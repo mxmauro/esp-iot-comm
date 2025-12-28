@@ -1,0 +1,11 @@
+*.~*
+.DS_Store
+.cache
+.vscode
+build
+dist
+managed_components
+__pycache__
+sdkconfig*
+!sdkconfig.defaults
+dependencies.lock
