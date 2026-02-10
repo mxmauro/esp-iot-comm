@@ -11,10 +11,10 @@ static const char *findChar(const char *s, const char *sEnd, char c);
 
 void parseIPv4(IPAddress_t *addr, const struct sockaddr_in *in)
 {
-    addr->ip[0] = in->sin_addr.s_addr & 0xFF;
-    addr->ip[1] = (in->sin_addr.s_addr >> 8) & 0xFF;
-    addr->ip[2] = (in->sin_addr.s_addr >> 16) & 0xFF;
-    addr->ip[3] = (in->sin_addr.s_addr >> 24) & 0xFF;
+    addr->ip[0] = (uint8_t)in->sin_addr.s_addr & 0xFF;
+    addr->ip[1] = (uint8_t)(in->sin_addr.s_addr >> 8) & 0xFF;
+    addr->ip[2] = (uint8_t)(in->sin_addr.s_addr >> 16) & 0xFF;
+    addr->ip[3] = (uint8_t)(in->sin_addr.s_addr >> 24) & 0xFF;
     addr->isIPv6 = false;
 }
 
@@ -28,8 +28,8 @@ bool parseIP(IPAddress_t *addr, const char *s, size_t len)
 {
     const char *sEnd;
     const char *pos;
-    struct in_addr a4;
-    struct in6_addr a6;
+    struct sockaddr_in a4;
+    struct sockaddr_in6 a6;
     char buf[128];
 
     if (s == nullptr) {
@@ -71,8 +71,8 @@ bool parseIP(IPAddress_t *addr, const char *s, size_t len)
         strncpy(buf, s + 1, pos - s - 1);
         buf[pos - s - 1] = '\0';
 
-        if (inet_pton(AF_INET6, buf, &a6) == 1) {
-            parseIPv6(addr, (const struct sockaddr_in6 *)&a6);
+        if (inet_pton(AF_INET6, buf, &a6.sin6_addr) == 1) {
+            parseIPv6(addr, &a6);
             return true;
         }
         return false;
@@ -96,14 +96,14 @@ bool parseIP(IPAddress_t *addr, const char *s, size_t len)
     buf[sEnd - s] = '\0';
 
     // Try IPv4
-    if (inet_pton(AF_INET, buf, &a4) == 1) {
-        parseIPv4(addr, (const struct sockaddr_in *)&a4);
+    if (inet_pton(AF_INET, buf, &a4.sin_addr) == 1) {
+        parseIPv4(addr, &a4);
         return true;
     }
 
     // Try raw IPv6 (no brackets)
-    if (inet_pton(AF_INET6, buf, &a6) == 1) {
-        parseIPv6(addr, (const struct sockaddr_in6 *)&a6);
+    if (inet_pton(AF_INET6, buf, &a6.sin6_addr) == 1) {
+        parseIPv6(addr, &a6);
         return true;
     }
 

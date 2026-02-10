@@ -12,8 +12,6 @@
 #include <atomic>
 #include <convert.h>
 #include <cJSON.h>
-#include <cstddef>
-#include <cstdint>
 #include <endian.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
