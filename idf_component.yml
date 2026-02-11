@@ -1,5 +1,5 @@
 ## IDF Component Manager Manifest File
-version: 0.1.0
+version: 0.1.1
 description: IoT Communications Library for ESP-IDF
 url: https://github.com/mxmauro/esp-iot-comm
 repository: https://github.com/mxmauro/esp-iot-comm.git
