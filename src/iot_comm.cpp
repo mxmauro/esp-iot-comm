@@ -4,6 +4,7 @@
 #include "iot_comm/binary_reader.h"
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hash.h"
+#include "iot_comm/crypto/hkdf.h"
 #include "challenge.h"
 #include "ip_address.h"
 #include "lwip/sockets.h"
@@ -801,7 +802,8 @@ error500:
         }
     }
     if (err == ESP_OK) {
-        err = aesDeriveKey(sharedSecret, AES_KEY_LEN, salt, sizeof(salt), info, sizeof(info), derivedKey, sizeof(derivedKey));
+        err = hkdfSha256DeriveKey(sharedSecret, AES_KEY_LEN, salt, sizeof(salt), info, sizeof(info),
+                                  derivedKey, sizeof(derivedKey));
     }
     if (err != ESP_OK) {
         goto error500;

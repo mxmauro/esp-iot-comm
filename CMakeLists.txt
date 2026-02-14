@@ -14,6 +14,7 @@ set(srcs "src/binary_reader.cpp"
          "src/provisioning/wifi.cpp"
          "src/crypto/aes.cpp"
          "src/crypto/hash.cpp"
+         "src/crypto/hkdf.cpp"
          "src/crypto/p256.cpp"
 )
 

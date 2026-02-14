@@ -1,21 +1,12 @@
 #include "iot_comm/crypto/aes.h"
 #include <string.h>
-#include <mbedtls/hkdf.h>
 #include <mbedtls/gcm.h>
-#include <mbedtls/md.h>
 
 // static const char* TAG = "AES";
 
 #define GCM_TAG_LEN 16
 
 // -----------------------------------------------------------------------------
-
-esp_err_t aesDeriveKey(const uint8_t *key, size_t keyLen, const uint8_t *salt, size_t saltLen,
-                       const uint8_t *info, size_t infoLen, uint8_t *keyOut, size_t keyOutLen)
-{
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    return mbedtls_hkdf(md, salt, saltLen, key, keyLen, info, infoLen, keyOut, keyOutLen);
-}
 
 esp_err_t aesEncrypt(const uint8_t *key, size_t keyLen, const uint8_t *plaintext, size_t plaintextLen,
                      const uint8_t *iv, size_t ivLen, const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut)
@@ -57,7 +48,7 @@ esp_err_t aesDecrypt(const uint8_t *key, size_t keyLen, const uint8_t *ciphertex
         return err;
     }
     err = mbedtls_gcm_auth_decrypt(&gcm, ciphertextLen, iv, ivLen, aad, aadLen, ciphertext + ciphertextLen,
-                                GCM_TAG_LEN, ciphertext, plaintextOut);
+                                   GCM_TAG_LEN, ciphertext, plaintextOut);
     mbedtls_gcm_free(&gcm);
     return err;
 }
