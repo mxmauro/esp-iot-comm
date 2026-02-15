@@ -64,9 +64,11 @@ typedef struct SessionInfo_s {
     uint32_t nextRxCounter;
     uint32_t nextTxCounter;
     ChallengeNonce_t nonce;
-    uint8_t clientAesKey[SESSION_AES_KEY_LEN];
+    Aes     *clientAes;
+    // uint8_t clientAesKey[SESSION_AES_KEY_LEN];
     uint8_t clientBaseIV[SESSION_IV_LEN];
-    uint8_t serverAesKey[SESSION_AES_KEY_LEN];
+    Aes     *serverAes;
+    // uint8_t serverAesKey[SESSION_AES_KEY_LEN];
     uint8_t serverBaseIV[SESSION_IV_LEN];
     uint8_t isAdmin : 1;
     uint8_t mustChangeCredentials : 1;
@@ -131,6 +133,9 @@ static bool getIpFromPeer(int sockfd, IPAddress_t *out);
 
 static void destroyServerCtx(void *ctx);
 static void destroySessionCtx(void *ctx);
+
+static SessionInfo_t *createSession();
+static void destroySession(SessionInfo_t *session);
 
 static esp_err_t readWsPacket(ServerContext_t *serverCtx, httpd_req_t *req, httpd_ws_frame_t *frame);
 static void closeWebsocket(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason);
@@ -813,36 +818,39 @@ error500:
     serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
 
     // Create user session
-    session = (SessionInfo_t *)malloc(sizeof(SessionInfo_t));
+    session = createSession();
     if (!session) {
         err = ESP_ERR_NO_MEM;
         goto error500;
     }
-    memset(session, 0, sizeof(SessionInfo_t));
-    do {
-        // Generate unique ID
-        session->id = nextSessionId.fetch_add(1) & 0x7FFFFFFFUL;
-    }
-    while (session->id == 0);
     session->sockfd = httpd_req_to_sockfd(req);
     memcpy(&session->addr, &remoteAddr, sizeof(remoteAddr));
     session->userId = challenge->userId;
     session->nextRxCounter = 1;
     session->nextTxCounter = 1;
     memcpy(session->nonce, challenge->wsNonce, sizeof(ChallengeNonce_t));
-    memcpy(session->clientAesKey, derivedKey, AES_KEY_LEN);
-    memcpy(session->serverAesKey, derivedKey + AES_KEY_LEN, AES_KEY_LEN);
+
+    err = session->clientAes->setKey(derivedKey, AES_KEY_LEN);
+    if (err != ESP_OK) {
+        destroySession(session);
+        goto error500;
+    }
+    err = session->serverAes->setKey(derivedKey + AES_KEY_LEN, AES_KEY_LEN);
+    if (err != ESP_OK) {
+        destroySession(session);
+        goto error500;
+    }
     memcpy(session->clientBaseIV, derivedKey + 2 * AES_KEY_LEN, SESSION_IV_LEN);
     memcpy(session->serverBaseIV, derivedKey + 2 * AES_KEY_LEN + SESSION_IV_LEN, SESSION_IV_LEN);
     err = userIsAdmin(session->userId, &b);
     if (err != ESP_OK) {
-        free(session);
+        destroySession(session);
         goto error500;
     }
     session->isAdmin = (b) ? 1 : 0;
     err = userMustChangeCredentials(session->userId, &b);
     if (err != ESP_OK) {
-        free(session);
+        destroySession(session);
         goto error500;
     }
     session->mustChangeCredentials = (b) ? 1 : 0;
@@ -985,9 +993,8 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     }
 
     // Decrypt message
-    err = aesDecrypt(commandCtx.session->clientAesKey, sizeof(commandCtx.session->clientAesKey),
-                    frame.payload + sizeof(WebSocketPacketHeader_t),
-                    dataAndTagLen, iv, sizeof(iv), nullptr, 0, commandCtx.serverCtx->plaintext.buffer);
+    err = commandCtx.session->clientAes->decrypt(frame.payload + sizeof(WebSocketPacketHeader_t), dataAndTagLen,
+                                                 iv, sizeof(iv), nullptr, 0, commandCtx.serverCtx->plaintext.buffer);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Unable to decrypt message. Error: %ld.", err);
         closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
@@ -1387,8 +1394,8 @@ static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *
     }
 
     // Encrypt message
-    err = aesEncrypt(commandCtx->session->serverAesKey, sizeof(commandCtx->session->serverAesKey), plaintext, plaintextLen,
-                    iv, SESSION_IV_LEN, nullptr, 0, outBuf->buffer + sizeof(WebSocketPacketHeader_t));
+    err = commandCtx->session->serverAes->encrypt(plaintext, plaintextLen, iv, SESSION_IV_LEN, nullptr, 0,
+                                                  outBuf->buffer + sizeof(WebSocketPacketHeader_t));
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Unable to encrypt message. Error: %ld.", err);
         closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
@@ -1630,6 +1637,50 @@ static void destroySessionCtx(void *ctx)
             }
         }
 
+        destroySession(session);
+    }
+}
+
+static SessionInfo_t *createSession()
+{
+    SessionInfo_t *session;
+
+    // Create user session
+    session = (SessionInfo_t *)malloc(sizeof(SessionInfo_t));
+    if (!session) {
+        return nullptr;
+    }
+    memset(session, 0, sizeof(SessionInfo_t));
+
+    session->clientAes = new Aes();
+    if (!session->clientAes) {
+        free(session);
+        return nullptr;
+    }
+    session->serverAes = new Aes();
+    if (!session->serverAes) {
+        delete session->clientAes;
+        free(session);
+        return nullptr;
+    }
+
+    session->nextRxCounter = 1;
+    session->nextTxCounter = 1;
+    // Generate unique ID
+    do {
+        session->id = nextSessionId.fetch_add(1) & 0x7FFFFFFFUL;
+    }
+    while (session->id == 0);
+
+    // Done
+    return session;
+}
+
+static void destroySession(SessionInfo_t *session)
+{
+    if (session) {
+        delete session->clientAes;
+        delete session->serverAes;
         memset(session, 0, sizeof(SessionInfo_t));
         free(session);
     }
