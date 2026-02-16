@@ -696,6 +696,13 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
         return ESP_OK;
     }
 
+    // Check if it is a real websocket request. ESP_HTTP_SERVER calls the handle even
+    // when not a websocket connection
+    if (httpd_req_get_hdr_value_len(req, "Upgrade") == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
+        return ESP_FAIL;
+    }
+
     // Get request IP address
     if (!getClientIpFromRequest(req, &remoteAddr)) {
         ESP_LOGE(TAG, "Failed to get client IP address");
