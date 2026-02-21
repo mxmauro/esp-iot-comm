@@ -957,7 +957,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
             return ESP_OK;
     }
 
-    // Check message size
+    // Check message size (the payload must be, at least, 1 byte plus the TAG)
     if (frame.len <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
         ESP_LOGD(TAG, "Short packet.");
         closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
@@ -1376,6 +1376,12 @@ static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *
     httpd_ws_frame_t frame;
     uint8_t iv[SESSION_IV_LEN];
     esp_err_t err;
+
+    // The plain text must not be empty
+    if (plaintextLen == 0) {
+        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
+        return ESP_OK;
+    }
 
     // Prepare output for encrypted message
     gbReset(outBuf, false);
