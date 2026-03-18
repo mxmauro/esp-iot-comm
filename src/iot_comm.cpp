@@ -1,27 +1,24 @@
 #include "iot_comm/iot_comm.h"
-#include "esp_err.h"
-#include "http_parser.h"
 #include "iot_comm/binary_reader.h"
 #include "iot_comm/crypto/aes.h"
-#include "iot_comm/crypto/hash.h"
 #include "iot_comm/crypto/hkdf.h"
+#include "iot_comm/crypto/utils.h"
 #include "challenge.h"
+#include "http_helpers.h"
 #include "ip_address.h"
-#include "lwip/sockets.h"
 #include "rate_limit.h"
 #include "user.h"
-#include <atomic>
 #include <convert.h>
 #include <cJSON.h>
 #include <endian.h>
+#include <esp_check.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <growable_buffer.h>
-#include <lwip/sockets.h>
-#include <mbedtls/ecdh.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/sha256.h>
 #include <mutex.h>
+#include <rundown_protection.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/_types.h>
 
@@ -34,7 +31,6 @@ static const char* TAG = "IotComm";
 
 #define MAX_BODY_SIZE 10240
 #define MAX_QUERY_SIZE 1024
-#define MAX_MSG_SIZE 2000
 
 #define CMD_CREATE_USER             0x7FF1
 #define CMD_DELETE_USER             0x7FF2
@@ -44,17 +40,36 @@ static const char* TAG = "IotComm";
 #define SESSION_IV_LEN     12
 #define SESSION_AES_KEY_LEN    32
 
+#define SHA256_SIZE 32
+
+#define MIN_WS_PACKET_SIZE 1024
+
+#define MAX_OUTPUT_FRAME_SIZE 4096
+
 // -----------------------------------------------------------------------------
 
+typedef enum IncomingBufferType_e {
+    IncomingBufferTypeNone = 0,
+    IncomingBufferTypeBinary,
+    IncomingBufferTypeText
+} IncomingBufferType_t;
+
 typedef struct ServerContext_s {
-    GrowableBuffer_t plaintext;
-    GrowableBuffer_t ciphertext;
+    size_t maxPacketSize;
 
     size_t maxConnectionsCount;
-    int *clientSocketsBuffer;
+
+    struct {
+        RwMutex_t mtx;
+        struct SessionInfo_s *first;
+        struct SessionInfo_s *last;
+    } sessions;
 } ServerContext_t;
 
 typedef struct SessionInfo_s {
+    struct SessionInfo_s *next;
+    struct SessionInfo_s *prev;
+    ServerContext_t *serverCtx;
     uint32_t id;
     int sockfd;
     void *userData;
@@ -64,15 +79,18 @@ typedef struct SessionInfo_s {
     uint32_t nextRxCounter;
     uint32_t nextTxCounter;
     ChallengeNonce_t nonce;
-    Aes     *clientAes;
-    // uint8_t clientAesKey[SESSION_AES_KEY_LEN];
+    mbedtls_gcm_context clientAesCtx;
     uint8_t clientBaseIV[SESSION_IV_LEN];
-    Aes     *serverAes;
-    // uint8_t serverAesKey[SESSION_AES_KEY_LEN];
+    mbedtls_gcm_context serverAesCtx;
     uint8_t serverBaseIV[SESSION_IV_LEN];
     uint8_t isAdmin : 1;
     uint8_t mustChangeCredentials : 1;
     uint8_t credentialsChangeAttempts : 2;
+    uint8_t isClosed : 1;
+    IncomingBufferType_t incomingMessageType;
+    GrowableBuffer_t plaintextIn;
+    GrowableBuffer_t ciphertextIn;
+    GrowableBuffer_t ciphertextOut;
 } SessionInfo_t;
 
 // v(1) | cmd(2) | filler(1) | replyCounter(4) | counter(4) | filler(4)
@@ -95,16 +113,43 @@ typedef struct CommandContext_s {
     uint32_t rxCounter;
 } CommandContext_t;
 
+typedef struct OnTheFlyEventListItem_s {
+    struct OnTheFlyEventListItem_s *next;
+    struct OnTheFlyEventListItem_s *prev;
+
+    uint32_t          eventId;
+    SessionInfo_t    *session;
+    httpd_req_t      *req;
+    CommandContext_t *commandCtx;
+
+    esp_err_t savedErr;
+    bool      replySent;
+    esp_err_t closeErr;
+    bool      closeSent;
+
+    IotCommEventSessionStart_t  *pSessionStartEventData;
+    IotCommEventSessionEnd_t    *pSessionEndEventData;
+    IotCommEventCustomCommand_t *pCustomCommandEventData;
+} OnTheFlyEventListItem_t;
+
 // -----------------------------------------------------------------------------
 
-static Mutex mtx;
-static httpd_handle_t server = nullptr;
-static std::atomic_uint32_t nextSessionId = {0};
+static RWMutex rwNtx;
+static RundownProtection_t rp = RUNDOWN_PROTECTION_INIT_STATIC;
 static IotCommEventHandler_t handler = nullptr;
+static void *handlerCtx = nullptr;
+static httpd_handle_t server = nullptr;
+static _Atomic(uint32_t) nextSessionId = {0};
+static _Atomic(uint32_t) nextEventId = {0};
+
+static RWMutex otfeRwMtx;
+static OnTheFlyEventListItem_t *otfeFirst = nullptr;
+static OnTheFlyEventListItem_t *otfeLast = nullptr;
 
 // -----------------------------------------------------------------------------
 
-static void internalServerStop();
+static void iotCommDeinitNoLock();
+static void iotCommStopServerNoLock();
 
 static esp_err_t serveWsInit(httpd_req_t *req);
 static esp_err_t serveWsAuth(httpd_req_t *req);
@@ -118,18 +163,16 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx);
 static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx);
 static esp_err_t handleCustomCommand(CommandContext_t *commandCtx);
 
-static esp_err_t handleSessionStart(SessionInfo_t *session);
+static bool handleSessionStart(SessionInfo_t *session, httpd_req_t *req, esp_err_t *closeErr);
 static void handleSessionEnd(SessionInfo_t *session);
 
-static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintext, size_t plaintextLen, uint32_t replyCounter);
-static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, uint32_t replyCounter);
+static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, uint32_t replyCounter,
+                                   bool closeOnError);
+static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, uint32_t replyCounter,
+                                   bool closeOnError);
 
-static const char *parseRequestBody(ServerContext_t *serverCtx, httpd_req_t *req, size_t *rawBodyLen);
-static const char *parseRequestQuery(ServerContext_t *serverCtx, httpd_req_t *req);
-static esp_err_t setDefaultCORS(httpd_req_t *req);
-
-static bool getClientIpFromRequest(httpd_req_t *req, IPAddress_t *out);
-static bool getIpFromPeer(int sockfd, IPAddress_t *out);
+static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason);
+static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, esp_err_t err);
 
 static void destroyServerCtx(void *ctx);
 static void destroySessionCtx(void *ctx);
@@ -137,58 +180,104 @@ static void destroySessionCtx(void *ctx);
 static SessionInfo_t *createSession();
 static void destroySession(SessionInfo_t *session);
 
-static esp_err_t readWsPacket(ServerContext_t *serverCtx, httpd_req_t *req, httpd_ws_frame_t *frame);
-static void closeWebsocket(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason);
+static esp_err_t readWsPacket(ServerContext_t *serverCtx, SessionInfo_t *session, httpd_req_t *req, bool *messageComplete);
+
+static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason);
 
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl);
+
+static void otfeGenerateID(OnTheFlyEventListItem_t *item);
+static void otfePushBack(OnTheFlyEventListItem_t *item);
+static void otfeRemove(OnTheFlyEventListItem_t *item);
+static OnTheFlyEventListItem_t* otfeFindByEventId(uint32_t eventId);
+// The first event matching the session id is returned
+static OnTheFlyEventListItem_t* otfeFindBySessionId(uint32_t sessionId);
 
 // -----------------------------------------------------------------------------
 
 esp_err_t iotCommInit(IotCommConfig_t *config)
 {
+    AutoRWMutex lock(rwNtx, false);
+    UsersConfig_t usersConfig;
+    uint8_t maxRequestsPerWindow;
+    esp_err_t ret;
+
+    if (!(config && config->handler)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    iotCommDeinitNoLock();
+    rundownProtInit(&rp);
+
+    atomic_store_explicit(&nextSessionId, 1, memory_order_relaxed);
+    atomic_store_explicit(&nextEventId, 1, memory_order_relaxed);
+
+    // Initialize users manager
+    memset(&usersConfig, 0, sizeof(usersConfig));
+    usersConfig.maxUsersCount = config->maxUsersCount;
+    usersConfig.rootKey.cb = config->rootKey.cb;
+    usersConfig.rootKey.ctx = config->rootKey.ctx;
+    usersConfig.storage.load = config->storage.load;
+    usersConfig.storage.save = config->storage.save;
+    usersConfig.storage.ctx = config->storage.ctx;
+    ESP_GOTO_ON_ERROR(usersInit(&usersConfig), on_error, TAG, "Unable to initialize users manager");
+
+    // The authentication flow is INIT+AUTH+WS so let's multiply the provided request limit by three.
+    maxRequestsPerWindow = config->rateLimit.maxRequestsPerWindow;
+    if (maxRequestsPerWindow < ((sizeof(maxRequestsPerWindow) << 8) - 1) / 3) {
+        maxRequestsPerWindow *= 3;
+    }
+    else {
+        maxRequestsPerWindow = (uint8_t)((sizeof(maxRequestsPerWindow) << 8) - 1);
+    }
+    ESP_GOTO_ON_ERROR(rateLimitInit(config->rateLimit.maxSlots, config->rateLimit.windowSizeInMs, maxRequestsPerWindow,
+                                    config->rateLimit.maxConsecutiveAuthFailures),
+                      on_error, TAG, "Unable to initialize rate limit handler");
+
+    ESP_GOTO_ON_ERROR(challengesInit(config->challenge.maxSlots, config->challenge.windowSizeInMs), on_error, TAG,
+                      "Unable to initialize challenges manager");
+
+    // Save event handler
+    handler = config->handler;
+    handlerCtx = config->handlerCtx;
+
+    // Done
+    ESP_LOGI(TAG, "IotComm engine initialized");
+    return ESP_OK;
+
+on_error:
+    iotCommDeinitNoLock();
+    return ret;
+}
+
+void iotCommDeinit()
+{
+    rundownProtWait(&rp);
+
+    {
+        AutoRWMutex lock(rwNtx, false);
+
+        iotCommDeinitNoLock();
+    }
+}
+
+esp_err_t iotCommStartServer(IotCommServerConfig_t *config)
+{
+    AutoRWMutex lock(rwNtx, false);
     httpd_config_t httpdConfig;
     ServerContext_t *serverCtx;
     httpd_uri_t uri;
     esp_err_t err;
 
-    assert(config);
-    assert(config->listenPort >= 1);
-    assert(config->maxConnections >= 1);
-    assert(config->handler);
-
-    internalServerStop();
-
-    nextSessionId.store(1);
-
-    // Initialize crypto
-    err = p256Init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to load ECP group. Error: %d", err);
-        return err;
+    if (!(config && config->listenPort >= 1 && config->maxConnections >= 1)) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    // Initialize helpers
-    err = usersInit(config->maxUsersCount, config->usersStorage, config->fnGetDefRootUserPublicKey);
-    if (err == ESP_OK) {
-        uint8_t maxRequestsPerWindow = config->maxRequestsPerWindow;
+    if (!handler) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-        // The authentication flow is INIT+AUTH+WS so let's multiply the provided request limit by three.
-        if (maxRequestsPerWindow < ((sizeof(maxRequestsPerWindow) << 8) - 1) / 3) {
-            maxRequestsPerWindow *= 3;
-        }
-        else {
-            maxRequestsPerWindow = (uint8_t)((sizeof(maxRequestsPerWindow) << 8) - 1);
-        }
-
-        err = rateLimitInit(config->maxRateLimitSlots, config->rateLimitWindowSizeInMs, maxRequestsPerWindow,
-                            config->maxConsecutiveAuthFailures);
-    }
-    if (err == ESP_OK) {
-        err = challengesInit(config->maxChallengesSlot, config->challengeWindowSizeInMs);
-    }
-    if (err != ESP_OK) {
-        goto on_error;
-    }
+    iotCommStopServerNoLock();
 
     // Create http server context
     serverCtx = (ServerContext_t *)malloc(sizeof(ServerContext_t));
@@ -196,15 +285,10 @@ esp_err_t iotCommInit(IotCommConfig_t *config)
         err = ESP_ERR_NO_MEM;
         goto on_error;
     }
-    serverCtx->plaintext = GB_STATIC_INIT;
-    serverCtx->ciphertext = GB_STATIC_INIT;
-    serverCtx->maxConnectionsCount = config->maxConnections;
-    serverCtx->clientSocketsBuffer = (int *)malloc(config->maxConnections * sizeof(int));
-    if (!serverCtx->clientSocketsBuffer) {
-        free(serverCtx);
-        err = ESP_ERR_NO_MEM;
-        goto on_error;
-    }
+    memset(serverCtx, 0, sizeof(ServerContext_t));
+    serverCtx->maxConnectionsCount = (size_t)config->maxConnections;
+    serverCtx->maxPacketSize = (config->maxPacketSize > MIN_WS_PACKET_SIZE) ? (size_t)config->maxPacketSize : MIN_WS_PACKET_SIZE;
+    rwMutexInit(&serverCtx->sessions.mtx);
 
     // Setup http server configuration
     httpdConfig = HTTPD_DEFAULT_CONFIG();
@@ -261,42 +345,245 @@ esp_err_t iotCommInit(IotCommConfig_t *config)
         goto on_error;
     }
 
-    // Save event handler
-    handler = config->handler;
-
     // Done
     ESP_LOGI(TAG, "Server initialized and listening at %u", config->listenPort);
     return ESP_OK;
 
 on_error:
     ESP_LOGE(TAG, "Unable to start http server. Error: %d.", err);
-    internalServerStop();
+    iotCommStopServerNoLock();
     return err;
 }
 
-void iotCommDone()
+void iotCommStopServer()
 {
-    AutoMutex lock(&mtx);
+    rundownProtWait(&rp);
 
-    internalServerStop();
-    challengesDone();
-    rateLimitDone();
-    usersDone();
-    p256Done();
+    {
+        AutoRWMutex lock(rwNtx, false);
 
-    handler = nullptr;
+        iotCommStopServerNoLock();
+    }
 }
 
-bool iotCommIsRunning()
+bool iotCommIsServerRunning()
 {
-    AutoMutex lock(&mtx);
+    AutoRWMutex lock(rwNtx, true);
 
     return !!server;
 }
 
+esp_err_t iotCommSetSessionUserData(uint32_t sessionId, void *ptr, IotCommUserDataFreeFunc_t freeFn)
+{
+    AutoRundownProtection rpLock(rp);
+    void *oldUserData = nullptr;
+    IotCommUserDataFreeFunc_t oldUserDataFreeFn = nullptr;
+
+    if (rpLock.acquired()) {
+        AutoRWMutex otfeLock(otfeRwMtx, true);
+        OnTheFlyEventListItem_t *otfeItem;
+        SessionInfo_t *session;
+
+        // Find session
+        otfeItem = otfeFindBySessionId(sessionId);
+        if (!otfeItem) {
+            return ESP_ERR_NOT_FOUND;
+        }
+        session = otfeItem->session;
+
+        // Save the old user data
+        oldUserData = session->userData;
+        oldUserDataFreeFn = session->userDataFreeFn;
+
+        // Replace with new user data
+        session->userData = ptr;
+        session->userDataFreeFn = freeFn;
+    }
+    else {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Free old user data
+    if (oldUserData) {
+        if (oldUserDataFreeFn) {
+            oldUserDataFreeFn(oldUserData);
+        }
+        else {
+            free(oldUserData);
+        }
+    }
+
+    // Done
+    return ESP_OK;
+}
+
+void* iotCommGetSessionUserData(uint32_t sessionId)
+{
+    AutoRundownProtection rpLock(rp);
+    void *userData = nullptr;
+
+    if (rpLock.acquired()) {
+        AutoRWMutex otfeLock(otfeRwMtx, true);
+        OnTheFlyEventListItem_t *otfeItem;
+
+        // Find session
+        otfeItem = otfeFindBySessionId(sessionId);
+        if (otfeItem) {
+            // Save the user data
+            userData = otfeItem->session->userData;
+        }
+    }
+
+    // Free old user data
+    return userData;
+}
+
+esp_err_t iotCommEventReply(uint32_t eventId, const uint8_t * reply, size_t replyLen)
+{
+    AutoRundownProtection rpLock(rp);
+
+    if (rpLock.acquired()) {
+        AutoRWMutex otfeLock(otfeRwMtx, true);
+        OnTheFlyEventListItem_t *otfeItem;
+
+        // Find event
+        otfeItem = otfeFindByEventId(eventId);
+        if (!otfeItem) {
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (!otfeItem->pCustomCommandEventData) {
+            // If not a custom event command, nothing to do
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        // If some error happened previously for this event, return it
+        if (otfeItem->savedErr != ESP_OK) {
+            return otfeItem->savedErr;
+        }
+        // If closed or a reply was already sent, block
+        if (otfeItem->session->isClosed || otfeItem->replySent || otfeItem->closeSent) {
+            return ESP_FAIL;
+        }
+
+        // Send the reply
+        otfeItem->savedErr = buildAndSendReply(otfeItem->commandCtx, reply, replyLen, otfeItem->commandCtx->rxCounter, false);
+        otfeItem->replySent = true;
+        if (otfeItem->savedErr != ESP_OK) {
+            otfeItem->closeSent = true;
+            otfeItem->closeErr = closeWsWithCmdCtxAndError(otfeItem->commandCtx, otfeItem->savedErr);
+        }
+
+        // Done
+        return otfeItem->savedErr;
+    }
+
+    // Rundown active
+    return ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t iotCommEventReplyWithError(uint32_t eventId, uint32_t code, const char *message)
+{
+    AutoRundownProtection rpLock(rp);
+
+    if (rpLock.acquired()) {
+        AutoRWMutex otfeLock(otfeRwMtx, true);
+        OnTheFlyEventListItem_t *otfeItem;
+
+        // Find event
+        otfeItem = otfeFindByEventId(eventId);
+        if (!otfeItem) {
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (!otfeItem->pCustomCommandEventData) {
+            // If not a custom event command, nothing to do
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        // If some error happened previously for this event, return it
+        if (otfeItem->savedErr != ESP_OK) {
+            return otfeItem->savedErr;
+        }
+        // If closed or a reply was already sent, block
+        if (otfeItem->session->isClosed || otfeItem->replySent || otfeItem->closeSent) {
+            return ESP_FAIL;
+        }
+
+        // Send the reply
+        otfeItem->savedErr = buildAndSendErrorReply(otfeItem->commandCtx, code, message, otfeItem->commandCtx->rxCounter, false);
+        otfeItem->replySent = true;
+        if (otfeItem->savedErr != ESP_OK) {
+            otfeItem->closeSent = true;
+            otfeItem->closeErr = closeWsWithCmdCtxAndError(otfeItem->commandCtx, otfeItem->savedErr);
+        }
+
+        // Done
+        return otfeItem->savedErr;
+    }
+
+    // Rundown active
+    return ESP_ERR_INVALID_STATE;
+}
+
+void iotCommSessionClose(uint32_t sessionId, uint16_t reason, const char *message)
+{
+    AutoRundownProtection rpLock(rp);
+
+    if (rpLock.acquired()) {
+        AutoRWMutex otfeLock(otfeRwMtx, true);
+        OnTheFlyEventListItem_t *otfeItem;
+
+        // Find event by session. The presence of a start event is mutually exclusive with
+        // the presence if a custom command event.
+        otfeItem = otfeFindBySessionId(sessionId);
+        if (otfeItem) {
+            if (otfeItem->pSessionStartEventData) {
+                if (!otfeItem->closeSent) {
+                    if (reason < 400) {
+                        reason = (uint16_t)HTTPD_500_INTERNAL_SERVER_ERROR;
+                    }
+                    otfeItem->closeSent = true;
+                    otfeItem->closeErr = httpd_resp_send_err(otfeItem->req, (httpd_err_code_t)reason,
+                                                             (message && *message != 0) ? message : nullptr);
+                }
+            }
+            else if (otfeItem->pCustomCommandEventData) {
+                if (!(otfeItem->session->isClosed || otfeItem->closeSent)) {
+                    otfeItem->closeSent = true;
+                    otfeItem->closeErr = closeWsWithCmdCtx(otfeItem->commandCtx, reason, message);
+                }
+            }
+        }
+    }
+}
+
+esp_err_t iotCommInitRootUserPublicKey(const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
+{
+    AutoRWMutex lock(rwNtx, true);
+    uint32_t rootUserId;
+
+    if (!handler) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    rootUserId = userGetID("root", 4);
+    return userChangeCredentials(rootUserId, rootUserId, publicKey);
+}
+
 // -----------------------------------------------------------------------------
 
-static void internalServerStop()
+static void iotCommDeinitNoLock()
+{
+    iotCommStopServerNoLock();
+
+    challengesDeinit();
+    rateLimitDeinit();
+    usersDeinit();
+
+    handler = nullptr;
+    handlerCtx = nullptr;
+}
+
+static void iotCommStopServerNoLock()
 {
     if (server) {
         httpd_stop(server);
@@ -306,107 +593,109 @@ static void internalServerStop()
 
 static esp_err_t serveWsInit(httpd_req_t *req)
 {
-    ServerContext_t *serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
+    AutoRundownProtection rpLock(rp);
     IPAddress_t remoteAddr;
-    const char *rawBody;
-    size_t rawBodyLen;
-    cJSON *json, *userNameItem, *clientNonceItem, *ecdhClientPublicKeyItem;
+    GrowableBuffer_t reqBody;
+    GrowableBuffer_t respBody;
+    cJSON *json = nullptr;
+    char *userNameValue, *clientNonceValue, *ecdhClientPublicKeyValue;
     size_t clientNonceLen;
     size_t ecdhClientPublicKeyLen;
     Challenge_t challenge;
     ChallengeCookie_t challengeCookie;
-    ECDHKeyPair ecdhKeyPair;
-    GrowableBuffer_t *outBuf = nullptr;
+    P256KeyPair_t ecdhKeyPair;
     esp_err_t err;
 
-    err = setDefaultCORS(req);
-    if (err != ESP_OK) {
-        goto done;
+    if (!rpLock.acquired()) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     // Is OPTIONS?
     if (req->method == HTTP_OPTIONS) {
-        httpd_resp_set_status(req, HTTPD_204);
-        httpd_resp_send(req, nullptr, 0);
-        return ESP_OK;
+        return httpSendPreflightResponse(req);
+    }
+
+    // Prepare
+    reqBody = GB_STATIC_INIT;
+    respBody = GB_STATIC_INIT;
+    p256KeyPairInit(&ecdhKeyPair);
+    memset(&challenge, 0, sizeof(challenge));
+
+    // Send CORS
+    err = httpSendDefaultCORS(req);
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Get request IP address
-    if (!getClientIpFromRequest(req, &remoteAddr)) {
+    if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
         ESP_LOGE(TAG, "Failed to get client IP address");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, nullptr);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto done;
     }
 
     // Check rate limit
     if (!rateLimitCheckRequest(&remoteAddr)) {
-        httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
-        return ESP_FAIL;
+        err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
+        goto done;
     }
 
-    // Prepare challenge
-    memset(&challenge, 0, sizeof(challenge));
-
     // Read request body
-    rawBody = parseRequestBody(serverCtx, req, &rawBodyLen);
-    if (!rawBody) {
-        err = ESP_FAIL;
+    if (req->content_len > MAX_BODY_SIZE) {
+        err = httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, nullptr);
+        goto done;
+    }
+    err = httpGetRequestBody(&reqBody, req);
+    if (err != ESP_OK) {
         goto done;
     }
 
     // Extract parameters from request body and validate
-    json = cJSON_ParseWithLength(rawBody, rawBodyLen);
+    json = cJSON_ParseWithLength((const char*)reqBody.buffer, reqBody.used);
     if (!json) {
-error400:
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
-        err = ESP_FAIL;
+err_invalid_data:
+        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
-    userNameItem = cJSON_GetObjectItem(json, "userName");
-    clientNonceItem = cJSON_GetObjectItem(json, "clientNonce");
-    ecdhClientPublicKeyItem = cJSON_GetObjectItem(json, "clientPublicKey");
-    if ((!cJSON_IsString(userNameItem)) || (!userNameItem->valuestring) || *userNameItem->valuestring == 0 ||
-        (!cJSON_IsString(clientNonceItem)) || (!clientNonceItem->valuestring) ||
-        (!cJSON_IsString(ecdhClientPublicKeyItem)) || (!ecdhClientPublicKeyItem->valuestring)
-    ) {
-error400_del_json:
-        cJSON_Delete(json);
-        goto error400;
+
+    userNameValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "userName"));
+    clientNonceValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "clientNonce"));
+    ecdhClientPublicKeyValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "clientPublicKey"));
+    if ((!userNameValue) || *userNameValue == 0 || (!clientNonceValue) || (!ecdhClientPublicKeyValue)) {
+        goto err_invalid_data;
     }
 
     // Validate user
-    challenge.userId = userGetID(userNameItem->valuestring, strlen(userNameItem->valuestring));
+    challenge.userId = userGetID(userNameValue, strlen(userNameValue));
     if (challenge.userId == 0) {
-        goto error400_del_json;
+        goto err_invalid_data;
     }
 
     // Decode and validate client nonce and client ECDH public key
     clientNonceLen = sizeof(challenge.clientNonce);
     ecdhClientPublicKeyLen = sizeof(challenge.ecdhClientPublicKey);
-    if ((!fromB64(clientNonceItem->valuestring, strlen(clientNonceItem->valuestring), false,
-            challenge.clientNonce, &clientNonceLen)) ||
-        (!fromB64(ecdhClientPublicKeyItem->valuestring, strlen(ecdhClientPublicKeyItem->valuestring), false,
-            challenge.ecdhClientPublicKey, &ecdhClientPublicKeyLen))
+    if (
+        (!fromB64(clientNonceValue, strlen(clientNonceValue), false, challenge.clientNonce, &clientNonceLen)) ||
+        (!fromB64(ecdhClientPublicKeyValue, strlen(ecdhClientPublicKeyValue), false, challenge.ecdhClientPublicKey,
+                  &ecdhClientPublicKeyLen))
     ) {
-        goto error400_del_json;
+        goto err_invalid_data;
     }
-    if (clientNonceLen != CHALLENGE_NONCE_SIZE || ecdhClientPublicKeyLen != P256_PUBLIC_KEY_SIZE ||
-        (!P256KeyPair::validatePublicKey(challenge.ecdhClientPublicKey, P256_PUBLIC_KEY_SIZE))
+    if (
+        clientNonceLen != CHALLENGE_NONCE_SIZE || ecdhClientPublicKeyLen != P256_PUBLIC_KEY_SIZE ||
+        (!p256ValidatePublicKey(challenge.ecdhClientPublicKey, P256_PUBLIC_KEY_SIZE))
     ) {
-        goto error400_del_json;
+        goto err_invalid_data;
     }
-
-    // Cleanup json data
-    cJSON_Delete(json);
 
     // Generate server nonce, challenge cookie and ephemeral server ECDH key pair
-    if ((!randomize(challenge.serverNonce, sizeof(challenge.serverNonce))) ||
-        (!randomize(challengeCookie, sizeof(challengeCookie))) ||
-        ecdhKeyPair.generate() != ESP_OK ||
-        ecdhKeyPair.savePublicKey(challenge.ecdhServerPublicKey) != ESP_OK ||
-        ecdhKeyPair.savePrivateKey(challenge.ecdhServerPrivateKey) != ESP_OK
+    if (
+        randomize(challenge.serverNonce, sizeof(challenge.serverNonce)) != ESP_OK ||
+        randomize(challengeCookie, sizeof(challengeCookie)) != ESP_OK ||
+        ecdhGeneratePair(&ecdhKeyPair) != ESP_OK ||
+        p256SavePublicKey(&ecdhKeyPair, challenge.ecdhServerPublicKey) != ESP_OK ||
+        p256SavePrivateKey(&ecdhKeyPair, challenge.ecdhServerPrivateKey) != ESP_OK
     ) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to generate challenge");
         err = ESP_FAIL;
         goto done;
     }
@@ -415,173 +704,189 @@ error400_del_json:
     challengesAdd(challengeCookie, &remoteAddr, &challenge);
 
     // Prepare output
-    err = httpd_resp_set_type(req, "application/json");
-    if (err != ESP_OK) {
-error500:
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-            ((err == ESP_ERR_NO_MEM) ? "Insufficient resources" : nullptr));
-        err = ESP_FAIL;
-        goto done;
-    }
-
-    // Write output
-    outBuf = &serverCtx->plaintext;
-    gbReset(outBuf, false);
-
-    if ((!gbAdd(outBuf, "{\"token\":\"", 10)) ||
-        (!extGbAddB64(outBuf, challengeCookie, sizeof(challengeCookie), false)) ||
-        (!gbAdd(outBuf, "\",\"serverNonce\":\"", 17)) ||
-        (!extGbAddB64(outBuf, challenge.serverNonce, sizeof(challenge.serverNonce), false)) ||
-        (!gbAdd(outBuf, "\",\"serverPublicKey\":\"", 21)) ||
-        (!extGbAddB64(outBuf, challenge.ecdhServerPublicKey, sizeof(challenge.ecdhServerPublicKey), false)) ||
-        (!gbAdd(outBuf, "\"}", 2))
+    if (
+        (!gbAdd(&respBody, "{\"token\":\"", 10)) ||
+        (!extGbAddB64(&respBody, challengeCookie, sizeof(challengeCookie), false)) ||
+        (!gbAdd(&respBody, "\",\"serverNonce\":\"", 17)) ||
+        (!extGbAddB64(&respBody, challenge.serverNonce, sizeof(challenge.serverNonce), false)) ||
+        (!gbAdd(&respBody, "\",\"serverPublicKey\":\"", 21)) ||
+        (!extGbAddB64(&respBody, challenge.ecdhServerPublicKey, sizeof(challenge.ecdhServerPublicKey), false)) ||
+        (!gbAdd(&respBody, "\"}", 2))
     ) {
         err = ESP_ERR_NO_MEM;
-        goto error500;
-    }
-
-    err = httpd_resp_send(req, (char *)outBuf->buffer, (ssize_t)outBuf->used);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unable to deliver response");
-        err = ESP_FAIL;
         goto done;
     }
 
-    // Success
-    err = ESP_OK;
+    // Send response
+    err = httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        err = httpd_resp_send(req, (char *)respBody.buffer, (ssize_t)respBody.used);
+    }
 
 done:
-    if (outBuf) {
-        gbWipe(outBuf);
+    // Cleanup
+    if (json) {
+        cJSON_Delete(json);
     }
     memset(&challenge, 0, sizeof(challenge));
-    return err;
+    p256KeyPairDone(&ecdhKeyPair);
+    gbWipe(&respBody);
+    gbReset(&respBody, true);
+    gbWipe(&reqBody);
+    gbReset(&reqBody, true);
+
+    // Done
+    return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
 static esp_err_t serveWsAuth(httpd_req_t *req)
 {
-    ServerContext_t *serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
+    AutoRundownProtection rpLock(rp);
     IPAddress_t remoteAddr;
-    const char *rawBody;
-    size_t rawBodyLen;
-    cJSON *json, *cookieItem, *authNonceItem, *signatureItem;
+    GrowableBuffer_t reqBody;
+    GrowableBuffer_t respBody;
+    cJSON *json = nullptr;
+    char *cookieValue, *authNonceValue, *signatureValue;
     ChallengeCookie_t challengeCookie;
+    bool removeChallenge = false;
     uint8_t authNonce[CHALLENGE_NONCE_SIZE];
     uint8_t signature[P256_SIGNATURE_SIZE];
     size_t challengeCookieLen;
     size_t authNonceLen;
     size_t signatureLen;
     Challenge_t *challenge;
-    Sha256 hash256;
+    mbedtls_sha256_context sha256Ctx;
     uint8_t th[SHA256_SIZE];
-    GrowableBuffer_t *outBuf = nullptr;
     bool b;
     esp_err_t err;
 
-    err = setDefaultCORS(req);
-    if (err != ESP_OK) {
-        goto done;
+    if (!rpLock.acquired()) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     // Is OPTIONS?
     if (req->method == HTTP_OPTIONS) {
-        httpd_resp_set_status(req, HTTPD_204);
-        httpd_resp_send(req, nullptr, 0);
-        return ESP_OK;
+        return httpSendPreflightResponse(req);
+    }
+
+    // Prepare
+    reqBody = GB_STATIC_INIT;
+    respBody = GB_STATIC_INIT;
+    mbedtls_sha256_init(&sha256Ctx);
+
+    // Send CORS
+    err = httpSendDefaultCORS(req);
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Get request IP address
-    if (!getClientIpFromRequest(req, &remoteAddr)) {
+    if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
         ESP_LOGE(TAG, "Failed to get client IP address");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, nullptr);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto done;
     }
 
     // Check rate limit
     if (!rateLimitCheckRequest(&remoteAddr)) {
-        httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
-        return ESP_FAIL;
+        err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
+        goto done;
     }
 
     // Read request body
-    rawBody = parseRequestBody(serverCtx, req, &rawBodyLen);
-    if (!rawBody) {
-        err = ESP_FAIL;
+    if (req->content_len > MAX_BODY_SIZE) {
+        err = httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, nullptr);
+        goto done;
+    }
+    err = httpGetRequestBody(&reqBody, req);
+    if (err != ESP_OK) {
         goto done;
     }
 
     // Extract parameters from request body and validate
-    json = cJSON_ParseWithLength(rawBody, rawBodyLen);
+    json = cJSON_ParseWithLength((const char*)reqBody.buffer, reqBody.used);
     if (!json) {
-error400:
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
-        err = ESP_FAIL;
+err_invalid_data:
+        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
 
-    cookieItem = cJSON_GetObjectItem(json, "token");
-    authNonceItem = cJSON_GetObjectItem(json, "authNonce");
-    signatureItem = cJSON_GetObjectItem(json, "signature");
-    if ((!cJSON_IsString(cookieItem)) || (!cookieItem->valuestring) ||
-        (!cJSON_IsString(authNonceItem)) || (!authNonceItem->valuestring) ||
-        (!cJSON_IsString(signatureItem)) || (!signatureItem->valuestring)
-    ) {
-error400_del_json:
-        cJSON_Delete(json);
-        goto error400;
+    cookieValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "token"));
+    authNonceValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "authNonce"));
+    signatureValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "signature"));
+    if ((!cookieValue) || (!authNonceValue) || (!signatureValue)) {
+        goto err_invalid_data;
     }
 
     // Decode and validate token, auth nonce, and signature
     challengeCookieLen = sizeof(challengeCookie);
     authNonceLen = sizeof(authNonce);
     signatureLen = sizeof(signature);
-    if ((!fromB64(cookieItem->valuestring, strlen(cookieItem->valuestring), false, challengeCookie, &challengeCookieLen)) ||
-        (!fromB64(authNonceItem->valuestring, strlen(authNonceItem->valuestring), false, authNonce, &authNonceLen)) ||
-        (!fromB64(signatureItem->valuestring, strlen(signatureItem->valuestring), false, signature, &signatureLen))
+    if (
+        (!fromB64(cookieValue, strlen(cookieValue), false, challengeCookie, &challengeCookieLen)) ||
+        (!fromB64(authNonceValue, strlen(authNonceValue), false, authNonce, &authNonceLen)) ||
+        (!fromB64(signatureValue, strlen(signatureValue), false, signature, &signatureLen))
     ) {
-        goto error400_del_json;
+        goto err_invalid_data;
     }
     if (challengeCookieLen != CHALLENGE_COOKIE_SIZE || authNonceLen != CHALLENGE_NONCE_SIZE || signatureLen != P256_SIGNATURE_SIZE) {
-        goto error400_del_json;
+        goto err_invalid_data;
     }
-
-    // Cleanup json data
-    cJSON_Delete(json);
 
     // Lookup challenge
     challenge = challengesFind(challengeCookie, &remoteAddr);
     if (!challenge) {
-error401_nc:
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, nullptr);
-        err = ESP_FAIL;
+error_not_auth:
+        err = httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, nullptr);
         goto done;
     }
+    removeChallenge = true;
 
     // th = SHA256("ws-login-v1" || c_pk || s_pk || s_nonce || c_nonce || cookie || auth_nonce)
-    hash256.init();
-    hash256.update("ws-login-v1", 11);
-    hash256.update(challenge->ecdhServerPublicKey, sizeof(challenge->ecdhServerPublicKey));
-    hash256.update(challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
-    hash256.update(challenge->serverNonce, sizeof(challenge->serverNonce));
-    hash256.update(challenge->clientNonce, sizeof(challenge->clientNonce));
-    hash256.update(challengeCookie, sizeof(challengeCookie));
-    hash256.update(authNonce, sizeof(authNonce));
-    hash256.finalize(th);
-    if (hash256.error() != ESP_OK) {
-error401:
-        challengesRemove(challengeCookie);
-        goto error401_nc;
+    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->ecdhServerPublicKey, sizeof(challenge->ecdhServerPublicKey));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, authNonce, sizeof(authNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_finish(&sha256Ctx, th);
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
         if (err == MBEDTLS_ERR_ECP_VERIFY_FAILED) {
-            goto error401;
+            challengesRemove(challengeCookie);
+            goto error_not_auth;
         }
-error500:
-        challengesRemove(challengeCookie);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, ((err == ESP_ERR_NO_MEM) ? "Insufficient resources" : nullptr));
         goto done;
     }
 
@@ -589,68 +894,75 @@ error500:
     challenge->verified = true;
 
     // Generate ws nonce
-    if (!randomize(challenge->wsNonce, sizeof(challenge->wsNonce))) {
-        goto error500;
-    }
-
-    // Prepare output
-    err = httpd_resp_set_type(req, "application/json");
+    err = randomize(challenge->wsNonce, sizeof(challenge->wsNonce));
     if (err != ESP_OK) {
-        goto error500;
-    }
-
-    // Write output
-    outBuf = &serverCtx->plaintext;
-    gbReset(outBuf, false);
-
-    if (!(gbAdd(outBuf, "{\"mustChangeCredentials\":", 25))) {
-error500_nomem:
-        err = ESP_ERR_NO_MEM;
-        goto error500;
-    }
-    userMustChangeCredentials(challenge->userId, &b); // error check ignored on purpose
-    if (b) {
-        if (!gbAdd(outBuf, "true", 4)) {
-            goto error500_nomem;
-        }
-    }
-    else {
-        if (!gbAdd(outBuf, "false", 5)) {
-            goto error500_nomem;
-        }
-    }
-
-    if ((!gbAdd(outBuf, ",\"wsNonce\":\"", 12)) ||
-        (!extGbAddB64(outBuf, challenge->wsNonce, sizeof(challenge->wsNonce), false)) ||
-        (!gbAdd(outBuf, "\"}", 2))
-    ) {
-        goto error500_nomem;
-    }
-
-    err = httpd_resp_send(req, (char *)outBuf->buffer, (ssize_t)outBuf->used);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unable to deliver response");
-        err = ESP_FAIL;
         goto done;
     }
 
-    // Success
-    err = ESP_OK;
+    // Prepare output
+    if (!(gbAdd(&respBody, "{\"mustChangeCredentials\":", 25))) {
+error_no_mem:
+        err = ESP_ERR_NO_MEM;
+        goto done;
+    }
+    userMustChangeCredentials(challenge->userId, &b); // error check ignored on purpose
+    if (b) {
+        if (!gbAdd(&respBody, "true", 4)) {
+            goto error_no_mem;
+        }
+    }
+    else {
+        if (!gbAdd(&respBody, "false", 5)) {
+            goto error_no_mem;
+        }
+    }
+    if (
+        (!gbAdd(&respBody, ",\"wsNonce\":\"", 12)) ||
+        (!extGbAddB64(&respBody, challenge->wsNonce, sizeof(challenge->wsNonce), false)) ||
+        (!gbAdd(&respBody, "\"}", 2))
+    ) {
+        goto error_no_mem;
+    }
+
+    // Send response
+    err = httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        err = httpd_resp_send(req, (char *)respBody.buffer, (ssize_t)respBody.used);
+    }
+
+    // On success, keep added challenge
+    removeChallenge = false;
 
 done:
     // Cleanup
-    if (outBuf) {
-        gbWipe(outBuf);
+    if (removeChallenge) {
+        challengesRemove(challengeCookie);
+    }
+    if (json) {
+        cJSON_Delete(json);
     }
     memset(th, 0, sizeof(th));
     memset(signature, 0, sizeof(signature));
     memset(authNonce, 0, sizeof(authNonce));
     memset(&challengeCookie, 0, sizeof(challengeCookie));
-    return err;
+    mbedtls_sha256_free(&sha256Ctx);
+    gbWipe(&respBody);
+    gbReset(&respBody, true);
+    gbWipe(&reqBody);
+    gbReset(&reqBody, true);
+
+    // Done
+    return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
 static esp_err_t serveWs(httpd_req_t *req)
 {
+    AutoRundownProtection rpLock(rp);
+
+    if (!rpLock.acquired()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (req->method == 0) {
         return serveWsPacket(req);
     }
@@ -661,76 +973,82 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
 {
     ServerContext_t *serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
     IPAddress_t remoteAddr;
-    const char *rawQuery;
+    GrowableBuffer_t reqQueryParams;
     char tokenB64[CHALLENGE_COOKIE_SIZE * 4 / 3 + 2];
     char wsNonceB64[CHALLENGE_NONCE_SIZE * 4 / 3 + 2];
     char signatureB64[P256_SIGNATURE_SIZE * 4 / 3 + 2];
     ChallengeCookie_t challengeCookie;
+    bool removeChallenge = false;
     ChallengeNonce_t wsNonce;
     uint8_t signature[P256_SIGNATURE_SIZE];
     size_t challengeCookieLen;
     size_t wsNonceLen;
     size_t signatureLen;
     Challenge_t *challenge;
-    Sha256 hash256;
+    mbedtls_sha256_context sha256Ctx;
     uint8_t th[SHA256_SIZE];
-    ECDHKeyPair ecdhKeyPair;
+    P256KeyPair_t ecdhKeyPair;
     uint8_t info[6 + 2 * P256_PUBLIC_KEY_SIZE];
     uint8_t salt[SHA256_SIZE];
     uint8_t sharedSecret[AES_KEY_LEN];
     uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN];
     SessionInfo_t *session;
     bool b;
-    size_t connCount;
     esp_err_t err;
-
-    err = setDefaultCORS(req);
-    if (err != ESP_OK) {
-        goto done;
-    }
 
     // Is OPTIONS?
     if (req->method == HTTP_OPTIONS) {
-        httpd_resp_set_status(req, HTTPD_204);
-        httpd_resp_send(req, nullptr, 0);
-        return ESP_OK;
+        return httpSendPreflightResponse(req);
+    }
+
+    // Prepare
+    reqQueryParams = GB_STATIC_INIT;
+    mbedtls_sha256_init(&sha256Ctx);
+    p256KeyPairInit(&ecdhKeyPair);
+
+    // Send CORS
+    err = httpSendDefaultCORS(req);
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Check if it is a real websocket request. ESP_HTTP_SERVER calls the handle even
     // when not a websocket connection
     if (httpd_req_get_hdr_value_len(req, "Upgrade") == 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
-        return ESP_FAIL;
+        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
+        goto done;
     }
 
     // Get request IP address
-    if (!getClientIpFromRequest(req, &remoteAddr)) {
+    if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
         ESP_LOGE(TAG, "Failed to get client IP address");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, nullptr);
-        return ESP_FAIL;
-    }
-
-    // Check rate limit
-    if (!rateLimitCheckRequest(&remoteAddr)) {
-        httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
-        return ESP_FAIL;
-    }
-
-    // Read request quey
-    rawQuery = parseRequestQuery(serverCtx, req);
-    if (!rawQuery) {
         err = ESP_FAIL;
         goto done;
     }
 
+    // Check rate limit
+    if (!rateLimitCheckRequest(&remoteAddr)) {
+        err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
+        goto done;
+    }
+
+    // Read request quey
+    err = httpGetRequestQueryParams(&reqQueryParams, req, MAX_QUERY_SIZE);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_INVALID_SIZE) {
+            err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Query too long");
+        }
+        goto done;
+    }
+
     // Extract parameters from url query
-    if (httpd_query_key_value(rawQuery, "token", tokenB64, sizeof(tokenB64)) != ESP_OK ||
-        httpd_query_key_value(rawQuery, "wsNonce", wsNonceB64, sizeof(wsNonceB64)) != ESP_OK ||
-        httpd_query_key_value(rawQuery, "signature", signatureB64, sizeof(signatureB64)) != ESP_OK
+    if (
+        httpd_query_key_value((const char*)reqQueryParams.buffer, "token", tokenB64, sizeof(tokenB64)) != ESP_OK ||
+        httpd_query_key_value((const char*)reqQueryParams.buffer, "wsNonce", wsNonceB64, sizeof(wsNonceB64)) != ESP_OK ||
+        httpd_query_key_value((const char*)reqQueryParams.buffer, "signature", signatureB64, sizeof(signatureB64)) != ESP_OK
     ) {
-error400:
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
-        err = ESP_FAIL;
+err_invalid_data:
+        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
 
@@ -738,53 +1056,66 @@ error400:
     challengeCookieLen = sizeof(challengeCookie);
     wsNonceLen = sizeof(wsNonce);
     signatureLen = sizeof(signature);
-    if ((!fromB64(tokenB64, strlen(tokenB64), true, challengeCookie, &challengeCookieLen)) ||
-        (!fromB64(wsNonceB64, strlen(wsNonceB64), true, wsNonce, &wsNonceLen)) ||
-        (!fromB64(signatureB64, strlen(signatureB64), true, signature, &signatureLen)) ||
-        challengeCookieLen != CHALLENGE_COOKIE_SIZE ||
-        wsNonceLen != CHALLENGE_NONCE_SIZE ||
-        signatureLen != P256_SIGNATURE_SIZE
+    if (
+        (!fromB64(tokenB64, strlen(tokenB64), true, challengeCookie, &challengeCookieLen)) || challengeCookieLen != CHALLENGE_COOKIE_SIZE ||
+        (!fromB64(wsNonceB64, strlen(wsNonceB64), true, wsNonce, &wsNonceLen)) || wsNonceLen != CHALLENGE_NONCE_SIZE ||
+        (!fromB64(signatureB64, strlen(signatureB64), true, signature, &signatureLen)) ||signatureLen != P256_SIGNATURE_SIZE
     ) {
-        goto error400;
+        goto err_invalid_data;
     }
 
     // Lookup challenge and check if the user is authenticated
     challenge = challengesFind(challengeCookie, &remoteAddr);
     if (!challenge) {
-error401_nc:
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, nullptr);
-        err = ESP_FAIL;
+error_not_auth:
+        err = httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, nullptr);
         goto done;
     }
+    removeChallenge = true;
+
     if ((!challenge->verified) ||
         (!constantTimeCompare(challenge->wsNonce, wsNonce, CHALLENGE_NONCE_SIZE))
     ) {
-error401:
-        challengesRemove(challengeCookie);
-        goto error401_nc;
+        goto error_not_auth;
     }
 
     // th = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie || ws_nonce)
-    hash256.init();
-    hash256.update("ws-login-v1", 11);
-    hash256.update(challenge->serverNonce, sizeof(challenge->serverNonce));
-    hash256.update(challenge->clientNonce, sizeof(challenge->clientNonce));
-    hash256.update(challengeCookie, sizeof(challengeCookie));
-    hash256.update(wsNonce, sizeof(wsNonce));
-    hash256.finalize(th);
-    if (hash256.error() != ESP_OK) {
-        goto error401;
+    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, wsNonce, sizeof(wsNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_finish(&sha256Ctx, th);
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
         if (err == MBEDTLS_ERR_ECP_VERIFY_FAILED) {
-            goto error401;
+            challengesRemove(challengeCookie);
+            goto error_not_auth;
         }
-error500:
-        challengesRemove(challengeCookie);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, ((err == ESP_ERR_NO_MEM) ? "" : nullptr));
         goto done;
     }
 
@@ -794,31 +1125,45 @@ error500:
     memcpy(info + 6 + sizeof(challenge->ecdhServerPublicKey), challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
 
     // Build salt = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie)
-    hash256.init();
-    hash256.update("ws-login-v1", 11);
-    hash256.update(challenge->serverNonce, sizeof(challenge->serverNonce));
-    hash256.update(challenge->clientNonce, sizeof(challenge->clientNonce));
-    hash256.update(challengeCookie, sizeof(challengeCookie));
-    hash256.finalize(salt);
-    err = hash256.error();
+    err = mbedtls_sha256_starts(&sha256Ctx, 0);
     if (err != ESP_OK) {
-        goto error500;
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = mbedtls_sha256_finish(&sha256Ctx, salt);
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Compute shared secret and derive keys
-    err = ecdhKeyPair.loadPrivateKey(challenge->ecdhServerPrivateKey);
+    err = p256LoadPrivateKey(&ecdhKeyPair, challenge->ecdhServerPrivateKey);
     if (err == ESP_OK) {
-        err = ecdhKeyPair.loadPublicKey(challenge->ecdhClientPublicKey);
+        err = p256LoadPublicKey(&ecdhKeyPair, challenge->ecdhClientPublicKey);
         if (err == ESP_OK) {
-            err = ecdhKeyPair.computeSharedSecret(sharedSecret);
+            err = ecdhComputeSharedSecret(&ecdhKeyPair, sharedSecret);
         }
     }
-    if (err == ESP_OK) {
-        err = hkdfSha256DeriveKey(sharedSecret, AES_KEY_LEN, salt, sizeof(salt), info, sizeof(info),
-                                  derivedKey, sizeof(derivedKey));
-    }
     if (err != ESP_OK) {
-        goto error500;
+        goto done;
+    }
+    err = hkdfSha256DeriveKey(sharedSecret, AES_KEY_LEN, salt, sizeof(salt), info, sizeof(info), derivedKey, sizeof(derivedKey));
+    if (err != ESP_OK) {
+        goto done;
     }
 
     // Get server context
@@ -828,71 +1173,79 @@ error500:
     session = createSession();
     if (!session) {
         err = ESP_ERR_NO_MEM;
-        goto error500;
+        goto done;
     }
+    session->serverCtx = serverCtx;
     session->sockfd = httpd_req_to_sockfd(req);
     memcpy(&session->addr, &remoteAddr, sizeof(remoteAddr));
     session->userId = challenge->userId;
     session->nextRxCounter = 1;
     session->nextTxCounter = 1;
-    memcpy(session->nonce, challenge->wsNonce, sizeof(ChallengeNonce_t));
 
-    err = session->clientAes->setKey(derivedKey, AES_KEY_LEN);
+    memcpy(session->nonce, challenge->wsNonce, sizeof(ChallengeNonce_t));
+    err = aesSetKey(&session->clientAesCtx, derivedKey, AES_KEY_LEN);
     if (err != ESP_OK) {
+err_destroy_session_and_done:
         destroySession(session);
-        goto error500;
+        goto done;
     }
-    err = session->serverAes->setKey(derivedKey + AES_KEY_LEN, AES_KEY_LEN);
+    err = aesSetKey(&session->serverAesCtx, derivedKey + AES_KEY_LEN, AES_KEY_LEN);
     if (err != ESP_OK) {
-        destroySession(session);
-        goto error500;
+        goto err_destroy_session_and_done;
     }
     memcpy(session->clientBaseIV, derivedKey + 2 * AES_KEY_LEN, SESSION_IV_LEN);
     memcpy(session->serverBaseIV, derivedKey + 2 * AES_KEY_LEN + SESSION_IV_LEN, SESSION_IV_LEN);
+
     err = userIsAdmin(session->userId, &b);
     if (err != ESP_OK) {
-        destroySession(session);
-        goto error500;
+        goto err_destroy_session_and_done;
     }
     session->isAdmin = (b) ? 1 : 0;
+
     err = userMustChangeCredentials(session->userId, &b);
     if (err != ESP_OK) {
-        destroySession(session);
-        goto error500;
+        goto err_destroy_session_and_done;
     }
     session->mustChangeCredentials = (b) ? 1 : 0;
 
     // Bind our internal session to the connection
     httpd_sess_set_ctx(req->handle, session->sockfd, session, destroySessionCtx);
 
+    // Add the session to the server's sessions list
+    rwMutexLockWrite(&serverCtx->sessions.mtx);
+    session->prev = serverCtx->sessions.last;
+    if (serverCtx->sessions.last) {
+        serverCtx->sessions.last->next = session;
+    }
+    else {
+        serverCtx->sessions.first = session;
+    }
+    serverCtx->sessions.last = session;
+    rwMutexUnlockWrite(&serverCtx->sessions.mtx);
+
     // Call session start callback
-    err = handleSessionStart(session);
-    if (err != ESP_OK) {
-        goto error500;
+    if (handleSessionStart(session, req, &err)) {
+        goto done;
     }
 
     // Look for existing sessions for the same user and close them
-    connCount = serverCtx->maxConnectionsCount;
-    err = httpd_get_client_list(req->handle, &connCount, serverCtx->clientSocketsBuffer);
-    if (err != ESP_OK) {
-        goto error500;
-    }
-    for (size_t i = 0; i < connCount; i++) {
-        SessionInfo_t *otherSession;
-
+    rwMutexLockRead(&serverCtx->sessions.mtx);
+    for (SessionInfo_t *otherSession = serverCtx->sessions.first;
+         otherSession;
+         otherSession = otherSession->next
+    ) {
         // Dont close our own session
-        if (serverCtx->clientSocketsBuffer[i] == session->sockfd) {
+        if (otherSession->sockfd == session->sockfd) {
             continue;
         }
-        otherSession = (SessionInfo_t *)httpd_sess_get_ctx(req->handle, serverCtx->clientSocketsBuffer[i]);
-        if (otherSession && otherSession->userId == session->userId) {
+
+        if (otherSession->userId == session->userId) {
             ESP_LOGD(TAG, "Closing old session %u for user %u", otherSession->id, otherSession->userId);
-            closeWebsocket(req->handle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "New connection detected");
+            otherSession->isClosed = true;
+            closeWs(req->handle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "New connection detected");
         }
     }
-
-    // Remove challenge
-    challengesRemove(challengeCookie);
+    rwMutexUnlockRead(&serverCtx->sessions.mtx);
 
     // Reset rate limits for successful access
     rateLimitResetAddress(&remoteAddr);
@@ -902,6 +1255,9 @@ error500:
 
 done:
     // Cleanup
+    if (removeChallenge) {
+        challengesRemove(challengeCookie);
+    }
     memset(derivedKey, 0, sizeof(derivedKey));
     memset(sharedSecret, 0, sizeof(sharedSecret));
     memset(salt, 0, sizeof(salt));
@@ -911,80 +1267,81 @@ done:
     memset(challengeCookie, 0, sizeof(challengeCookie));
     memset(wsNonceB64, 0, sizeof(wsNonceB64));
     memset(tokenB64, 0, sizeof(tokenB64));
-    return err;
+    p256KeyPairDone(&ecdhKeyPair);
+    mbedtls_sha256_free(&sha256Ctx);
+    gbWipe(&reqQueryParams);
+    gbReset(&reqQueryParams, true);
+
+    // Done
+    return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
 static esp_err_t serveWsPacket(httpd_req_t *req)
 {
-    httpd_ws_frame_t frame;
     uint8_t iv[SESSION_IV_LEN];
     WebSocketPacketHeader_t *hdr;
     size_t dataAndTagLen;
     CommandContext_t commandCtx;
+    bool messageComplete;
     esp_err_t err;
 
-    commandCtx.serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
-
     // Get session from session context
+    commandCtx.serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
     commandCtx.serverHandle = req->handle;
     commandCtx.sockfd = httpd_req_to_sockfd(req);
     commandCtx.session = (SessionInfo_t *)httpd_sess_get_ctx(commandCtx.serverHandle, commandCtx.sockfd);
     if (!commandCtx.session) {
         ESP_LOGD(TAG, "Session not found.");
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_APP_SESSION_NOT_FOUND, nullptr);
-        return ESP_FAIL;
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_APP_SESSION_NOT_FOUND, nullptr);
+    }
+
+    // Check if already closed
+    if (commandCtx.session->isClosed) {
+        return ESP_OK;
     }
 
     // Read WebSocket packet
-    err = readWsPacket(commandCtx.serverCtx, req, &frame);
+    err = readWsPacket(commandCtx.serverCtx, commandCtx.session, req, &messageComplete);
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Unable to read WebSocket packet. Error: %ld.", err);
-        return ESP_FAIL;
+        if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_SIZE || err == ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGD(TAG, "Invalid or unexpected WebSocket packet. Error: %ld.", err);
+        }
+        else {
+            ESP_LOGD(TAG, "Unable to read WebSocket packet. Error: %ld.", err);
+        }
+        return closeWsWithCmdCtxAndError(&commandCtx, err);
+    }
+    if (!messageComplete) {
+        // Nothing to do if the message is not complete
+        return ESP_OK;
     }
 
     // We only accept binary messages
-    switch (frame.type) {
-        case HTTPD_WS_TYPE_TEXT:
-            ESP_LOGD(TAG, "Non binary packet.");
-            closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_UNSUPPORTED_DATA, nullptr);
-            return ESP_OK;
-
-        case HTTPD_WS_TYPE_BINARY:
-            // The only type we accept
-            break;
-
-        default:
-            return ESP_OK;
+    if (commandCtx.session->incomingMessageType != IncomingBufferTypeBinary) {
+        ESP_LOGD(TAG, "Non binary packet.");
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_UNSUPPORTED_DATA, nullptr);
     }
 
     // Check message size (the payload must be, at least, 1 byte plus the TAG)
-    if (frame.len <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
+    if (commandCtx.session->ciphertextIn.used <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
         ESP_LOGD(TAG, "Short packet.");
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
-    }
-    if (frame.len > sizeof(WebSocketPacketHeader_t) + TAG_LEN + MAX_MSG_SIZE) {
-        ESP_LOGD(TAG, "Long packet.");
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Extract header and validate version and RX counter (a.k.a. nonce)
-    hdr = (WebSocketPacketHeader_t *)frame.payload;
+    hdr = (WebSocketPacketHeader_t *)commandCtx.session->ciphertextIn.buffer;
     if (hdr->v != VERSION) {
         ESP_LOGD(TAG, "Unsupported version packet.");
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     commandCtx.rxCounter = be32dec(hdr->counter);
     if (commandCtx.session->nextRxCounter != commandCtx.rxCounter) {
         ESP_LOGD(TAG, "Counter mismatch.");
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     commandCtx.session->nextRxCounter += 1;
     commandCtx.cmd = be16dec(hdr->cmd);
-    dataAndTagLen = frame.len - sizeof(WebSocketPacketHeader_t);
+    dataAndTagLen = commandCtx.session->ciphertextIn.used - sizeof(WebSocketPacketHeader_t);
 
     // Build IV
     memcpy(iv, commandCtx.session->clientBaseIV, SESSION_IV_LEN);
@@ -993,29 +1350,33 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     }
 
     // Prepare output for decrypted message
-    gbReset(&commandCtx.serverCtx->plaintext, false);
-    if (!gbEnsureSize(&commandCtx.serverCtx->plaintext, dataAndTagLen - TAG_LEN)) {
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
-        return ESP_OK;
+    gbReset(&commandCtx.session->plaintextIn, false);
+    if (!gbEnsureSize(&commandCtx.session->plaintextIn, dataAndTagLen - TAG_LEN)) {
+        return closeWsWithCmdCtxAndError(&commandCtx, ESP_ERR_NO_MEM);
     }
 
     // Decrypt message
-    err = commandCtx.session->clientAes->decrypt(frame.payload + sizeof(WebSocketPacketHeader_t), dataAndTagLen,
-                                                 iv, sizeof(iv), nullptr, 0, commandCtx.serverCtx->plaintext.buffer);
+    err = aesDecrypt(&commandCtx.session->clientAesCtx, commandCtx.session->ciphertextIn.buffer + sizeof(WebSocketPacketHeader_t),
+                     dataAndTagLen, iv, sizeof(iv), nullptr, 0, commandCtx.session->plaintextIn.buffer);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Unable to decrypt message. Error: %ld.", err);
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        if (err == MBEDTLS_ERR_GCM_AUTH_FAILED) {
+            return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
+        }
+        return closeWsWithCmdCtxAndError(&commandCtx, err);
     }
+
+    // Cleanup incoming message internals
+    commandCtx.session->incomingMessageType = IncomingBufferTypeNone;
+    gbReset(&commandCtx.session->ciphertextIn, false);
 
     // Check if the only accepted command is to change the credentials
     if (commandCtx.session->mustChangeCredentials != 0 && commandCtx.cmd != CMD_CHANGE_USER_CREDENTIALS) {
         ESP_LOGD(TAG, "User must change the access credentials.");
-        closeWebsocket(commandCtx.serverHandle, commandCtx.sockfd, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
-        return ESP_OK;
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
     }
 
-    commandCtx.br = br_init(commandCtx.serverCtx->plaintext.buffer, dataAndTagLen - TAG_LEN);
+    commandCtx.br = br_init(commandCtx.session->plaintextIn.buffer, dataAndTagLen - TAG_LEN);
     switch (commandCtx.cmd) {
         case CMD_CREATE_USER:
             return handleCreateUser(&commandCtx);
@@ -1043,33 +1404,31 @@ static esp_err_t handleCreateUser(CommandContext_t *commandCtx)
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "CREATE USER command: Insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
     }
 
     // Get user name
     if ((!br_read_str(&commandCtx->br, &name, &nameLen)) || nameLen == 0) {
         ESP_LOGD(TAG, "CREATE USER command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Get the new public key
     if (!br_read_blob(&commandCtx->br, P256_PUBLIC_KEY_SIZE, &publicKey)) {
         ESP_LOGD(TAG, "CREATE USER command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
 
     // Check if the user already exists
     if (userCreate(name, nameLen, publicKeyBuf) == 0) {
         ESP_LOGD(TAG, "CREATE USER command: Unable to create new user.");
-        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to create new user", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to create new user", commandCtx->rxCounter, true);
     }
 
     // Done
     ESP_LOGD(TAG, "CREATE USER command: User successfully created.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
 static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
@@ -1078,60 +1437,53 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
     size_t nameLen;
     uint32_t targetUserId;
     bool isAdmin = false;
-    int *clientSocketsBuffer;
-    size_t connCount;
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "DELETE USER command: Insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
     }
 
     // Get user name
     if ((!br_read_str(&commandCtx->br, &name, &nameLen)) || nameLen == 0) {
         ESP_LOGD(TAG, "DELETE USER command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Find the user
     targetUserId = userGetID(name, nameLen);
     if (targetUserId == 0 || userIsAdmin(targetUserId, &isAdmin) != ESP_OK) {
         ESP_LOGD(TAG, "DELETE USER command: User not found.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter, true);
     }
 
     // Check if the user is admin
     if (isAdmin) {
         ESP_LOGD(TAG, "DELETE USER command: Cannot delete administrator.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot delete admin user", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot delete admin user", commandCtx->rxCounter, true);
     }
 
     // Delete it
     userDestroy(targetUserId);
 
-    // Delete active user sessions
-    clientSocketsBuffer = commandCtx->serverCtx->clientSocketsBuffer;
-    connCount = commandCtx->serverCtx->maxConnectionsCount;
-    if (httpd_get_client_list(commandCtx->serverHandle, &connCount, clientSocketsBuffer) == ESP_OK) {
-        for (size_t i = 0; i < connCount; i++) {
-            SessionInfo_t *otherSession;
+    // Delete active target user sessions
+    rwMutexLockRead(&commandCtx->serverCtx->sessions.mtx);
+    for (SessionInfo_t *otherSession = commandCtx->serverCtx->sessions.first; otherSession; otherSession = otherSession->next) {
+        // Dont close our own session
+        if (otherSession->sockfd == commandCtx->sockfd) {
+            continue;
+        }
 
-            // Dont close our own session
-            if (clientSocketsBuffer[i] == commandCtx->sockfd) {
-                continue;
-            }
-
-            otherSession = (SessionInfo_t *)httpd_sess_get_ctx(commandCtx->serverHandle, clientSocketsBuffer[i]);
-            if (otherSession && otherSession->userId == targetUserId) {
-                ESP_LOGD(TAG, "Closing session %u for deleted user %u", otherSession->id, otherSession->userId);
-                closeWebsocket(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User has been deleted");
-            }
+        if (otherSession->userId == targetUserId) {
+            ESP_LOGD(TAG, "Closing session %u for deleted user %u", otherSession->id, otherSession->userId);
+            otherSession->isClosed = true;
+            closeWs(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User has been deleted");
         }
     }
+    rwMutexUnlockRead(&commandCtx->serverCtx->sessions.mtx);
 
     // Done
     ESP_LOGD(TAG, "DELETE USER command: User successfully deleted.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
 static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
@@ -1142,26 +1494,22 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
     bool targetIsAdmin;
     const uint8_t *publicKey;
     uint8_t publicKeyBuf[P256_PUBLIC_KEY_SIZE];
-    int *clientSocketsBuffer;
-    size_t connCount;
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
     }
 
     // Get user name
     if ((!br_read_str(&commandCtx->br, &name, &nameLen)) || nameLen == 0) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Get the new public key
     if (!br_read_blob(&commandCtx->br, P256_PUBLIC_KEY_SIZE, &publicKey)) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
 
@@ -1169,50 +1517,46 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
     targetUserId = userGetID(name, nameLen);
     if (targetUserId == 0) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: User not found.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter, true);
     }
 
     // Check if the user is the same than us
     if (commandCtx->session->userId == targetUserId) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Cannot reset own credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset own credentials", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset own credentials", commandCtx->rxCounter, true);
     }
 
     // Check if the target user is an admin
     if (userIsAdmin(targetUserId, &targetIsAdmin) != ESP_OK || targetIsAdmin) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Cannot reset user credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset user credentials", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset user credentials", commandCtx->rxCounter, true);
     }
 
     // Change the user public key
     if (userChangeCredentials(targetUserId, commandCtx->session->userId, publicKeyBuf) != ESP_OK) {
         ESP_LOGD(TAG, "RESET USER PASSWORD command: Unable to reset user credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to reset user credentials", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to reset user credentials", commandCtx->rxCounter, true);
     }
 
     // Delete active target user sessions
-    clientSocketsBuffer = commandCtx->serverCtx->clientSocketsBuffer;
-    connCount = commandCtx->serverCtx->maxConnectionsCount;
-    if (httpd_get_client_list(commandCtx->serverHandle, &connCount, clientSocketsBuffer) == ESP_OK) {
-        for (size_t i = 0; i < connCount; i++) {
-            SessionInfo_t *otherSession;
+    rwMutexLockRead(&commandCtx->serverCtx->sessions.mtx);
+    for (SessionInfo_t *otherSession = commandCtx->serverCtx->sessions.first; otherSession; otherSession = otherSession->next) {
+        // Dont close our own session
+        if (otherSession->sockfd == commandCtx->sockfd) {
+            continue;
+        }
 
-            // Don't close our own session
-            if (clientSocketsBuffer[i] == commandCtx->sockfd) {
-                continue;
-            }
-
-            otherSession = (SessionInfo_t *)httpd_sess_get_ctx(commandCtx->serverHandle, clientSocketsBuffer[i]);
-            if (otherSession && otherSession->userId == targetUserId) {
-                ESP_LOGD(TAG, "Closing session %u for deleted user %u", otherSession->id, otherSession->userId);
-                closeWebsocket(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User credentials has been reset");
-            }
+        if (otherSession->userId == targetUserId) {
+            ESP_LOGD(TAG, "Closing session %u for deleted user %u", otherSession->id, otherSession->userId);
+            otherSession->isClosed = true;
+            closeWs(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User credentials has been reset");
         }
     }
+    rwMutexUnlockRead(&commandCtx->serverCtx->sessions.mtx);
 
     // Done
     ESP_LOGD(TAG, "RESET USER PASSWORD command: User password successfully changed.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
 static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
@@ -1220,40 +1564,48 @@ static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
     const uint8_t *signature;
     const uint8_t *publicKey;
     uint8_t publicKeyBuf[P256_PUBLIC_KEY_SIZE];
-    Sha256 hash256;
+    mbedtls_sha256_context sha256Ctx;
     uint8_t th[SHA256_SIZE];
     uint8_t signatureToVerify[P256_SIGNATURE_SIZE];
+    esp_err_t err;
 
     // Get the signature validation for the old key
     if (!br_read_blob(&commandCtx->br, P256_SIGNATURE_SIZE, &signature)) {
         ESP_LOGD(TAG, "CHANGE PASSWORD command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Get the new public key
     if (!br_read_blob(&commandCtx->br, P256_PUBLIC_KEY_SIZE, &publicKey)) {
         ESP_LOGD(TAG, "CHANGE PASSWORD command: Invalid packet.");
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
 
     // th = SHA256("ws-chgcreds-v1" || publicKey || ws_nonce)
-    hash256.init();
-    hash256.update("ws-chgcreds-v1", 14);
-    hash256.update(publicKeyBuf, P256_PUBLIC_KEY_SIZE);
-    hash256.update(commandCtx->session->nonce, sizeof(commandCtx->session->nonce));
-    hash256.finalize(th);
-    if (hash256.error() != ESP_OK) {
+    mbedtls_sha256_init(&sha256Ctx);
+    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    if (err == ESP_OK) {
+        err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-chgcreds-v1", 14);
+        if (err == ESP_OK) {
+            err = mbedtls_sha256_update(&sha256Ctx, publicKeyBuf, P256_PUBLIC_KEY_SIZE);
+            if (err == ESP_OK) {
+                err = mbedtls_sha256_update(&sha256Ctx, commandCtx->session->nonce, sizeof(commandCtx->session->nonce));
+                if (err == ESP_OK) {
+                    err = mbedtls_sha256_finish(&sha256Ctx, th);
+                }
+            }
+        }
+    }
+    mbedtls_sha256_free(&sha256Ctx);
+    if (err != ESP_OK) {
 error_validation_failed:
         ESP_LOGD(TAG, "CHANGE PASSWORD command: Validation failed.");
         if (commandCtx->session->credentialsChangeAttempts < 2) {
             commandCtx->session->credentialsChangeAttempts += 1;
-            return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Validation failed", commandCtx->rxCounter);
+            return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Validation failed", commandCtx->rxCounter, true);
         }
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_POLICY_VIOLATION, nullptr);
-        return ESP_OK;
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_POLICY_VIOLATION, nullptr);
     }
 
     // Validate old public key
@@ -1268,21 +1620,31 @@ error_validation_failed:
     // Change the user public key
     if (userChangeCredentials(commandCtx->session->userId, commandCtx->session->userId, publicKeyBuf) != ESP_OK) {
         ESP_LOGD(TAG, "CHANGE PASSWORD command: Unable to change user credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to change user credentials", commandCtx->rxCounter);
+        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to change user credentials", commandCtx->rxCounter, true);
     }
 
     commandCtx->session->mustChangeCredentials = 0;
 
     // Done
     ESP_LOGD(TAG, "CHANGE PASSWORD command: Credentials successfully changed.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
 static esp_err_t handleCustomCommand(CommandContext_t *commandCtx)
 {
     IotCommEventCustomCommand_t eventData;
+    OnTheFlyEventListItem_t otfeItem;
+
+    // Setup on-the-fly event
+    memset(&otfeItem, 0, sizeof(otfeItem));
+    otfeGenerateID(&otfeItem);
+    otfeItem.session = commandCtx->session;
+    otfeItem.pCustomCommandEventData = &eventData;
+    otfeItem.commandCtx = commandCtx;
 
     // Populate event data
+    eventData.eventId = otfeItem.eventId;
+    eventData.handlerCtx = handlerCtx;
     eventData.sessionId = commandCtx->session->id;
     eventData.userId = commandCtx->session->userId;
     eventData.userIsAdmin = (commandCtx->session->isAdmin != 0) ? true : false;
@@ -1290,108 +1652,138 @@ static esp_err_t handleCustomCommand(CommandContext_t *commandCtx)
     eventData.data = commandCtx->br.ptr;
     eventData.dataLen = commandCtx->br.len;
 
-    auto replyImpl = [commandCtx](const uint8_t *reply, size_t replyLen) -> bool {
-        esp_err_t err;
+    // Add on-the-fly event item
+    {
+        AutoRWMutex lock(otfeRwMtx, false);
 
-        err = buildAndSendReply(commandCtx, reply, replyLen, commandCtx->rxCounter);
-        return !!(err == ESP_OK);
-    };
-    eventData.reply = replyImpl;
-
-    auto replywithErrorImpl = [commandCtx](uint32_t code, const char *message) -> bool {
-        esp_err_t err;
-
-        err = buildAndSendErrorReply(commandCtx, code, message, commandCtx->rxCounter);
-        return !!(err == ESP_OK);
-    };
-    eventData.replyWithError = replywithErrorImpl;
-
-    auto closeImpl = [commandCtx](uint16_t reason, const char *message) -> void {
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, reason, message);
-    };
-    eventData.close = closeImpl;
-
-    auto getUserDataImpl = [commandCtx]() -> void* {
-        return commandCtx->session->userData;
-    };
-    eventData.getUserData = getUserDataImpl;
+        otfePushBack(&otfeItem);
+    }
 
     // Raise event
     handler(IotCommEventCustomCommand, &eventData);
+
+    // Remove on-the-fly event item
+    {
+        AutoRWMutex lock(otfeRwMtx, false);
+
+        otfeRemove(&otfeItem);
+    }
+
+    if (otfeItem.closeSent) {
+        return otfeItem.closeErr;
+    }
+    if (otfeItem.replySent) {
+        return otfeItem.savedErr;
+    }
 
     // Done
     return ESP_OK;
 }
 
-static esp_err_t handleSessionStart(SessionInfo_t *session)
+static bool handleSessionStart(SessionInfo_t *session, httpd_req_t *req, esp_err_t *closeErr)
 {
     IotCommEventSessionStart_t eventData;
-    esp_err_t err = ESP_OK;
+    OnTheFlyEventListItem_t otfeItem;
+
+    // Setup on-the-fly event
+    memset(&otfeItem, 0, sizeof(otfeItem));
+    otfeGenerateID(&otfeItem);
+    otfeItem.session = session;
+    otfeItem.pSessionStartEventData = &eventData;
+    otfeItem.req = req;
 
     // Populate event data
+    eventData.eventId = otfeItem.eventId;
+    eventData.handlerCtx = handlerCtx;
     eventData.sessionId = session->id;
     eventData.userId = session->userId;
     eventData.userIsAdmin = (session->isAdmin != 0) ? true : false;
 
-    auto setErrorImpl = [&err](esp_err_t _err) -> void {
-        err = _err;
-    };
-    eventData.setError = setErrorImpl;
+    // Add on-the-fly event item
+    {
+        AutoRWMutex lock(otfeRwMtx, false);
 
-    auto setUserDataImpl = [session](const void *ptr, IotCommUserDataFreeFunc_t freeFn) -> void {
-        session->userData = (void *)ptr;
-        session->userDataFreeFn = freeFn;
-    };
-    eventData.setUserData = setUserDataImpl;
+        otfePushBack(&otfeItem);
+    }
 
     // Raise event
     handler(IotCommEventSessionStart, &eventData);
 
+    // Remove on-the-fly event item
+    {
+        AutoRWMutex lock(otfeRwMtx, false);
+
+        otfeRemove(&otfeItem);
+    }
+
     // Done
-    return err;
+    *closeErr = otfeItem.closeErr;
+    return otfeItem.closeSent;
 }
 
 static void handleSessionEnd(SessionInfo_t *session)
 {
     IotCommEventSessionEnd_t eventData;
+    OnTheFlyEventListItem_t otfeItem;
+
+    // Setup on-the-fly event
+    memset(&otfeItem, 0, sizeof(otfeItem));
+    otfeGenerateID(&otfeItem);
+    otfeItem.session = session;
+    otfeItem.pSessionEndEventData = &eventData;
 
     // Populate event data
+    eventData.eventId = otfeItem.eventId;
+    eventData.handlerCtx = handlerCtx;
     eventData.sessionId = session->id;
     eventData.userId = session->userId;
 
-    auto getUserDataImpl = [session]() -> void* {
-        return session->userData;
-    };
-    eventData.getUserData = getUserDataImpl;
+    // Add on-the-fly event item
+    {
+        AutoRWMutex lock(otfeRwMtx, false);
+
+        otfePushBack(&otfeItem);
+    }
 
     // Raise event
     handler(IotCommEventSessionEnd, &eventData);
+
+    // Remove on-the-fly event item
+    {
+        AutoRWMutex lock(otfeRwMtx, false);
+
+        otfeRemove(&otfeItem);
+    }
 }
 
-static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintext, size_t plaintextLen, uint32_t replyCounter)
+static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, uint32_t replyCounter,
+                                   bool closeOnError)
 {
-    GrowableBuffer_t *outBuf = &commandCtx->serverCtx->ciphertext;
+    GrowableBuffer_t *ciphertextOut = &commandCtx->session->ciphertextOut;
     WebSocketPacketHeader_t *hdr;
     uint32_t nextTxCounter;
     httpd_ws_frame_t frame;
     uint8_t iv[SESSION_IV_LEN];
+    size_t toSendSize;
+    uint8_t *toSendPtr;
+    httpd_ws_type_t toSendFrameType;
     esp_err_t err;
 
     // The plain text must not be empty
-    if (plaintextLen == 0) {
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
-        return ESP_OK;
+    if (plaintextOutLen == 0) {
+        return ESP_FAIL;
     }
 
     // Prepare output for encrypted message
-    gbReset(outBuf, false);
-    if (!gbEnsureSize(outBuf, sizeof(WebSocketPacketHeader_t) + plaintextLen + TAG_LEN)) {
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
-        return ESP_OK;
+    gbReset(ciphertextOut, false);
+    if (!gbEnsureSize(ciphertextOut, sizeof(WebSocketPacketHeader_t) + plaintextOutLen + TAG_LEN)) {
+        err = ESP_ERR_NO_MEM;
+on_error:
+        return (closeOnError) ? closeWsWithCmdCtxAndError(commandCtx, err) : err;
     }
 
     // Header
-    hdr = (WebSocketPacketHeader_t *)outBuf->buffer;
+    hdr = (WebSocketPacketHeader_t *)ciphertextOut->buffer;
     hdr->v = VERSION;
     be16enc(hdr->cmd, commandCtx->cmd);
     hdr->filler1 = 0;
@@ -1407,26 +1799,40 @@ static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *
     }
 
     // Encrypt message
-    err = commandCtx->session->serverAes->encrypt(plaintext, plaintextLen, iv, SESSION_IV_LEN, nullptr, 0,
-                                                  outBuf->buffer + sizeof(WebSocketPacketHeader_t));
+    err = aesEncrypt(&commandCtx->session->serverAesCtx, plaintextOut, plaintextOutLen, iv, SESSION_IV_LEN,
+                     nullptr, 0, ciphertextOut->buffer + sizeof(WebSocketPacketHeader_t));
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Unable to encrypt message. Error: %ld.", err);
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
-        return ESP_OK;
+        goto on_error;
     }
 
     // Send it
-    memset(&frame, 0, sizeof(frame));
-    frame.final = true;
-    frame.type = HTTPD_WS_TYPE_BINARY;
-    frame.len = sizeof(WebSocketPacketHeader_t) + plaintextLen + TAG_LEN;
-    frame.payload = outBuf->buffer;
+    toSendSize = sizeof(WebSocketPacketHeader_t) + plaintextOutLen + TAG_LEN;
+    toSendPtr = ciphertextOut->buffer;
+    toSendFrameType = HTTPD_WS_TYPE_BINARY;
+    while (toSendSize > 0) {
+        // Build frame
+        memset(&frame, 0, sizeof(frame));
+        frame.type = toSendFrameType;
+        if (toSendSize <= MAX_OUTPUT_FRAME_SIZE) {
+            frame.len = toSendSize;
+            frame.final = false;
+        }
+        else {
+            frame.len = MAX_OUTPUT_FRAME_SIZE;
+            frame.final = true;
+        }
+        frame.payload = toSendPtr;
 
-    err = httpd_ws_send_frame_async(commandCtx->serverHandle, commandCtx->sockfd, &frame);
-    if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Unable to deliver message. Error: %ld.", err);
-        closeWebsocket(commandCtx->serverHandle, commandCtx->sockfd, WS_CLOSE_INTERNAL_ERROR, nullptr);
-        return ESP_OK;
+        toSendPtr += frame.len;
+        toSendSize -= frame.len;
+        toSendFrameType = HTTPD_WS_TYPE_CONTINUE;
+
+        err = httpd_ws_send_frame_async(commandCtx->serverHandle, commandCtx->sockfd, &frame);
+        if (err != ESP_OK) {
+            ESP_LOGD(TAG, "Unable to deliver message. Error: %ld.", err);
+            goto on_error;
+        }
     }
 
     // Increment TX counter
@@ -1436,188 +1842,38 @@ static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *
     return ESP_OK;
 }
 
-static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, uint32_t replyCounter)
+static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, uint32_t replyCounter,
+                                        bool closeOnError)
 {
-    GrowableBuffer_t *outBuf = &commandCtx->serverCtx->plaintext;
-    void *ptr;
+    uint8_t buf[4 + 128 + 1];
+    size_t bufUsed;
 
-    gbReset(outBuf, false);
-
-    ptr = gbReserve(outBuf, sizeof(uint32_t));
-    if (!ptr) {
-        return false;
-    }
-    be32enc(ptr, code);
+    be32enc(buf, code);
+    bufUsed = 4;
 
     if (message && *message != 0) {
         size_t msgLen = strlen(message);
 
-        if (!gbAdd(outBuf, message, msgLen)) {
-            return false;
+        if (msgLen > 128) {
+            msgLen = 128;
         }
+        memcpy(buf + bufUsed, message, msgLen);
+        bufUsed += msgLen;
     }
-    if (!gbAdd(outBuf, "\0", 1)) {
-        return false;
-    }
-    return buildAndSendReply(commandCtx, outBuf->buffer, outBuf->used, replyCounter);
+
+    // Send reply
+    return buildAndSendReply(commandCtx, buf, bufUsed, replyCounter, closeOnError);
 }
 
-static const char *parseRequestBody(ServerContext_t *serverCtx, httpd_req_t *req, size_t *rawBodyLen)
+static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason)
 {
-    char *rawBody;
-    size_t curLen;
-    int received;
-
-    *rawBodyLen = 0;
-    if (req->content_len > MAX_BODY_SIZE) {
-        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, nullptr);
-        return nullptr;
-    }
-
-    gbReset(&serverCtx->plaintext, false);
-    rawBody = (char *)gbReserve(&serverCtx->plaintext, req->content_len + 1);
-    if (!rawBody) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to allocate memory");
-        return nullptr;
-    }
-
-    for (curLen = 0; curLen < req->content_len; curLen += (size_t)received) {
-        received = httpd_req_recv(req, rawBody + curLen, req->content_len - curLen);
-        if (received <= 0) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to get request body");
-            return nullptr;
-        }
-    }
-
-    // Done
-    *rawBodyLen = req->content_len;
-    return rawBody;
+    commandCtx->session->isClosed = 1;
+    return closeWs(commandCtx->serverHandle, commandCtx->sockfd, code, reason) ? ESP_OK : ESP_FAIL;
 }
 
-static const char *parseRequestQuery(ServerContext_t *serverCtx, httpd_req_t *req)
+static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, esp_err_t err)
 {
-    char *rawQuery;
-    size_t queryLen;
-
-    queryLen = httpd_req_get_url_query_len(req);
-    if (queryLen > MAX_QUERY_SIZE) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Query too long");
-        return nullptr;
-    }
-
-    gbReset(&serverCtx->plaintext, false);
-    rawQuery = (char *)gbReserve(&serverCtx->plaintext, queryLen + 1);
-    if (!rawQuery) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to allocate memory");
-        return nullptr;
-    }
-
-    if (queryLen > 1) {
-        if (httpd_req_get_url_query_str(req, rawQuery, queryLen + 1) != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to get request query");
-            return nullptr;
-        }
-    }
-    rawQuery[queryLen] = 0;
-
-    // Done
-    return rawQuery;
-}
-
-static esp_err_t setDefaultCORS(httpd_req_t *req)
-{
-    esp_err_t err;
-
-    // NOTE: No need to save values until response is sent because they are constant values.
-    err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    if (err == ESP_OK) {
-        err = httpd_resp_set_hdr(req, "Vary", "Origin");
-    }
-    if (err == ESP_OK) {
-        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
-    }
-    if (err == ESP_OK && req->method == HTTP_OPTIONS) {
-        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        if (err == ESP_OK) {
-            err = httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
-        }
-    }
-    return err;
-}
-
-static bool getClientIpFromRequest(httpd_req_t *req, IPAddress_t *out)
-{
-    char hdr[256];
-    size_t len;
-    esp_err_t err;
-
-    err = httpd_req_get_hdr_value_str(req, "Forwarded", hdr, sizeof(hdr));
-    if (err == ESP_OK && hdr[0] != 0) {
-        hdr[sizeof(hdr) - 1] = '\0';
-
-        const char *p = hdr;
-        const char *pEnd = hdr + sizeof(hdr);
-        while (p < pEnd && (p = strcasestr(p, "for=")) != nullptr) {
-            p += 4; // skip "for="
-
-            len = 0;
-            while (p[len] != 0 && p[len] != ',' && p + len < pEnd - 1) {
-                len++;
-            }
-
-            if (parseIP(out, p, len)) {
-                return true;
-            }
-
-            p += len;
-        }
-    }
-
-    err = httpd_req_get_hdr_value_str(req, "X-Forwarded-For", hdr, sizeof(hdr));
-    if (err == ESP_OK && hdr[0] != 0) {
-        len = 0;
-        while (hdr[len] != 0 && hdr[len] != ',' && len < sizeof(hdr) - 1) {
-            len++;
-        }
-
-        if (parseIP(out, hdr, len)) {
-            return true;
-        }
-    }
-
-    err = httpd_req_get_hdr_value_str(req, "X-Real-IP", hdr, sizeof(hdr));
-    if (err == ESP_OK && hdr[0] != 0) {
-        hdr[sizeof(hdr) - 1] = '\0';
-        if (parseIP(out, hdr)) {
-            return true;
-        }
-    }
-
-    if (getIpFromPeer(httpd_req_to_sockfd(req), out)) {
-        return true;
-    }
-
-    // We were unable to determine the IP
-    return false;
-}
-
-static bool getIpFromPeer(int sockfd, IPAddress_t *out)
-{
-    struct sockaddr_storage addr;
-    socklen_t addrLen = sizeof(addr);
-
-    if (getpeername(sockfd, (struct sockaddr *)&addr, &addrLen) == 0) {
-        switch (addr.ss_family) {
-            case AF_INET:
-                parseIPv4(out, (const struct sockaddr_in *)&addr);
-                return true;
-
-            case AF_INET6:
-                parseIPv6(out, (const struct sockaddr_in6 *)&addr);
-                return true;
-        }
-    }
-    return false;
+    return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INTERNAL_ERROR, (err == ESP_ERR_NO_MEM) ? "Out of memory" : nullptr);
 }
 
 static void destroyServerCtx(void *ctx)
@@ -1625,9 +1881,8 @@ static void destroyServerCtx(void *ctx)
     if (ctx) {
         ServerContext_t *serverCtx = (ServerContext_t *)ctx;
 
-        gbReset(&serverCtx->plaintext, true);
-        gbReset(&serverCtx->ciphertext, true);
-        free(serverCtx->clientSocketsBuffer);
+        rwMutexDeinit(&serverCtx->sessions.mtx);
+
         free(serverCtx);
     }
 }
@@ -1636,19 +1891,26 @@ static void destroySessionCtx(void *ctx)
 {
     if (ctx) {
         SessionInfo_t *session = (SessionInfo_t *)ctx;
+        ServerContext_t *serverCtx = session->serverCtx;
+
+        // Remove the session from the server's session list
+        rwMutexLockWrite(&serverCtx->sessions.mtx);
+        if (session->prev) {
+            session->prev->next = session->next;
+        }
+        else {
+            serverCtx->sessions.first = session->next;
+        }
+        if (session->next) {
+            session->next->prev = session->prev;
+        }
+        else {
+            serverCtx->sessions.last = session->prev;
+        }
+        rwMutexUnlockWrite(&serverCtx->sessions.mtx);
 
         // Call session end callback
         handleSessionEnd(session);
-
-        // Free user data
-        if (session->userData) {
-            if (session->userDataFreeFn) {
-                session->userDataFreeFn(session->userData);
-            }
-            else {
-                free(session->userData);
-            }
-        }
 
         destroySession(session);
     }
@@ -1665,23 +1927,20 @@ static SessionInfo_t *createSession()
     }
     memset(session, 0, sizeof(SessionInfo_t));
 
-    session->clientAes = new Aes();
-    if (!session->clientAes) {
-        free(session);
-        return nullptr;
-    }
-    session->serverAes = new Aes();
-    if (!session->serverAes) {
-        delete session->clientAes;
-        free(session);
-        return nullptr;
-    }
+    session->incomingMessageType = IncomingBufferTypeNone;
+    session->plaintextIn = GB_STATIC_INIT;
+    session->ciphertextIn = GB_STATIC_INIT;
+    session->ciphertextOut = GB_STATIC_INIT;
+
+    aesInit(&session->clientAesCtx);
+    aesInit(&session->serverAesCtx);
 
     session->nextRxCounter = 1;
     session->nextTxCounter = 1;
+
     // Generate unique ID
     do {
-        session->id = nextSessionId.fetch_add(1) & 0x7FFFFFFFUL;
+        session->id = atomic_fetch_add_explicit(&nextSessionId, 1, memory_order_relaxed) & 0x7FFFFFFFUL;
     }
     while (session->id == 0);
 
@@ -1692,42 +1951,99 @@ static SessionInfo_t *createSession()
 static void destroySession(SessionInfo_t *session)
 {
     if (session) {
-        delete session->clientAes;
-        delete session->serverAes;
+
+        // Free user data
+        if (session->userData) {
+            if (session->userDataFreeFn) {
+                session->userDataFreeFn(session->userData);
+            }
+            else {
+                free(session->userData);
+            }
+        }
+
+        aesDone(&session->clientAesCtx);
+        aesDone(&session->serverAesCtx);
+
+        gbWipe(&session->plaintextIn);
+        gbReset(&session->plaintextIn, true);
+        gbWipe(&session->ciphertextIn);
+        gbReset(&session->ciphertextIn, true);
+        gbWipe(&session->ciphertextOut);
+        gbReset(&session->ciphertextOut, true);
+
         memset(session, 0, sizeof(SessionInfo_t));
         free(session);
     }
 }
 
-static esp_err_t readWsPacket(ServerContext_t *serverCtx, httpd_req_t *req, httpd_ws_frame_t *frame)
+static esp_err_t readWsPacket(ServerContext_t *serverCtx, SessionInfo_t *session, httpd_req_t *req, bool *messageComplete)
 {
+    httpd_ws_frame_t frame;
     esp_err_t err;
 
-    memset(frame, 0, sizeof(httpd_ws_frame_t));
-    frame->type = HTTPD_WS_TYPE_TEXT;
-    err = httpd_ws_recv_frame(req, frame, 0);
+    *messageComplete = false;
+
+    // Read frame
+    memset(&frame, 0, sizeof(frame));
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    err = httpd_ws_recv_frame(req, &frame, 0);
     if (err != ESP_OK) {
         return err;
     }
-    if (frame->len > 0) {
-        gbReset(&serverCtx->ciphertext, false);
-        frame->payload = (uint8_t *)gbReserve(&serverCtx->ciphertext, frame->len);
-        if (!frame->payload) {
+    if (frame.len > 0) {
+        if (frame.len > serverCtx->maxPacketSize - session->ciphertextIn.used) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        frame.payload = (uint8_t *)gbReserve(&session->ciphertextIn, frame.len);
+        if (!frame.payload) {
             return ESP_ERR_NO_MEM;
         }
 
-        err = httpd_ws_recv_frame(req, frame, frame->len);
+        err = httpd_ws_recv_frame(req, &frame, frame.len);
         if (err != ESP_OK) {
             return err;
         }
     }
+
+    switch (frame.type) {
+        case HTTPD_WS_TYPE_TEXT:
+            if (session->incomingMessageType != IncomingBufferTypeNone) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            session->incomingMessageType = IncomingBufferTypeText;
+            break;
+
+        case HTTPD_WS_TYPE_BINARY:
+            if (session->incomingMessageType != IncomingBufferTypeNone) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            session->incomingMessageType = IncomingBufferTypeBinary;
+            break;
+
+        case HTTPD_WS_TYPE_CONTINUE:
+            if (session->incomingMessageType == IncomingBufferTypeNone) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            break;
+
+        default:
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    // Check if final
+    if (frame.final) {
+        *messageComplete = true;
+    }
+
+    // Done
     return ESP_OK;
 }
 
-static void closeWebsocket(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason)
+static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason)
 {
     httpd_ws_frame_t frame;
-    uint8_t buf[1024];
+    uint8_t buf[256];
 
     memset(&frame, 0, sizeof(frame));
     frame.final = true;
@@ -1746,9 +2062,8 @@ static void closeWebsocket(httpd_handle_t serverHandle, int sockfd, uint16_t cod
         frame.len += msgLen;
     }
 
-    httpd_ws_send_frame_async(serverHandle, sockfd, &frame);
-
-    httpd_sess_trigger_close(serverHandle, sockfd);
+    return httpd_ws_send_frame_async(serverHandle, sockfd, &frame) == ESP_OK &&
+           httpd_sess_trigger_close(serverHandle, sockfd) == ESP_OK;
 }
 
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl)
@@ -1768,4 +2083,77 @@ static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen
         gbDel(buf, buf->used - (maxLen - usedLen), maxLen - usedLen);
     }
     return true;
+}
+
+static void otfeGenerateID(OnTheFlyEventListItem_t *item)
+{
+    // Generate unique ID
+    do {
+        item->eventId = atomic_fetch_add_explicit(&nextEventId, 1, memory_order_relaxed);
+    }
+    while (item->eventId == 0);
+}
+
+static void otfePushBack(OnTheFlyEventListItem_t *item)
+{
+    assert(item);
+
+    item->next = nullptr;
+    item->prev = otfeLast;
+
+    if (otfeLast) {
+        otfeLast->next = item;
+    }
+    else {
+        otfeFirst = item;
+    }
+    otfeLast = item;
+}
+
+static void otfeRemove(OnTheFlyEventListItem_t *item)
+{
+    assert(item);
+
+    if (item->prev) {
+        item->prev->next = item->next;
+    }
+    else {
+        otfeFirst = item->next;
+    }
+
+    if (item->next) {
+        item->next->prev = item->prev;
+    }
+    else {
+        otfeLast = item->prev;
+    }
+
+    item->next = nullptr;
+    item->prev = nullptr;
+}
+
+static OnTheFlyEventListItem_t* otfeFindByEventId(uint32_t eventId)
+{
+    OnTheFlyEventListItem_t *current = otfeFirst;
+
+    while (current) {
+        if (current->eventId == eventId) {
+            return current;
+        }
+        current = current->next;
+    }
+    return nullptr;
+}
+
+static OnTheFlyEventListItem_t* otfeFindBySessionId(uint32_t sessionId)
+{
+    OnTheFlyEventListItem_t *current = otfeFirst;
+
+    while (current) {
+        if (current->session->id == sessionId) {
+            return current;
+        }
+        current = current->next;
+    }
+    return nullptr;
 }

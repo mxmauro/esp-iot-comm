@@ -3,8 +3,8 @@
 #include <esp_random.h>
 #include <fnv.h>
 #include <freertos/FreeRTOS.h>
+#include <lightstd/vector.h>
 #include <mbedtls/pkcs5.h>
-#include <mbedtls/sha256.h>
 #include <string.h>
 #include <time.h>
 
@@ -27,17 +27,17 @@ typedef struct User_s {
 
 // -----------------------------------------------------------------------------
 
-static const char *stgUsersKey = "usersMgr";
-
-static IStorage *storage = nullptr;
 static User_t *users = nullptr; // User 0 is the administrator
 static size_t maxUsersCount = 0;
+static SaveUsersToStorageCallback_t saveUsers = nullptr;
+static void *saveUsersCtx = nullptr;
 
 // -----------------------------------------------------------------------------
 
 static esp_err_t saveAllUsers();
 static User_t* findUserByName(const char *name, size_t nameLen);
 static User_t* findUserByID(uint32_t id);
+static bool isEmptyUserPublicKey(User_t* user);
 static void internalCreateUser(User_t *user, const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
 static esp_err_t internalChangeUserCredentials(User_t *user, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE], bool force, bool isReset);
 static size_t getUserNameLength(const User_t *user);
@@ -47,46 +47,55 @@ static bool validateUserName(const char *name, size_t nameLen);
 
 // -----------------------------------------------------------------------------
 
-esp_err_t usersInit(size_t _maxUsersCount, IStorage *_storage, UsersGetDefaultRootPublicKey_t fnGetDefRootPublicKey)
+esp_err_t usersInit(UsersConfig_t *config)
 {
-    StorageBlob_t data;
+    size_t usersDataLen;
     esp_err_t err;
 
-    assert(_maxUsersCount < (size_t)-1);
-    assert(_storage);
-    assert(fnGetDefRootPublicKey);
+    if (
+        (!config) ||
+        config->maxUsersCount >= ((size_t)-1 / sizeof(User_t)) ||
+        (!config->storage.load) || (!config->storage.save)
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    users = (User_t *)malloc((1 + _maxUsersCount) * sizeof(User_t));
+    usersDataLen = (1 + config->maxUsersCount) * sizeof(User_t);
+    users = (User_t *)malloc(usersDataLen);
     if (!users) {
         ESP_LOGE(TAG, "Unable to allocate memory for users.");
         return ESP_ERR_NO_MEM;
     }
 
-    maxUsersCount = _maxUsersCount;
-    storage = _storage;
+    maxUsersCount = config->maxUsersCount;
+    saveUsers = config->storage.save;
+    saveUsersCtx = config->storage.ctx;
 
-    err = _storage->readBlob(stgUsersKey, data);
-    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
-        ESP_LOGE(TAG, "Unable to read users from flash memory. Error: %d.", err);
-        usersDone();
-        return err;
-    }
-
-    if (err == ESP_OK && data.len == (1 + maxUsersCount) * sizeof(User_t)) {
-        memcpy(users, data.value.get(), data.len);
-    }
-    else {
+    err = config->storage.load(users, usersDataLen, config->storage.ctx);
+    if (err != ESP_OK) {
         uint8_t tempPublicKey[P256_PUBLIC_KEY_SIZE];
 
+        if (err != ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Unable to read users from flash memory. Error: %d.", err);
+            usersDeinit();
+            return err;
+        }
+
         // Load defaults
-        memset(users, 0, (1 + maxUsersCount) * sizeof(User_t));
+        memset(users, 0, usersDataLen);
 
         // Get the default root public key from callback
-        err = fnGetDefRootPublicKey(tempPublicKey);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Unable to create the default administrator user. Error: %d.", err);
-            usersDone();
-            return err;
+        memset(tempPublicKey, 0, sizeof(tempPublicKey));
+
+        // If no default root user public key, the user system will be unusable until
+        // a portal or initialization routine sets it
+        if (config->rootKey.cb) {
+            err = config->rootKey.cb(tempPublicKey, config->rootKey.ctx);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Unable to create the default administrator user. Error: %d.", err);
+                usersDeinit();
+                return err;
+            }
         }
 
         // Create root user
@@ -97,7 +106,7 @@ esp_err_t usersInit(size_t _maxUsersCount, IStorage *_storage, UsersGetDefaultRo
         // Save users
         err = saveAllUsers();
         if (err != ESP_OK) {
-            usersDone();
+            usersDeinit();
             return err;
         }
     }
@@ -106,14 +115,15 @@ esp_err_t usersInit(size_t _maxUsersCount, IStorage *_storage, UsersGetDefaultRo
     return ESP_OK;
 }
 
-void usersDone()
+void usersDeinit()
 {
     if (users) {
         memset(users, 0, (1 + maxUsersCount) * sizeof(User_t));
         free(users);
         users = nullptr;
     }
-    storage = nullptr;
+    saveUsers = nullptr;
+    saveUsersCtx = nullptr;
     maxUsersCount = 0;
 }
 
@@ -200,7 +210,6 @@ uint32_t userGetID(const char *name, size_t nameLen)
 
 esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
-    ECDSAKeyPair keyPair;
     User_t *user;
     User_t origUser;
     bool forceAndReset;
@@ -220,17 +229,17 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     else if (requestingUserId == users[0].id) {
         // Admin request
         forceAndReset = true;
-    } else {
+    }
+    else {
         ESP_LOGE(TAG, "Only admin users can change other users' credentials.");
         memset(&origUser, 0, sizeof(User_t));
         return ESP_ERR_INVALID_STATE;
     }
 
     // Try to load the public key to check if valid
-    err = keyPair.loadPublicKey(publicKey);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to load new credentials. Error: %d.", err);
-        return err;
+    if (!p256ValidatePublicKey(publicKey, P256_PUBLIC_KEY_SIZE)) {
+        ESP_LOGE(TAG, "Invalid public key in user change credentials call.");
+        return ESP_ERR_INVALID_ARG;
     }
 
     // Make a copy of the original user data
@@ -259,10 +268,9 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     return ESP_OK;
 }
 
-esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE],
-                              const uint8_t signature[P256_SIGNATURE_SIZE])
+esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE], const uint8_t signature[P256_SIGNATURE_SIZE])
 {
-    ECDSAKeyPair keyPair;
+    P256KeyPair_t keyPair;
     User_t *user;
     esp_err_t err;
 
@@ -272,19 +280,26 @@ esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE
         return ESP_ERR_NOT_FOUND;
     }
 
-    err = keyPair.loadPublicKey(user->publicKey);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to load user credentials. Error: %d.", err);
-        return err;
+    if (isEmptyUserPublicKey(user)) {
+        return ESP_ERR_INVALID_STATE;
     }
-    err = keyPair.verify(hash, signature);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Signature verification failed. Error: %d.", err);
-        return err;
+
+    p256KeyPairInit(&keyPair);
+    err = p256LoadPublicKey(&keyPair, user->publicKey);
+    if (err == ESP_OK) {
+        // Verify
+        err = ecdsaVerify(&keyPair, hash, signature);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Signature verification failed. Error: %d.", err);
+        }
+    }
+    else {
+        ESP_LOGE(TAG, "Unable to load user credentials. Error: %d.", err);
     }
 
     // Done
-    return ESP_OK;
+    p256KeyPairDone(&keyPair);
+    return err;
 }
 
 esp_err_t userMustChangeCredentials(uint32_t userId, bool *mustChange)
@@ -327,7 +342,7 @@ static esp_err_t saveAllUsers()
 {
     esp_err_t err;
 
-    err = storage->writeBlob(stgUsersKey, users, (1 + maxUsersCount) * sizeof(User_t));
+    err = saveUsers(users, (1 + maxUsersCount) * sizeof(User_t), saveUsersCtx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Unable to save users into storage. Error: %d.", err);
     }
@@ -340,7 +355,8 @@ static User_t* findUserByName(const char *name, size_t nameLen)
         return nullptr;
     }
     for (size_t i = 0; i < 1 + maxUsersCount; i++) {
-        if (users[i].inUse && memcmp(users[i].name, name, nameLen) == 0 &&
+        if (
+            users[i].inUse && memcmp(users[i].name, name, nameLen) == 0 &&
             (nameLen == sizeof(users[0].name) || users[i].name[nameLen] == 0)
         ) {
             return users + i;
@@ -357,6 +373,16 @@ static User_t* findUserByID(uint32_t id)
         }
     }
     return nullptr;
+}
+
+static bool isEmptyUserPublicKey(User_t* user)
+{
+    uint8_t val = 0;
+
+    for (size_t i = 0; i < P256_PUBLIC_KEY_SIZE; i++) {
+        val |= user->publicKey[i];
+    }
+    return (val != 0) ? true : false;
 }
 
 static void internalCreateUser(User_t *user, const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
@@ -425,10 +451,7 @@ static bool validateUserName(const char *name, size_t nameLen)
         return false;
     }
     for (i = 0; i < nameLen; i++) {
-        if ((name[i] < '0' || name[i] > '9') &&
-            (name[i] < 'A' || name[i] > 'Z') &&
-            (name[i] < 'a' || name[i] > 'z')
-        ) {
+        if ((name[i] < '0' || name[i] > '9') && (name[i] < 'A' || name[i] > 'Z') && (name[i] < 'a' || name[i] > 'z')) {
             if (name[i] != '_' && name[i] != '-') {
                 return false;
             }

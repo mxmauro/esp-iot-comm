@@ -2,12 +2,11 @@
 
 #include "sdkconfig.h"
 #include "crypto/p256.h"
-#include "mDNS\mDNS.h" // IWYU pragma: keep
-#include "provisioning\wifi.h" // IWYU pragma: keep
+#include "mDNS/mDNS.h" // IWYU pragma: keep
+#include "provisioning/wifi.h" // IWYU pragma: keep
 #include <esp_err.h>
-#include <simple_function_ref.h>
 #include <stdint.h>
-#include <storage/istorage.h>
+#include <string.h>
 
 #if (!defined(CONFIG_HTTPD_WS_SUPPORT))
     #error This library requires CONFIG_HTTPD_WS_SUPPORT to be enabled
@@ -74,64 +73,83 @@ typedef void (*IotCommEventHandler_t)(IotCommEvent_t event, void *eventData);
 
 typedef void (*IotCommUserDataFreeFunc_t)(void *userData);
 
+typedef esp_err_t (*IotCommGetDefaultRootUserPublicKeyCallback_t)(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void *ctx);
+
+typedef esp_err_t (*IotCommLoadUsersFromStorageCallback_t)(void *dest, size_t destLen, void *ctx);
+typedef esp_err_t (*IotCommSaveUsersToStorageCallback_t)(const void *data, size_t dataLen, void *ctx);
+
 typedef struct IotCommClose_s {
     uint16_t reason;
     char     message[128];
 } IotCommClose_t;
 
 typedef struct IotCommEventSessionStart_s {
+    uint32_t eventId;
+    void     *handlerCtx;
     uint32_t sessionId;
     uint32_t userId;
     bool     userIsAdmin;
-
-    SimpleFunctionRef<void, esp_err_t /*err*/> setError;
-
-    // Sets a per-session custom data pointer and a cleanup routine.
-    SimpleFunctionRef<void, const void * /*ptr*/, IotCommUserDataFreeFunc_t /*freeFn*/> setUserData;
 } IotCommEventSessionStart_t;
 
 typedef struct IotCommEventSessionEnd_s {
+    uint32_t eventId;
+    void     *handlerCtx;
     uint32_t sessionId;
     uint32_t userId;
-
-    SimpleFunctionRef<void *> getUserData;
 } IotCommEventSessionEnd_t;
 
 typedef struct IotCommEventCustomCommand_s {
+    uint32_t      eventId;
+    void          *handlerCtx;
     uint32_t      sessionId;
     uint32_t      userId;
     bool          userIsAdmin;
     uint16_t      cmd;
     const uint8_t *data;
     size_t        dataLen;
-
-    SimpleFunctionRef<void *> getUserData;
-
-    SimpleFunctionRef<bool, const uint8_t * /*reply*/, size_t /*replyLen*/> reply;
-    SimpleFunctionRef<bool, uint32_t /*code*/, const char * /*message*/> replyWithError;
-    SimpleFunctionRef<void, uint16_t /*reason*/, const char * /*message*/> close;
 } IotCommEventCustomCommand_t;
 
-typedef esp_err_t (*IotCommGetDefaultRootPublicKey_t)(uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
 
-typedef struct IotCommConfig_s {
-    uint16_t listenPort;
-    uint16_t maxConnections;
+typedef struct IotCommUsersDefaultRootKeyProvider_s {
+    IotCommGetDefaultRootUserPublicKeyCallback_t cb;
+    void                                         *ctx;
+} IotCommUsersDefaultRootKeyProvider_t;
 
-    size_t                           maxUsersCount;
-    IStorage                         *usersStorage;
-    IotCommGetDefaultRootPublicKey_t fnGetDefRootUserPublicKey;
+typedef struct IotCommUsersStorageCallbacks_s {
+    // NOTE: If load returns an error different from ESP_ERR_NOT_FOUND, it
+    //       will be treated as a fatal error.
+    IotCommLoadUsersFromStorageCallback_t load;
+    IotCommSaveUsersToStorageCallback_t   save;
+    void                                 *ctx;
+} IotCommStorageCallbacks_t;
 
-    size_t   maxRateLimitSlots;
-    uint32_t rateLimitWindowSizeInMs;
+typedef struct IotCommRateLimitConfig_s {
+    size_t   maxSlots;
+    uint32_t windowSizeInMs;
     uint8_t  maxRequestsPerWindow;
     uint8_t  maxConsecutiveAuthFailures;
+} IotCommRateLimitConfig_t;
 
-    size_t maxChallengesSlot;
-    uint32_t challengeWindowSizeInMs;
+typedef struct IotCommRateChallengeConfig_s {
+    size_t   maxSlots;
+    uint32_t windowSizeInMs;
+} IotCommRateChallengeConfig_t;
 
-    IotCommEventHandler_t handler;
+typedef struct IotCommConfig_s {
+    size_t                               maxUsersCount;
+    IotCommUsersDefaultRootKeyProvider_t rootKey;
+    IotCommStorageCallbacks_t            storage;
+    IotCommRateLimitConfig_t             rateLimit;
+    IotCommRateChallengeConfig_t         challenge;
+    IotCommEventHandler_t                handler;
+    void                                 *handlerCtx;
 } IotCommConfig_t;
+
+typedef struct IotCommServerConfig_s {
+    uint16_t listenPort;
+    uint16_t maxConnections;
+    uint32_t maxPacketSize;
+} IotCommServerConfig_t;
 
 // -----------------------------------------------------------------------------
 
@@ -140,9 +158,25 @@ extern "C" {
 #endif // __cplusplus
 
 esp_err_t iotCommInit(IotCommConfig_t *config);
-void iotCommDone();
+void iotCommDeinit();
 
-bool iotCommIsRunning();
+esp_err_t iotCommStartServer(IotCommServerConfig_t *config);
+void iotCommStopServer();
+
+bool iotCommIsServerRunning();
+
+esp_err_t iotCommSetSessionUserData(uint32_t sessionId, void *ptr, IotCommUserDataFreeFunc_t freeFn);
+void* iotCommGetSessionUserData(uint32_t sessionId);
+
+// NOTE: Event replies are synchronous to the event callback. Do not retain event data
+//       or defer completion to another task/core after the callback returns.
+esp_err_t iotCommEventReply(uint32_t eventId, const uint8_t * reply, size_t replyLen);
+esp_err_t iotCommEventReplyWithError(uint32_t eventId, uint32_t code, const char *message);
+
+// NOTE: This function sends a standard websocket close except if called within a session start
+//       event. In this case, reason and message will act as the HTTP(S) Upgrade request response.
+// NOTE: Like iotCommEventReply*, this must be completed synchronously from the callback.
+void iotCommSessionClose(uint32_t sessionId, uint16_t reason, const char *message);
 
 static inline IotCommConfig_t iotCommDefaultConfig()
 {
@@ -150,21 +184,34 @@ static inline IotCommConfig_t iotCommDefaultConfig()
 
     memset(&cfg, 0, sizeof(cfg));
 
-    cfg.listenPort = 80;
-    cfg.maxConnections = IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2; // +2 for unauthenticated session
-
     cfg.maxUsersCount = IOTCOMM_DEFAULT_MAX_USERS_COUNT;
 
-    cfg.maxRateLimitSlots = IOTCOMM_DEFAULT_MAX_RATE_LIMIT_SLOTS;
-    cfg.rateLimitWindowSizeInMs = IOTCOMM_DEFAULT_RATE_LIMIT_WINDOW_TIME_MS;
-    cfg.maxRequestsPerWindow = IOTCOMM_DEFAULT_MAX_RATE_LIMIT_REQUESTS_COUNT;
-    cfg.maxConsecutiveAuthFailures = IOTCOMM_DEFAULT_MAX_RATE_LIMIT_CONSECUTIVE_FAILURES;
+    cfg.rateLimit.maxSlots = IOTCOMM_DEFAULT_MAX_RATE_LIMIT_SLOTS;
+    cfg.rateLimit.windowSizeInMs = IOTCOMM_DEFAULT_RATE_LIMIT_WINDOW_TIME_MS;
+    cfg.rateLimit.maxRequestsPerWindow = IOTCOMM_DEFAULT_MAX_RATE_LIMIT_REQUESTS_COUNT;
+    cfg.rateLimit.maxConsecutiveAuthFailures = IOTCOMM_DEFAULT_MAX_RATE_LIMIT_CONSECUTIVE_FAILURES;
 
-    cfg.maxChallengesSlot = IOTCOMM_DEFAULT_MAX_CHALLENGES_SLOTS;
-    cfg.challengeWindowSizeInMs = IOTCOMM_DEFAULT_CHALLENGE_WINDOW_TIME_MS;
+    cfg.challenge.maxSlots = IOTCOMM_DEFAULT_MAX_CHALLENGES_SLOTS;
+    cfg.challenge.windowSizeInMs = IOTCOMM_DEFAULT_CHALLENGE_WINDOW_TIME_MS;
 
     return cfg;
 }
+
+static inline IotCommServerConfig_t iotCommDefaultServerConfig()
+{
+    IotCommServerConfig_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+
+    cfg.listenPort = 80;
+    cfg.maxConnections = IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2; // +2 for unauthenticated session
+
+    return cfg;
+}
+
+// NOTE: Use this method only to initialize the root user key obtained, for example,
+//       after device initialization with a captive portal.
+esp_err_t iotCommInitRootUserPublicKey(const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
 
 #ifdef __cplusplus
 }

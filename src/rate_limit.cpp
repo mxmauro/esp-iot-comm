@@ -30,8 +30,7 @@ static RateLimit_t* internalRateLimitCheck(const IPAddress_t *addr);
 
 // -----------------------------------------------------------------------------
 
-esp_err_t rateLimitInit(size_t _maxSlots, uint32_t _windowSizeInMs, uint8_t _maxRequestsPerWindow,
-                        uint8_t _maxConsecutiveFailures)
+esp_err_t rateLimitInit(size_t _maxSlots, uint32_t _windowSizeInMs, uint8_t _maxRequestsPerWindow, uint8_t _maxConsecutiveFailures)
 {
     assert(_windowSizeInMs > 0);
     assert(_maxSlots > 0);
@@ -54,7 +53,7 @@ esp_err_t rateLimitInit(size_t _maxSlots, uint32_t _windowSizeInMs, uint8_t _max
     return ESP_OK;
 }
 
-void rateLimitDone()
+void rateLimitDeinit()
 {
     if (rateLimits) {
         memset(rateLimits, 0, maxSlots * sizeof(RateLimit_t));

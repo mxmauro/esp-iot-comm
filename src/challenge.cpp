@@ -1,4 +1,5 @@
 #include "challenge.h"
+#include "iot_comm/crypto/utils.h"
 #include <esp_log.h>
 #include <string.h>
 #include <time.h>
@@ -41,7 +42,7 @@ esp_err_t challengesInit(size_t _maxChallengesCount, uint32_t _windowSizeInMs)
     return ESP_OK;
 }
 
-void challengesDone()
+void challengesDeinit()
 {
     if (challenges) {
         memset(challenges, 0, maxChallengesCount * sizeof(SuperChallenge_t));
@@ -102,9 +103,7 @@ void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Chal
 void challengesRemove(const ChallengeCookie_t cookie)
 {
     for (size_t i = 0; i < maxChallengesCount; i++) {
-        if (challenges[i].createdAt != 0 &&
-            constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t))
-        ) {
+        if (challenges[i].createdAt != 0 && constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t))) {
             memset(&challenges[i], 0, sizeof(SuperChallenge_t));
             break;
         }
@@ -121,7 +120,8 @@ Challenge_t* challengesFind(const ChallengeCookie_t cookie, const IPAddress_t *a
     uint64_t now = now_ms();
 
     for (size_t i = 0; i < maxChallengesCount; i++) {
-        if (challenges[i].createdAt != 0 &&
+        if (
+            challenges[i].createdAt != 0 &&
             constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t)) &&
             ipAddressEqual(&challenges[i].clientIP, addr) &&
             now - challenges[i].createdAt < windowSizeInMs

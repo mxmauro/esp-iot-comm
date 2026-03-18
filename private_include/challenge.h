@@ -31,7 +31,7 @@ extern "C" {
 #endif // __cplusplus
 
 esp_err_t challengesInit(size_t maxChallengesCount, uint32_t windowSizeInMs);
-void challengesDone();
+void challengesDeinit();
 
 void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Challenge_t *challenge);
 void challengesRemove(const ChallengeCookie_t cookie);

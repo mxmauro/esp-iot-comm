@@ -14,8 +14,8 @@
 extern "C" {
 #endif // __cplusplus
 
-esp_err_t hkdfSha256DeriveKey(const uint8_t *key, size_t keyLen, const uint8_t *salt, size_t saltLen,
-                              const uint8_t *info, size_t infoLen, uint8_t *keyOut, size_t keyOutLen);
+esp_err_t hkdfSha256DeriveKey(const uint8_t *key, size_t keyLen, const uint8_t *salt, size_t saltLen, const uint8_t *info, size_t infoLen,
+                              uint8_t *keyOut, size_t keyOutLen);
 
 #ifdef __cplusplus
 }

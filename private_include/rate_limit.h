@@ -9,9 +9,8 @@
 extern "C" {
 #endif // __cplusplus
 
-esp_err_t rateLimitInit(size_t maxSlots, uint32_t windowSizeInMs, uint8_t maxRequestsPerWindow,
-                        uint8_t maxConsecutiveFailures);
-void rateLimitDone();
+esp_err_t rateLimitInit(size_t maxSlots, uint32_t windowSizeInMs, uint8_t maxRequestsPerWindow, uint8_t maxConsecutiveFailures);
+void rateLimitDeinit();
 
 bool rateLimitCheckRequest(const IPAddress_t *addr);
 

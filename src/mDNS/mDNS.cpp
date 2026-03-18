@@ -1,6 +1,7 @@
 #include "iot_comm/mDNS/mDNS.h"
 #include <convert.h>
 #include <ctype.h>
+#include <esp_check.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <mdns.h>
@@ -16,27 +17,27 @@ static bool running = false;
 // -----------------------------------------------------------------------------
 
 static void generateHostname(char* finalHostname, size_t maxLen, const char* hostname);
-static bool isValidHostname(const char *hostname);
 
 // -----------------------------------------------------------------------------
 
-void mDnsInit()
+esp_err_t mDnsInit()
 {
-    AutoMutex lock(&mtx);
+    AutoMutex lock(mtx);
 
     mdns_free();
     running = false;
 
-    ESP_ERROR_CHECK(mdns_init());
+    ESP_RETURN_ON_ERROR(mdns_init(), TAG, "init");
 
     // Done
     ESP_LOGI(TAG, "Initialized.");
     running = true;
+    return ESP_OK;
 }
 
-void mDnsDone()
+void mDnsDeinit()
 {
-    AutoMutex lock(&mtx);
+    AutoMutex lock(mtx);
 
     mdns_free();
     running = false;
@@ -44,7 +45,7 @@ void mDnsDone()
 
 esp_err_t mDnsSetHostname(const char *hostname)
 {
-    AutoMutex lock(&mtx);
+    AutoMutex lock(mtx);
     char finalHostname[256];
     esp_err_t err;
 
@@ -54,7 +55,7 @@ esp_err_t mDnsSetHostname(const char *hostname)
 
     // Generate hostname
     generateHostname(finalHostname, sizeof(finalHostname), hostname);
-    if (hostname && (!isValidHostname(finalHostname))) {
+    if (hostname && (!mDnsIsValidHostname(finalHostname))) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -69,10 +70,9 @@ esp_err_t mDnsSetHostname(const char *hostname)
     return ESP_OK;
 }
 
-esp_err_t mDnsAddService(const char *service, const char *proto, uint16_t port,
-                         const mDnsServiceTxt_t *txtList, size_t txtListCount)
+esp_err_t mDnsAddService(const char *service, const char *proto, uint16_t port, const mDnsServiceTxt_t *txtList, size_t txtListCount)
 {
-    AutoMutex lock(&mtx);
+    AutoMutex lock(mtx);
     mdns_txt_item_t *txtItems;
     esp_err_t err;
 
@@ -94,7 +94,8 @@ esp_err_t mDnsAddService(const char *service, const char *proto, uint16_t port,
             return ESP_ERR_NO_MEM;
         }
         for (size_t txtIndex = 0; txtIndex < txtListCount; txtIndex++) {
-            if (txtList[txtIndex].key == nullptr || txtList[txtIndex].key[0] == 0 ||
+            if (
+                txtList[txtIndex].key == nullptr || txtList[txtIndex].key[0] == 0 ||
                 txtList[txtIndex].value == nullptr || txtList[txtIndex].value[0] == 0
             ) {
                 free(txtItems);
@@ -121,7 +122,7 @@ esp_err_t mDnsAddService(const char *service, const char *proto, uint16_t port,
 
 esp_err_t mDnsRemoveService(const char *service, const char *proto)
 {
-    AutoMutex lock(&mtx);
+    AutoMutex lock(mtx);
     esp_err_t err;
 
     if (!running) {
@@ -141,65 +142,7 @@ esp_err_t mDnsRemoveService(const char *service, const char *proto)
     return ESP_OK;
 }
 
-// -----------------------------------------------------------------------------
-
-static void generateHostname(char* finalHostname, size_t maxLen, const char* hostname)
-{
-    uint8_t macAddr[6];
-    char macAddrHex[12 + 1];
-    size_t ofs, toCopy, macAddrHexLen;
-
-    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, macAddr));
-    if (hostname == nullptr || *hostname == 0) {
-        hostname = "mx-iot-$mac";
-    }
-
-    maxLen -= 1; // reserve final spcae for trailing \0
-    ofs = 0;
-    while (ofs < maxLen && *hostname != 0) {
-        if (*hostname == '$') {
-            if (hostname[1] == 'm' && hostname[2] == 'a' && hostname[3] == 'c') {
-                hostname += 4;
-
-                macAddrHexLen = sizeof(macAddrHex);
-                toHex(macAddr + 3, 3, macAddrHex, &macAddrHexLen);
-
-                toCopy = 6;
-                if (toCopy > maxLen - ofs) {
-                    toCopy = maxLen - ofs;
-                }
-                memcpy(finalHostname + ofs, macAddrHex, toCopy);
-                ofs += toCopy;
-
-                continue;
-            }
-
-            if (hostname[1] == 'f' && hostname[2] == 'u' && hostname[3] == 'l' && hostname[4] == 'l' &&
-                hostname[5] == 'm' && hostname[6] == 'a' && hostname[7] == 'c'
-            ) {
-                hostname += 8;
-
-                macAddrHexLen = sizeof(macAddrHex);
-                toHex(macAddr, 6, macAddrHex, &macAddrHexLen);
-
-                toCopy = 12;
-                if (toCopy > maxLen - ofs) {
-                    toCopy = maxLen - ofs;
-                }
-                memcpy(finalHostname + ofs, macAddrHex, toCopy);
-                ofs += toCopy;
-
-                continue;
-            }
-        }
-
-        finalHostname[ofs++] = *hostname++;
-    }
-
-    finalHostname[ofs] = 0;
-}
-
-static bool isValidHostname(const char *hostname)
+bool mDnsIsValidHostname(const char *hostname)
 {
     size_t i, j;
     size_t len, effectiveLen;
@@ -211,7 +154,7 @@ static bool isValidHostname(const char *hostname)
     }
 
     len = strlen(hostname);
-    if (len > 253) {
+    if (len > MDNS_NAME_MAX_LEN) {
         return false;
     }
 
@@ -258,4 +201,63 @@ static bool isValidHostname(const char *hostname)
 
     // Done
     return true;
+}
+
+// -----------------------------------------------------------------------------
+
+static void generateHostname(char* finalHostname, size_t maxLen, const char* hostname)
+{
+    uint8_t macAddr[6];
+    char macAddrHex[12 + 1];
+    size_t ofs, toCopy, macAddrHexLen;
+
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, macAddr));
+    if (hostname == nullptr || *hostname == 0) {
+        hostname = "mx-iot-$mac";
+    }
+
+    maxLen -= 1; // reserve final spcae for trailing \0
+    ofs = 0;
+    while (ofs < maxLen && *hostname != 0) {
+        if (*hostname == '$') {
+            if (hostname[1] == 'm' && hostname[2] == 'a' && hostname[3] == 'c') {
+                hostname += 4;
+
+                macAddrHexLen = sizeof(macAddrHex);
+                toHex(macAddr + 3, 3, macAddrHex, &macAddrHexLen);
+
+                toCopy = 6;
+                if (toCopy > maxLen - ofs) {
+                    toCopy = maxLen - ofs;
+                }
+                memcpy(finalHostname + ofs, macAddrHex, toCopy);
+                ofs += toCopy;
+
+                continue;
+            }
+
+            if (
+                hostname[1] == 'f' && hostname[2] == 'u' && hostname[3] == 'l' && hostname[4] == 'l' &&
+                hostname[5] == 'm' && hostname[6] == 'a' && hostname[7] == 'c'
+            ) {
+                hostname += 8;
+
+                macAddrHexLen = sizeof(macAddrHex);
+                toHex(macAddr, 6, macAddrHex, &macAddrHexLen);
+
+                toCopy = 12;
+                if (toCopy > maxLen - ofs) {
+                    toCopy = maxLen - ofs;
+                }
+                memcpy(finalHostname + ofs, macAddrHex, toCopy);
+                ofs += toCopy;
+
+                continue;
+            }
+        }
+
+        finalHostname[ofs++] = *hostname++;
+    }
+
+    finalHostname[ofs] = 0;
 }

@@ -11,8 +11,8 @@ static const char *findChar(const char *s, const char *sEnd, char c);
 
 void parseIPv4(IPAddress_t *addr, const struct sockaddr_in *in)
 {
-    addr->ip[0] = (uint8_t)in->sin_addr.s_addr & 0xFF;
-    addr->ip[1] = (uint8_t)(in->sin_addr.s_addr >> 8) & 0xFF;
+    addr->ip[0] = (uint8_t) in->sin_addr.s_addr        & 0xFF;
+    addr->ip[1] = (uint8_t)(in->sin_addr.s_addr >>  8) & 0xFF;
     addr->ip[2] = (uint8_t)(in->sin_addr.s_addr >> 16) & 0xFF;
     addr->ip[3] = (uint8_t)(in->sin_addr.s_addr >> 24) & 0xFF;
     addr->isIPv6 = false;

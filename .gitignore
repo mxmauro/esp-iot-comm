@@ -3,9 +3,8 @@
 .cache
 .vscode
 build
-dist
 managed_components
 __pycache__
-sdkconfig*
-!sdkconfig.defaults
+sdkconfig
+sdkconfig.old
 dependencies.lock

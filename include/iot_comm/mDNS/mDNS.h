@@ -26,17 +26,19 @@ extern "C" {
 
 // The initialization function must be called right after the network
 // provisioning engine is started.
-void mDnsInit();
-void mDnsDone();
+esp_err_t mDnsInit();
+void mDnsDeinit();
 
 // If hostname is null or empty, it is replaced with mx-iot-$mac.
 // $mac is replaced with the last three hexa digits of the MAC address.
 // $fullmac is replaced with the whole six hexa digits of the MAC address.
 esp_err_t mDnsSetHostname(const char *hostname);
 
-esp_err_t mDnsAddService(const char *service, const char *proto, uint16_t port,
-                         const mDnsServiceTxt_t *txtList = nullptr, size_t txtListCount = 0);
+esp_err_t mDnsAddService(const char *service, const char *proto, uint16_t port, const mDnsServiceTxt_t *txtList = nullptr,
+                         size_t txtListCount = 0);
 esp_err_t mDnsRemoveService(const char *service, const char *proto);
+
+bool mDnsIsValidHostname(const char *hostname);
 
 #ifdef __cplusplus
 }

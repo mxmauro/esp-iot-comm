@@ -1,5 +1,6 @@
 #pragma once
 
+
 #include "sdkconfig.h"
 #include <esp_err.h>
 #include <mbedtls/gcm.h>
@@ -11,26 +12,23 @@
 
 // -----------------------------------------------------------------------------
 
-#ifndef __cplusplus
-    #error C++ compiler required.
-#endif // !__cplusplus
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
 
-class Aes
-{
-public:
-    Aes();
-    ~Aes();
+void aesInit(mbedtls_gcm_context *ctx);
+void aesDone(mbedtls_gcm_context *ctx);
 
-    esp_err_t setKey(const uint8_t *key, size_t keyLen);
+esp_err_t aesSetKey(mbedtls_gcm_context *ctx, const uint8_t *key, size_t keyLen);
 
-    // Size of ciphertextOut must be plaintextLen plus 16 bytes for tag
-    esp_err_t encrypt(const uint8_t *plaintext, size_t plaintextLen, const uint8_t *iv, size_t ivLen,
-                      const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut);
-    // Size of plaintextOut will be ciphertextLen minus 16 bytes because ciphertext must include the tag at the end
-    esp_err_t decrypt(const uint8_t *ciphertext, size_t ciphertextLen, const uint8_t *iv, size_t ivLen,
-                      const uint8_t *aad, size_t aadLen, uint8_t *plaintextOut);
+// Size of ciphertextOut must be plaintextLen plus 16 bytes for tag
+esp_err_t aesEncrypt(mbedtls_gcm_context *ctx, const uint8_t *plaintext, size_t plaintextLen, const uint8_t *iv, size_t ivLen,
+                     const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut);
+// Size of plaintextOut will be ciphertextLen minus 16 bytes because ciphertext must include
+// the tag at the end
+esp_err_t aesDecrypt(mbedtls_gcm_context *ctx, const uint8_t *ciphertext, size_t ciphertextLen, const uint8_t *iv, size_t ivLen,
+                     const uint8_t *aad, size_t aadLen, uint8_t *plaintextOut);
 
-private:
-    mbedtls_gcm_context gcm;
-    bool valid;
-};
+#ifdef __cplusplus
+}
+#endif // __cplusplus
