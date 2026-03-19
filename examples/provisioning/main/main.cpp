@@ -1,7 +1,8 @@
-#include "esp_err.h"
+#include <esp_err.h>
 #include <iot_comm/iot_comm.h>
 #include <iot_comm/captive_portal/captive_portal.h>
 #include <iot_comm/provisioning/wifi.h>
+#include <mdns.h>
 #include <rundown_protection.h>
 #include <run_once.h>
 
@@ -58,7 +59,7 @@ static void setupTask(void *arg)
     };
 
     ESP_ERROR_CHECK(wifiMgrInit(&wifiConfig));
-    ESP_ERROR_CHECK(mDnsInit());
+    ESP_ERROR_CHECK(mdns_init());
 
     vTaskDelete(nullptr);
 }
@@ -79,7 +80,7 @@ static esp_err_t captivePortalCredentialsHandler(CaptivePortalCredentials_t *cre
 
     err = iotCommInitRootUserPublicKey(creds->rootUserPublicKey);
     if (err == ESP_OK && *creds->hostname != 0) {
-        err = mDnsSetHostname(creds->hostname);
+        err = mdns_hostname_set(creds->hostname);
     }
     if (err == ESP_OK) {
         err = wifiMgrStoreSTA(creds->wifiSSID, creds->wifiPassword);

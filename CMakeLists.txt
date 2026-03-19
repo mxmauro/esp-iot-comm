@@ -4,10 +4,8 @@ if(${target} STREQUAL "linux")
     return() # This component is not supported by the POSIX/Linux simulator
 endif()
 
-set(srcs "src/binary_reader.cpp"
-         "src/challenge.cpp"
+set(srcs "src/challenge.cpp"
          "src/iot_comm.cpp"
-         "src/ip_address.cpp"
          "src/rate_limit.cpp"
          "src/user.cpp"
          "src/captive_portal/captive_portal.cpp"
@@ -16,8 +14,9 @@ set(srcs "src/binary_reader.cpp"
          "src/crypto/p256.cpp"
          "src/crypto/utils.cpp"
          "src/http/http_helpers.cpp"
-         "src/mDNS/mDNS.cpp"
          "src/provisioning/wifi.cpp"
+         "src/utils/binary.cpp"
+         "src/utils/network.cpp"
 )
 
 idf_component_register(SRCS "${srcs}"

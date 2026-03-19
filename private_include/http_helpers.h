@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sdkconfig.h"
-#include "ip_address.h"
+#include "iot_comm/utils/network.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
 #include <growable_buffer.h>

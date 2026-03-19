@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ip_address.h"
+#include "iot_comm/utils/network.h"
 #include <esp_err.h>
 
 // -----------------------------------------------------------------------------

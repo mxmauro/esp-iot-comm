@@ -3,6 +3,7 @@
 #include <iot_comm/crypto/hkdf.h>
 #include <iot_comm/crypto/p256.h>
 #include <iot_comm/crypto/utils.h>
+#include <esp_log.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/gcm.h>
 #include <string.h>
@@ -167,6 +168,7 @@ TEST_CASE("ecdsa sign and verify succeed", "[crypto]")
 TEST_CASE("ecdsa verify reports invalid signature after tampering", "[crypto]")
 {
     P256KeyPair_t pair;
+    esp_log_level_t previousLogLevel;
     uint8_t hash[P256_HASH_SIZE];
     uint8_t signature[P256_SIGNATURE_SIZE];
 
@@ -177,7 +179,10 @@ TEST_CASE("ecdsa verify reports invalid signature after tampering", "[crypto]")
     TEST_ASSERT_EQUAL(ESP_OK, ecdsaSign(&pair, hash, signature));
 
     signature[0] ^= 0x01;
+    previousLogLevel = esp_log_level_get("P-256");
+    esp_log_level_set("P-256", ESP_LOG_NONE);
     TEST_ASSERT_EQUAL(MBEDTLS_ERR_ECP_VERIFY_FAILED, ecdsaVerify(&pair, hash, signature));
+    esp_log_level_set("P-256", previousLogLevel);
 
     p256KeyPairDone(&pair);
 }

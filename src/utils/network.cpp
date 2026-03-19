@@ -1,10 +1,11 @@
-#include "ip_address.h"
-#include <lwip/sockets.h>
+#include "iot_comm/utils/network.h"
+#include <ctype.h>
 #include <memory.h>
+#include <string.h>
 
 // -----------------------------------------------------------------------------
 
-static void trim(const char **lpS, const char **lpsEnd);
+static void trim(const char **lpsStart, const char **lpsEnd);
 static const char *findChar(const char *s, const char *sEnd, char c);
 
 // -----------------------------------------------------------------------------
@@ -145,11 +146,71 @@ bool ipAddressEqual(const IPAddress_t *addr1, const IPAddress_t *addr2)
     return true;
 }
 
+bool isValidHostname(const char *hostname)
+{
+    size_t i, j;
+    size_t len, effectiveLen;
+    size_t labelStart, labelLen;
+    char ch;
+
+    if ((!hostname) || *hostname == 0) {
+        return false;
+    }
+    len = strlen(hostname);
+    if (len > MAX_HOSTNAME_LEN) {
+        return false;
+    }
+
+    // Handle trailing dot (FQDN)
+    effectiveLen = (hostname[len - 1] == '.') ? len - 1 : len;
+
+    labelStart = 0;
+    labelLen = 0;
+    for (i = 0; i <= effectiveLen; i++) {
+        ch = (i < effectiveLen) ? hostname[i] : '.';
+
+        if (ch == '.') {
+            // End of label - validate it
+            if (labelLen == 0 || labelLen > 63) {
+                return false;
+            }
+
+            // Check first character of label
+            if (!isalnum((unsigned char)hostname[labelStart])) {
+                return false;
+            }
+
+            // Check last character of label
+            if (!isalnum((unsigned char)hostname[labelStart + labelLen - 1])) {
+                return false;
+            }
+
+            // Check all characters in label
+            for (j = labelStart; j < labelStart + labelLen; j++) {
+                ch = hostname[j];
+                if (!isalnum((unsigned char)ch) && ch != '-') {
+                    return false;
+                }
+            }
+
+            // Start next label
+            labelStart = i + 1;
+            labelLen = 0;
+        }
+        else {
+            labelLen += 1;
+        }
+    }
+
+    // Done
+    return true;
+}
+
 // -----------------------------------------------------------------------------
 
-static void trim(const char **lpS, const char **lpsEnd)
+static void trim(const char **lpsStart, const char **lpsEnd)
 {
-    const char *s = *lpS;
+    const char *s = *lpsStart;
     const char *sEnd = *lpsEnd;
 
     while (s < sEnd && isspace((unsigned char)*s)) {
@@ -158,7 +219,7 @@ static void trim(const char **lpS, const char **lpsEnd)
     while (sEnd > s && isspace((unsigned char)*(sEnd - 1))) {
         sEnd--;
     }
-    *lpS = s;
+    *lpsStart = s;
     *lpsEnd = sEnd;
 }
 

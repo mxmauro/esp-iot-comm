@@ -1,11 +1,11 @@
 #include "iot_comm/iot_comm.h"
-#include "iot_comm/binary_reader.h"
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hkdf.h"
 #include "iot_comm/crypto/utils.h"
+#include "iot_comm/utils/binary.h"
+#include "iot_comm/utils/network.h"
 #include "challenge.h"
 #include "http_helpers.h"
-#include "ip_address.h"
 #include "rate_limit.h"
 #include "user.h"
 #include <convert.h>

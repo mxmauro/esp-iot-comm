@@ -1,6 +1,4 @@
 #include "iot_comm/captive_portal/captive_portal.h"
-
-#include "iot_comm/mDNS/mDNS.h"
 #include "iot_comm/provisioning/wifi.h"
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hkdf.h"
@@ -545,7 +543,7 @@ err_no_mem:
             goto err_invalid_data;
         }
 
-        if (*hostnameValue != 0 && !mDnsIsValidHostname(hostnameValue)) {
+        if (*hostnameValue != 0 && !isValidHostname(hostnameValue)) {
             err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Hostname must be RFC1123 compliant.");
             goto done;
         }

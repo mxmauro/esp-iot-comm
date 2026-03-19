@@ -1,7 +1,10 @@
 #pragma once
 
+#include <lwip/sockets.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#define MAX_HOSTNAME_LEN 64
 
 // -----------------------------------------------------------------------------
 
@@ -31,6 +34,8 @@ void parseIPv6(IPAddress_t *addr, const struct sockaddr_in6 *in);
 bool parseIP(IPAddress_t *addr, const char *s, size_t len = (size_t)-1);
 
 bool ipAddressEqual(const IPAddress_t *addr1, const IPAddress_t *addr2);
+
+bool isValidHostname(const char *hostname);
 
 #ifdef __cplusplus
 }

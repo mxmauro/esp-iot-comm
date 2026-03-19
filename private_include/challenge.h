@@ -2,7 +2,7 @@
 #pragma once
 
 #include "iot_comm/crypto/p256.h"
-#include "ip_address.h"
+#include "iot_comm/utils/network.h"
 #include <esp_err.h>
 
 #define CHALLENGE_COOKIE_SIZE 12

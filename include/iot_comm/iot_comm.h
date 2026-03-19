@@ -2,7 +2,6 @@
 
 #include "sdkconfig.h"
 #include "crypto/p256.h"
-#include "mDNS/mDNS.h" // IWYU pragma: keep
 #include "provisioning/wifi.h" // IWYU pragma: keep
 #include <esp_err.h>
 #include <stdint.h>

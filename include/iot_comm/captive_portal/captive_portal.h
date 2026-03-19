@@ -1,9 +1,9 @@
 #pragma once
 
+#include "iot_comm/utils/network.h"
 #include "iot_comm/crypto/p256.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
-#include <mdns.h>
 
 // -----------------------------------------------------------------------------
 
@@ -11,7 +11,7 @@ typedef struct CaptivePortalCredentials_s {
     char    wifiSSID[32];
     char    wifiPassword[64];
     uint8_t rootUserPublicKey[P256_PUBLIC_KEY_SIZE];
-    char    hostname[MDNS_NAME_MAX_LEN + 1];
+    char    hostname[MAX_HOSTNAME_LEN + 1];
 } CaptivePortalCredentials_t;
 
 typedef esp_err_t (*CaptivePortalCredentialsHandler_t)(CaptivePortalCredentials_t *creds, void *ctx);
