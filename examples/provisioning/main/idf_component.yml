@@ -1,6 +1,7 @@
 description: 'Provisioning example'
 dependencies:
   idf: '>=5.5.0'
+  espressif/mdns: "^1.10.1"
   mxmauro/esp-iot-comm:
     version: '*'
     override_path: '../../../'

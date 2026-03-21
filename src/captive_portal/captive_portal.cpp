@@ -152,7 +152,7 @@ esp_err_t capPortalHandleRequest(httpd_req_t *req)
             switch (req->method) {
                 case HTTP_GET:
                     if (!handlers[i].get) {
-                        goto err_not_found;
+                        goto error_not_found;
                     }
                     err = httpSendDefaultCORS(req);
                     if (err == ESP_OK) {
@@ -162,7 +162,7 @@ esp_err_t capPortalHandleRequest(httpd_req_t *req)
 
                 case HTTP_POST:
                     if (!handlers[i].post) {
-                        goto err_not_found;
+                        goto error_not_found;
                     }
                     err = httpSendDefaultCORS(req);
                     if (err == ESP_OK) {
@@ -172,7 +172,7 @@ esp_err_t capPortalHandleRequest(httpd_req_t *req)
 
                 case HTTP_OPTIONS:
                     if (!(handlers[i].get || handlers[i].post)) {
-                        goto err_not_found;
+                        goto error_not_found;
                     }
                     return httpSendPreflightResponse(req);
             }
@@ -180,7 +180,7 @@ esp_err_t capPortalHandleRequest(httpd_req_t *req)
     }
 
     // Not found
-err_not_found:
+error_not_found:
     err = httpSendDefaultCORS(req);
     if (err != ESP_OK) {
         return err;
@@ -232,7 +232,7 @@ static esp_err_t handleInitParams(httpd_req_t *req)
 
     jsonRoot = cJSON_CreateObject();
     if (!jsonRoot) {
-err_nomem:
+error_no_mem:
         err = ESP_ERR_NO_MEM;
         goto done;
     }
@@ -241,12 +241,12 @@ err_nomem:
         (!cJSON_AddBoolToObject(jsonRoot, "setupRootUser", setupRootUser)) ||
         (!cJSON_AddBoolToObject(jsonRoot, "setupDeviceHostname", setupDeviceHostname))
     ) {
-        goto err_nomem;
+        goto error_no_mem;
     }
 
     jsonString = cJSON_PrintUnformatted(jsonRoot);
     if (!jsonString) {
-        goto err_nomem;
+        goto error_no_mem;
     }
 
     err = httpd_resp_set_type(req, "application/json");
@@ -285,7 +285,7 @@ static esp_err_t handleScanNetworks(httpd_req_t *req)
     if (recordsCount > 0) {
         records = (wifi_ap_record_t *)malloc((size_t)recordsCount * sizeof(wifi_ap_record_t));
         if (!records) {
-err_nomem:
+error_no_mem:
             err = ESP_ERR_NO_MEM;
             goto done;
         }
@@ -298,11 +298,11 @@ err_nomem:
     // Create output
     jsonRoot = cJSON_CreateObject();
     if (!jsonRoot) {
-        goto err_nomem;
+        goto error_no_mem;
     }
     jsonArray = cJSON_AddArrayToObject(jsonRoot, "networks");
     if (!jsonArray) {
-        goto err_nomem;
+        goto error_no_mem;
     }
 
     for (uint16_t i = 0; i < recordsCount; ++i) {
@@ -320,7 +320,7 @@ err_nomem:
 
             jsonObj = cJSON_CreateObject();
             if (!jsonObj) {
-                goto err_nomem;
+                goto error_no_mem;
             }
             cJSON_AddItemToArray(jsonArray, jsonObj);
 
@@ -329,14 +329,14 @@ err_nomem:
                 (!cJSON_AddNumberToObject(jsonObj, "rssi", (double)records[i].rssi)) ||
                 (!cJSON_AddBoolToObject(jsonObj, "public", records[i].authmode == WIFI_AUTH_OPEN ? 1 : 0))
             ) {
-                goto err_nomem;
+                goto error_no_mem;
             }
         }
     }
 
     jsonString = cJSON_PrintUnformatted(jsonRoot);
     if (!jsonString) {
-        goto err_nomem;
+        goto error_no_mem;
     }
 
     // Send response
@@ -417,7 +417,7 @@ static esp_err_t handleProvision(httpd_req_t *req)
     // Parse encrypted envelope JSON
     json = cJSON_ParseWithLength((const char*)rawBodyBuffer.buffer, rawBodyBuffer.used);
     if (!json) {
-err_invalid_data:
+error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid provisioning data");
         goto done;
     }
@@ -427,7 +427,7 @@ err_invalid_data:
     ivValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "iv"));
     encryptedPayloadValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "encryptedPayload"));
     if ((!clientPublicKeyValue) || (!nonceValue) || (!ivValue) || (!encryptedPayloadValue)) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     clientPublicKeyLen = sizeof(clientPublicKey);
@@ -439,28 +439,28 @@ err_invalid_data:
         (!fromB64(nonceValue, strlen(nonceValue), false, nonce, &nonceLen)) ||
         (!fromB64(ivValue, strlen(ivValue), false, iv, &ivLen))
     ) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
     if (
         (clientPublicKeyLen != sizeof(clientPublicKey)) || (nonceLen != sizeof(nonce)) || (ivLen != sizeof(iv)) ||
         (!p256ValidatePublicKey(clientPublicKey, sizeof(clientPublicKey)))
     ) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Get encrypted payload
     gbReset(&encryptedPayloadBuffer, false);
     if (!gbReserve(&encryptedPayloadBuffer, encryptedPayloadLen + 1)) {
-err_no_mem:
+error_no_mem:
         err = ESP_ERR_NO_MEM;
         goto done;
     }
     if (!fromB64(encryptedPayloadValue, strlen(encryptedPayloadValue), false,
                  encryptedPayloadBuffer.buffer, &encryptedPayloadLen)) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
     if (encryptedPayloadLen < AES_GCM_TAG_SIZE) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
     encryptedPayloadBuffer.used = encryptedPayloadLen;
 
@@ -486,7 +486,7 @@ err_no_mem:
     plaintextLen = encryptedPayloadLen - AES_GCM_TAG_SIZE;
     gbReset(&plaintextBuffer, false);
     if (!gbReserve(&plaintextBuffer, plaintextLen + 1)) {
-        goto err_no_mem;
+        goto error_no_mem;
     }
     err = aesDecrypt(&aesCtx, encryptedPayloadBuffer.buffer, encryptedPayloadLen, iv, sizeof(iv), nullptr, 0, plaintextBuffer.buffer);
     if (err != ESP_OK) {
@@ -500,7 +500,7 @@ err_no_mem:
     cJSON_Delete(json);
     json = cJSON_ParseWithLength((char *)plaintextBuffer.buffer, plaintextLen);
     if (!json) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     wifiSsidValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "wifiSSID"));
@@ -508,7 +508,7 @@ err_no_mem:
     rootUserPublicKeyValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "rootUserPublicKey"));
     hostnameValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "hostname"));
     if ((!wifiSsidValue) || (!wifiPasswordValue)) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     if (*wifiSsidValue == 0 || strlen(wifiSsidValue) > 32) {
@@ -525,7 +525,7 @@ err_no_mem:
 
     if (setupRootUser) {
         if (!rootUserPublicKeyValue) {
-            goto err_invalid_data;
+            goto error_invalid_data;
         }
 
         rootUserPublicKeyLen = sizeof(creds.rootUserPublicKey);
@@ -540,7 +540,7 @@ err_no_mem:
 
     if (setupDeviceHostname) {
         if (!hostnameValue) {
-            goto err_invalid_data;
+            goto error_invalid_data;
         }
 
         if (*hostnameValue != 0 && !isValidHostname(hostnameValue)) {

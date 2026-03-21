@@ -37,7 +37,7 @@ static void *saveUsersCtx = nullptr;
 static esp_err_t saveAllUsers();
 static User_t* findUserByName(const char *name, size_t nameLen);
 static User_t* findUserByID(uint32_t id);
-static bool isEmptyUserPublicKey(User_t* user);
+static bool isUserPublicKeySet(User_t* user);
 static void internalCreateUser(User_t *user, const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
 static esp_err_t internalChangeUserCredentials(User_t *user, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE], bool force, bool isReset);
 static size_t getUserNameLength(const User_t *user);
@@ -280,7 +280,7 @@ esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE
         return ESP_ERR_NOT_FOUND;
     }
 
-    if (isEmptyUserPublicKey(user)) {
+    if (!isUserPublicKeySet(user)) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -375,7 +375,7 @@ static User_t* findUserByID(uint32_t id)
     return nullptr;
 }
 
-static bool isEmptyUserPublicKey(User_t* user)
+static bool isUserPublicKeySet(User_t* user)
 {
     uint8_t val = 0;
 

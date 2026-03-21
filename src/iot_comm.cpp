@@ -675,7 +675,7 @@ static esp_err_t serveWsInit(httpd_req_t *req)
     // Extract parameters from request body and validate
     json = cJSON_ParseWithLength((const char*)reqBody.buffer, reqBody.used);
     if (!json) {
-err_invalid_data:
+error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
@@ -684,13 +684,13 @@ err_invalid_data:
     clientNonceValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "clientNonce"));
     ecdhClientPublicKeyValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "clientPublicKey"));
     if ((!userNameValue) || *userNameValue == 0 || (!clientNonceValue) || (!ecdhClientPublicKeyValue)) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Validate user
     challenge.userId = userGetID(userNameValue, strlen(userNameValue));
     if (challenge.userId == 0) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Decode and validate client nonce and client ECDH public key
@@ -701,13 +701,13 @@ err_invalid_data:
         (!fromB64(ecdhClientPublicKeyValue, strlen(ecdhClientPublicKeyValue), false, challenge.ecdhClientPublicKey,
                   &ecdhClientPublicKeyLen))
     ) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
     if (
         clientNonceLen != CHALLENGE_NONCE_SIZE || ecdhClientPublicKeyLen != P256_PUBLIC_KEY_SIZE ||
         (!p256ValidatePublicKey(challenge.ecdhClientPublicKey, P256_PUBLIC_KEY_SIZE))
     ) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Generate server nonce, challenge cookie and ephemeral server ECDH key pair
@@ -828,7 +828,7 @@ static esp_err_t serveWsAuth(httpd_req_t *req)
     // Extract parameters from request body and validate
     json = cJSON_ParseWithLength((const char*)reqBody.buffer, reqBody.used);
     if (!json) {
-err_invalid_data:
+error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
@@ -837,7 +837,7 @@ err_invalid_data:
     authNonceValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "authNonce"));
     signatureValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "signature"));
     if ((!cookieValue) || (!authNonceValue) || (!signatureValue)) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Decode and validate token, auth nonce, and signature
@@ -849,10 +849,10 @@ err_invalid_data:
         (!fromB64(authNonceValue, strlen(authNonceValue), false, authNonce, &authNonceLen)) ||
         (!fromB64(signatureValue, strlen(signatureValue), false, signature, &signatureLen))
     ) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
     if (challengeCookieLen != CHALLENGE_COOKIE_SIZE || authNonceLen != CHALLENGE_NONCE_SIZE || signatureLen != P256_SIGNATURE_SIZE) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Lookup challenge
@@ -905,7 +905,7 @@ error_not_auth:
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
-        if (err == MBEDTLS_ERR_ECP_VERIFY_FAILED) {
+        if (err == ESP_ERR_NOT_FOUND || err == MBEDTLS_ERR_ECP_VERIFY_FAILED || err == ESP_ERR_INVALID_STATE) {
             challengesRemove(challengeCookie);
             goto error_not_auth;
         }
@@ -1069,7 +1069,7 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
         httpd_query_key_value((const char*)reqQueryParams.buffer, "wsNonce", wsNonceB64, sizeof(wsNonceB64)) != ESP_OK ||
         httpd_query_key_value((const char*)reqQueryParams.buffer, "signature", signatureB64, sizeof(signatureB64)) != ESP_OK
     ) {
-err_invalid_data:
+error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
@@ -1083,7 +1083,7 @@ err_invalid_data:
         (!fromB64(wsNonceB64, strlen(wsNonceB64), true, wsNonce, &wsNonceLen)) || wsNonceLen != CHALLENGE_NONCE_SIZE ||
         (!fromB64(signatureB64, strlen(signatureB64), true, signature, &signatureLen)) ||signatureLen != P256_SIGNATURE_SIZE
     ) {
-        goto err_invalid_data;
+        goto error_invalid_data;
     }
 
     // Lookup challenge and check if the user is authenticated
@@ -1207,26 +1207,26 @@ error_not_auth:
     memcpy(session->nonce, challenge->wsNonce, sizeof(ChallengeNonce_t));
     err = aesSetKey(&session->clientAesCtx, derivedKey, AES_KEY_LEN);
     if (err != ESP_OK) {
-err_destroy_session_and_done:
+error_destroy_session_and_done:
         destroySession(session);
         goto done;
     }
     err = aesSetKey(&session->serverAesCtx, derivedKey + AES_KEY_LEN, AES_KEY_LEN);
     if (err != ESP_OK) {
-        goto err_destroy_session_and_done;
+        goto error_destroy_session_and_done;
     }
     memcpy(session->clientBaseIV, derivedKey + 2 * AES_KEY_LEN, SESSION_IV_LEN);
     memcpy(session->serverBaseIV, derivedKey + 2 * AES_KEY_LEN + SESSION_IV_LEN, SESSION_IV_LEN);
 
     err = userIsAdmin(session->userId, &b);
     if (err != ESP_OK) {
-        goto err_destroy_session_and_done;
+        goto error_destroy_session_and_done;
     }
     session->isAdmin = (b) ? 1 : 0;
 
     err = userMustChangeCredentials(session->userId, &b);
     if (err != ESP_OK) {
-        goto err_destroy_session_and_done;
+        goto error_destroy_session_and_done;
     }
     session->mustChangeCredentials = (b) ? 1 : 0;
 

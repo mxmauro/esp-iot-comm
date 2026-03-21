@@ -51,23 +51,24 @@ esp_err_t httpSendPreflightResponse(httpd_req_t *req)
 
 esp_err_t httpGetRequestBody(GrowableBuffer_t *rawBodyBuffer, httpd_req_t *req)
 {
-    char *rawBody;
-    size_t curLen;
-    int received;
-
     gbReset(rawBodyBuffer, false);
-    rawBody = (char *)gbReserve(rawBodyBuffer, req->content_len + 1);
-    if (!rawBody) {
-        return ESP_ERR_NO_MEM;
-    }
+    if (req->content_len > 0) {
+        char *rawBody;
+        size_t curLen;
+        int received;
 
-    for (curLen = 0; curLen < req->content_len; curLen += (size_t)received) {
-        received = httpd_req_recv(req, rawBody + curLen, req->content_len - curLen);
-        if (received <= 0) {
-            return ESP_FAIL;
+        rawBody = (char *)gbReserve(rawBodyBuffer, req->content_len);
+        if (!rawBody) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        for (curLen = 0; curLen < req->content_len; curLen += (size_t)received) {
+            received = httpd_req_recv(req, rawBody + curLen, req->content_len - curLen);
+            if (received <= 0) {
+                return ESP_FAIL;
+            }
         }
     }
-    rawBody[req->content_len] = 0;
 
     // Done
     return ESP_OK;
@@ -110,14 +111,17 @@ esp_err_t httpSendNotFound(httpd_req_t *req)
 esp_err_t httpSendInternalErrorResponse(httpd_req_t *req, esp_err_t err, const char *message)
 {
     if (err != ESP_OK) {
+        char msgHolder[40];
+
         switch (err) {
             case ESP_ERR_NO_MEM:
                 message = "Failed to allocate memory";
                 break;
 
             default:
-                if (!message) {
-                    message = "Unexpected error";
+                if ((!message) || *message == 0) {
+                    snprintf(msgHolder, sizeof(msgHolder), "Unexpected error %d", err);
+                    message = msgHolder;
                 }
                 break;
         }
