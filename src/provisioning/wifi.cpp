@@ -36,7 +36,7 @@ static esp_netif_t *defNetIfWifiAp = nullptr;
 static bool provisioned = false;
 
 static httpd_handle_t cpHttpServer = nullptr;
-static WifiMgrCaptivePortalDoneCallback_t cpDoneHandler = nullptr;
+static WifiMgrCaptivePortalDeinitCallback_t cpDeinitHandler = nullptr;
 static WifiMgrCaptivePortalHttpRequestHandler_t cpHttpReqHandler = nullptr;
 static void *cpHandlerCtx = nullptr;
 
@@ -278,10 +278,6 @@ static void wifiMgrDeinitNoLock()
 
         connected = false;
         provisioned = false;
-
-        cpDoneHandler = nullptr;
-        cpHttpReqHandler = nullptr;
-        cpHandlerCtx = nullptr;
     }
 
     rundownProtInit(&rp);
@@ -377,7 +373,7 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
 
         // Save captive portal handlers
         cpHttpReqHandler = config->softAP.captivePortal.httpReq;
-        cpDoneHandler = config->softAP.captivePortal.done;
+        cpDeinitHandler = config->softAP.captivePortal.deinit;
         cpHandlerCtx = config->softAP.captivePortal.ctx;
 
         // Initialize the HTTP server
@@ -735,10 +731,10 @@ static void stopCaptivePortal()
     memset(cpDnsIP, 0, sizeof(cpDnsIP));
     memset(cpDhcpUri, 0, sizeof(cpDhcpUri));
 
-    if (cpDoneHandler) {
-        cpDoneHandler(cpHandlerCtx);
+    if (cpDeinitHandler) {
+        cpDeinitHandler(cpHandlerCtx);
     }
-    cpDoneHandler = nullptr;
+    cpDeinitHandler = nullptr;
     cpHttpReqHandler = nullptr;
     cpHandlerCtx = nullptr;
 }

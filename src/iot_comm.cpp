@@ -56,7 +56,6 @@ typedef enum IncomingBufferType_e {
 
 typedef struct ServerContext_s {
     size_t maxPacketSize;
-
     size_t maxConnectionsCount;
 
     struct {
@@ -113,24 +112,19 @@ typedef struct CommandContext_s {
     uint32_t rxCounter;
 } CommandContext_t;
 
-typedef struct OnTheFlyEventListItem_s {
-    struct OnTheFlyEventListItem_s *next;
-    struct OnTheFlyEventListItem_s *prev;
-
-    uint32_t          eventId;
-    SessionInfo_t    *session;
-    httpd_req_t      *req;
-    CommandContext_t *commandCtx;
+typedef struct OnTheFlyEvent_s {
+    SessionInfo_t *session;
 
     esp_err_t savedErr;
     bool      replySent;
     esp_err_t closeErr;
     bool      closeSent;
 
-    IotCommEventSessionStart_t  *pSessionStartEventData;
-    IotCommEventSessionEnd_t    *pSessionEndEventData;
-    IotCommEventCustomCommand_t *pCustomCommandEventData;
-} OnTheFlyEventListItem_t;
+    IotCommEvent_t *event;
+
+    httpd_req_t   *req;
+    CommandContext_t *commandCtx;
+} OnTheFlyEvent_t;
 
 // -----------------------------------------------------------------------------
 
@@ -140,11 +134,6 @@ static IotCommEventHandler_t handler = nullptr;
 static void *handlerCtx = nullptr;
 static httpd_handle_t server = nullptr;
 static _Atomic(uint32_t) nextSessionId = {0};
-static _Atomic(uint32_t) nextEventId = {0};
-
-static RWMutex otfeRwMtx;
-static OnTheFlyEventListItem_t *otfeFirst = nullptr;
-static OnTheFlyEventListItem_t *otfeLast = nullptr;
 
 // -----------------------------------------------------------------------------
 
@@ -186,13 +175,6 @@ static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, cons
 
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl);
 
-static void otfeGenerateID(OnTheFlyEventListItem_t *item);
-static void otfePushBack(OnTheFlyEventListItem_t *item);
-static void otfeRemove(OnTheFlyEventListItem_t *item);
-static OnTheFlyEventListItem_t* otfeFindByEventId(uint32_t eventId);
-// The first event matching the session id is returned
-static OnTheFlyEventListItem_t* otfeFindBySessionId(uint32_t sessionId);
-
 // -----------------------------------------------------------------------------
 
 esp_err_t iotCommInit(IotCommConfig_t *config)
@@ -210,7 +192,6 @@ esp_err_t iotCommInit(IotCommConfig_t *config)
     rundownProtInit(&rp);
 
     atomic_store_explicit(&nextSessionId, 1, memory_order_relaxed);
-    atomic_store_explicit(&nextEventId, 1, memory_order_relaxed);
 
     // Initialize users manager
     memset(&usersConfig, 0, sizeof(usersConfig));
@@ -373,23 +354,15 @@ bool iotCommIsServerRunning()
     return !!server;
 }
 
-esp_err_t iotCommSetSessionUserData(uint32_t sessionId, void *ptr, IotCommUserDataFreeFunc_t freeFn)
+esp_err_t iotCommSetSessionUserData(IotCommSessionHandle_t h, void *ptr, IotCommUserDataFreeFunc_t freeFn)
 {
     AutoRundownProtection rpLock(rp);
     void *oldUserData = nullptr;
     IotCommUserDataFreeFunc_t oldUserDataFreeFn = nullptr;
 
     if (rpLock.acquired()) {
-        AutoRWMutex otfeLock(otfeRwMtx, true);
-        OnTheFlyEventListItem_t *otfeItem;
-        SessionInfo_t *session;
-
-        // Find session
-        otfeItem = otfeFindBySessionId(sessionId);
-        if (!otfeItem) {
-            return ESP_ERR_NOT_FOUND;
-        }
-        session = otfeItem->session;
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
+        SessionInfo_t *session = otfe->session;
 
         // Save the old user data
         oldUserData = session->userData;
@@ -417,141 +390,190 @@ esp_err_t iotCommSetSessionUserData(uint32_t sessionId, void *ptr, IotCommUserDa
     return ESP_OK;
 }
 
-void* iotCommGetSessionUserData(uint32_t sessionId)
+void* iotCommGetSessionUserData(IotCommSessionHandle_t h)
 {
     AutoRundownProtection rpLock(rp);
     void *userData = nullptr;
 
     if (rpLock.acquired()) {
-        AutoRWMutex otfeLock(otfeRwMtx, true);
-        OnTheFlyEventListItem_t *otfeItem;
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
 
-        // Find session
-        otfeItem = otfeFindBySessionId(sessionId);
-        if (otfeItem) {
-            // Save the user data
-            userData = otfeItem->session->userData;
-        }
+        userData = otfe->session->userData;
     }
 
-    // Free old user data
+    // Done
     return userData;
 }
 
-esp_err_t iotCommEventReply(uint32_t eventId, const uint8_t * reply, size_t replyLen)
+uint32_t iotCommGetSessionId(IotCommSessionHandle_t h)
+{
+    AutoRundownProtection rpLock(rp);
+    uint32_t sessionId = 0;
+
+    if (rpLock.acquired()) {
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
+
+        sessionId = otfe->session->id;
+    }
+
+    // Done
+    return sessionId;
+}
+
+uint32_t iotCommGetSessionUserId(IotCommSessionHandle_t h)
+{
+    AutoRundownProtection rpLock(rp);
+    uint32_t userId = 0;
+
+    if (rpLock.acquired()) {
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
+
+        userId = otfe->session->userId;
+    }
+
+    // Done
+    return userId;
+}
+
+bool  iotCommIsSessionUserAdmin(IotCommSessionHandle_t h)
+{
+    AutoRundownProtection rpLock(rp);
+    bool isAdmin = false;
+
+    if (rpLock.acquired()) {
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
+
+        isAdmin = (otfe->session->isAdmin != 0) ? true : false;
+    }
+
+    // Done
+    return isAdmin;
+}
+
+IPAddress_t iotCommGetSessionIpAddress(IotCommSessionHandle_t h)
+{
+    AutoRundownProtection rpLock(rp);
+    IPAddress_t addr;
+
+    if (rpLock.acquired()) {
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
+
+        memcpy(&addr, &otfe->session->addr, sizeof(IPAddress_t));
+    }
+    else {
+        memset(&addr, 0, sizeof(IPAddress_t));
+    }
+
+    // Done
+    return addr;
+}
+
+esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t * reply, size_t replyLen)
 {
     AutoRundownProtection rpLock(rp);
 
     if (rpLock.acquired()) {
-        AutoRWMutex otfeLock(otfeRwMtx, true);
-        OnTheFlyEventListItem_t *otfeItem;
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
 
-        // Find event
-        otfeItem = otfeFindByEventId(eventId);
-        if (!otfeItem) {
-            return ESP_ERR_NOT_FOUND;
-        }
-        if (!otfeItem->pCustomCommandEventData) {
-            // If not a custom event command, nothing to do
+        // If not a custom event command, nothing to do
+        if (otfe->event->eventType != IotCommEventTypeCustomCommand) {
             return ESP_ERR_NOT_FOUND;
         }
 
         // If some error happened previously for this event, return it
-        if (otfeItem->savedErr != ESP_OK) {
-            return otfeItem->savedErr;
+        if (otfe->savedErr != ESP_OK) {
+            return otfe->savedErr;
         }
         // If closed or a reply was already sent, block
-        if (otfeItem->session->isClosed || otfeItem->replySent || otfeItem->closeSent) {
+        if (otfe->session->isClosed || otfe->replySent || otfe->closeSent) {
             return ESP_FAIL;
         }
 
         // Send the reply
-        otfeItem->savedErr = buildAndSendReply(otfeItem->commandCtx, reply, replyLen, otfeItem->commandCtx->rxCounter, false);
-        otfeItem->replySent = true;
-        if (otfeItem->savedErr != ESP_OK) {
-            otfeItem->closeSent = true;
-            otfeItem->closeErr = closeWsWithCmdCtxAndError(otfeItem->commandCtx, otfeItem->savedErr);
+        otfe->savedErr = buildAndSendReply(otfe->commandCtx, reply, replyLen, otfe->commandCtx->rxCounter, false);
+        otfe->replySent = true;
+        if (otfe->savedErr != ESP_OK) {
+            otfe->closeSent = true;
+            otfe->closeErr = closeWsWithCmdCtxAndError(otfe->commandCtx, otfe->savedErr);
         }
 
         // Done
-        return otfeItem->savedErr;
+        return otfe->savedErr;
     }
 
     // Rundown active
     return ESP_ERR_INVALID_STATE;
 }
 
-esp_err_t iotCommEventReplyWithError(uint32_t eventId, uint32_t code, const char *message)
+esp_err_t iotCommEventReplyWithError(IotCommSessionHandle_t h, uint32_t code, const char *message)
 {
     AutoRundownProtection rpLock(rp);
 
     if (rpLock.acquired()) {
-        AutoRWMutex otfeLock(otfeRwMtx, true);
-        OnTheFlyEventListItem_t *otfeItem;
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
 
-        // Find event
-        otfeItem = otfeFindByEventId(eventId);
-        if (!otfeItem) {
-            return ESP_ERR_NOT_FOUND;
-        }
-        if (!otfeItem->pCustomCommandEventData) {
-            // If not a custom event command, nothing to do
+        // If not a custom event command, nothing to do
+        if (otfe->event->eventType != IotCommEventTypeCustomCommand) {
             return ESP_ERR_NOT_FOUND;
         }
 
         // If some error happened previously for this event, return it
-        if (otfeItem->savedErr != ESP_OK) {
-            return otfeItem->savedErr;
+        if (otfe->savedErr != ESP_OK) {
+            return otfe->savedErr;
         }
         // If closed or a reply was already sent, block
-        if (otfeItem->session->isClosed || otfeItem->replySent || otfeItem->closeSent) {
+        if (otfe->session->isClosed || otfe->replySent || otfe->closeSent) {
             return ESP_FAIL;
         }
 
         // Send the reply
-        otfeItem->savedErr = buildAndSendErrorReply(otfeItem->commandCtx, code, message, otfeItem->commandCtx->rxCounter, false);
-        otfeItem->replySent = true;
-        if (otfeItem->savedErr != ESP_OK) {
-            otfeItem->closeSent = true;
-            otfeItem->closeErr = closeWsWithCmdCtxAndError(otfeItem->commandCtx, otfeItem->savedErr);
+        otfe->savedErr = buildAndSendErrorReply(otfe->commandCtx, code, message, otfe->commandCtx->rxCounter, false);
+        otfe->replySent = true;
+        if (otfe->savedErr != ESP_OK) {
+            otfe->closeSent = true;
+            otfe->closeErr = closeWsWithCmdCtxAndError(otfe->commandCtx, otfe->savedErr);
         }
 
         // Done
-        return otfeItem->savedErr;
+        return otfe->savedErr;
     }
 
     // Rundown active
     return ESP_ERR_INVALID_STATE;
 }
 
-void iotCommSessionClose(uint32_t sessionId, uint16_t reason, const char *message)
+void iotCommSessionClose(IotCommSessionHandle_t h, uint16_t reason, const char *message)
 {
     AutoRundownProtection rpLock(rp);
 
     if (rpLock.acquired()) {
-        AutoRWMutex otfeLock(otfeRwMtx, true);
-        OnTheFlyEventListItem_t *otfeItem;
+        OnTheFlyEvent_t *otfe = (OnTheFlyEvent_t *)h;
 
-        // Find event by session. The presence of a start event is mutually exclusive with
-        // the presence if a custom command event.
-        otfeItem = otfeFindBySessionId(sessionId);
-        if (otfeItem) {
-            if (otfeItem->pSessionStartEventData) {
-                if (!otfeItem->closeSent) {
+        // If not a custom event command, nothing to do
+        switch (otfe->event->eventType) {
+            case IotCommEventTypeSessionStart:
+                if (!otfe->closeSent) {
                     if (reason < 400) {
                         reason = (uint16_t)HTTPD_500_INTERNAL_SERVER_ERROR;
                     }
-                    otfeItem->closeSent = true;
-                    otfeItem->closeErr = httpd_resp_send_err(otfeItem->req, (httpd_err_code_t)reason,
-                                                             (message && *message != 0) ? message : nullptr);
+                    if (message && *message == 0) {
+                        message = nullptr;
+                    }
+
+                    otfe->closeSent = true;
+                    otfe->closeErr = httpd_resp_send_err(otfe->req, (httpd_err_code_t)reason, message);
                 }
-            }
-            else if (otfeItem->pCustomCommandEventData) {
-                if (!(otfeItem->session->isClosed || otfeItem->closeSent)) {
-                    otfeItem->closeSent = true;
-                    otfeItem->closeErr = closeWsWithCmdCtx(otfeItem->commandCtx, reason, message);
+                break;
+
+            case IotCommEventTypeSessionEnd:
+                break;
+
+            case IotCommEventTypeCustomCommand:
+                if (!(otfe->session->isClosed || otfe->closeSent)) {
+                    otfe->closeSent = true;
+                    otfe->closeErr = closeWsWithCmdCtx(otfe->commandCtx, reason, message);
                 }
-            }
+                break;
         }
     }
 }
@@ -1632,48 +1654,35 @@ error_validation_failed:
 
 static esp_err_t handleCustomCommand(CommandContext_t *commandCtx)
 {
-    IotCommEventCustomCommand_t eventData;
-    OnTheFlyEventListItem_t otfeItem;
+    IotCommCustomCommandEvent_t customCommandEvent;
+    IotCommEvent_t event;
+    OnTheFlyEvent_t otfe;
 
     // Setup on-the-fly event
-    memset(&otfeItem, 0, sizeof(otfeItem));
-    otfeGenerateID(&otfeItem);
-    otfeItem.session = commandCtx->session;
-    otfeItem.pCustomCommandEventData = &eventData;
-    otfeItem.commandCtx = commandCtx;
+    memset(&otfe, 0, sizeof(otfe));
+    otfe.session = commandCtx->session;
+    otfe.event = &event;
+    otfe.commandCtx = commandCtx;
 
     // Populate event data
-    eventData.eventId = otfeItem.eventId;
-    eventData.handlerCtx = handlerCtx;
-    eventData.sessionId = commandCtx->session->id;
-    eventData.userId = commandCtx->session->userId;
-    eventData.userIsAdmin = (commandCtx->session->isAdmin != 0) ? true : false;
-    eventData.cmd = commandCtx->cmd;
-    eventData.data = commandCtx->br.ptr;
-    eventData.dataLen = commandCtx->br.len;
-
-    // Add on-the-fly event item
-    {
-        AutoRWMutex lock(otfeRwMtx, false);
-
-        otfePushBack(&otfeItem);
-    }
+    memset(&event, 0, sizeof(event));
+    event.sessionHandle = &otfe;
+    event.eventType = IotCommEventTypeCustomCommand;
+    event.ctx = handlerCtx;
+    event.command = &customCommandEvent;
+    customCommandEvent.cmd = commandCtx->cmd;
+    customCommandEvent.data = commandCtx->br.ptr;
+    customCommandEvent.dataLen = commandCtx->br.len;
 
     // Raise event
-    handler(IotCommEventCustomCommand, &eventData);
+    handler(&event);
 
-    // Remove on-the-fly event item
-    {
-        AutoRWMutex lock(otfeRwMtx, false);
-
-        otfeRemove(&otfeItem);
+    // Handle actions in the event handler
+    if (otfe.closeSent) {
+        return otfe.closeErr;
     }
-
-    if (otfeItem.closeSent) {
-        return otfeItem.closeErr;
-    }
-    if (otfeItem.replySent) {
-        return otfeItem.savedErr;
+    if (otfe.replySent) {
+        return otfe.savedErr;
     }
 
     // Done
@@ -1682,78 +1691,47 @@ static esp_err_t handleCustomCommand(CommandContext_t *commandCtx)
 
 static bool handleSessionStart(SessionInfo_t *session, httpd_req_t *req, esp_err_t *closeErr)
 {
-    IotCommEventSessionStart_t eventData;
-    OnTheFlyEventListItem_t otfeItem;
+    IotCommEvent_t event;
+    OnTheFlyEvent_t otfe;
 
     // Setup on-the-fly event
-    memset(&otfeItem, 0, sizeof(otfeItem));
-    otfeGenerateID(&otfeItem);
-    otfeItem.session = session;
-    otfeItem.pSessionStartEventData = &eventData;
-    otfeItem.req = req;
+    memset(&otfe, 0, sizeof(otfe));
+    otfe.session = session;
+    otfe.req = req;
+    otfe.event = &event;
 
     // Populate event data
-    eventData.eventId = otfeItem.eventId;
-    eventData.handlerCtx = handlerCtx;
-    eventData.sessionId = session->id;
-    eventData.userId = session->userId;
-    eventData.userIsAdmin = (session->isAdmin != 0) ? true : false;
-
-    // Add on-the-fly event item
-    {
-        AutoRWMutex lock(otfeRwMtx, false);
-
-        otfePushBack(&otfeItem);
-    }
+    memset(&event, 0, sizeof(event));
+    event.eventType = IotCommEventTypeSessionStart;
+    event.sessionHandle = &otfe;
+    event.ctx = handlerCtx;
 
     // Raise event
-    handler(IotCommEventSessionStart, &eventData);
-
-    // Remove on-the-fly event item
-    {
-        AutoRWMutex lock(otfeRwMtx, false);
-
-        otfeRemove(&otfeItem);
-    }
+    handler(&event);
 
     // Done
-    *closeErr = otfeItem.closeErr;
-    return otfeItem.closeSent;
+    *closeErr = otfe.closeErr;
+    return otfe.closeSent;
 }
 
 static void handleSessionEnd(SessionInfo_t *session)
 {
-    IotCommEventSessionEnd_t eventData;
-    OnTheFlyEventListItem_t otfeItem;
+    IotCommEvent_t event;
+    OnTheFlyEvent_t otfe;
 
     // Setup on-the-fly event
-    memset(&otfeItem, 0, sizeof(otfeItem));
-    otfeGenerateID(&otfeItem);
-    otfeItem.session = session;
-    otfeItem.pSessionEndEventData = &eventData;
+    memset(&otfe, 0, sizeof(otfe));
+    otfe.session = session;
+    otfe.event = &event;
 
-    // Populate event data
-    eventData.eventId = otfeItem.eventId;
-    eventData.handlerCtx = handlerCtx;
-    eventData.sessionId = session->id;
-    eventData.userId = session->userId;
-
-    // Add on-the-fly event item
-    {
-        AutoRWMutex lock(otfeRwMtx, false);
-
-        otfePushBack(&otfeItem);
-    }
+    // Populate event data'
+    memset(&event, 0, sizeof(event));
+    event.eventType = IotCommEventTypeSessionEnd;
+    event.sessionHandle = &otfe;
+    event.ctx = handlerCtx;
 
     // Raise event
-    handler(IotCommEventSessionEnd, &eventData);
-
-    // Remove on-the-fly event item
-    {
-        AutoRWMutex lock(otfeRwMtx, false);
-
-        otfeRemove(&otfeItem);
-    }
+    handler(&event);
 }
 
 static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, uint32_t replyCounter,
@@ -2083,77 +2061,4 @@ static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen
         gbDel(buf, buf->used - (maxLen - usedLen), maxLen - usedLen);
     }
     return true;
-}
-
-static void otfeGenerateID(OnTheFlyEventListItem_t *item)
-{
-    // Generate unique ID
-    do {
-        item->eventId = atomic_fetch_add_explicit(&nextEventId, 1, memory_order_relaxed);
-    }
-    while (item->eventId == 0);
-}
-
-static void otfePushBack(OnTheFlyEventListItem_t *item)
-{
-    assert(item);
-
-    item->next = nullptr;
-    item->prev = otfeLast;
-
-    if (otfeLast) {
-        otfeLast->next = item;
-    }
-    else {
-        otfeFirst = item;
-    }
-    otfeLast = item;
-}
-
-static void otfeRemove(OnTheFlyEventListItem_t *item)
-{
-    assert(item);
-
-    if (item->prev) {
-        item->prev->next = item->next;
-    }
-    else {
-        otfeFirst = item->next;
-    }
-
-    if (item->next) {
-        item->next->prev = item->prev;
-    }
-    else {
-        otfeLast = item->prev;
-    }
-
-    item->next = nullptr;
-    item->prev = nullptr;
-}
-
-static OnTheFlyEventListItem_t* otfeFindByEventId(uint32_t eventId)
-{
-    OnTheFlyEventListItem_t *current = otfeFirst;
-
-    while (current) {
-        if (current->eventId == eventId) {
-            return current;
-        }
-        current = current->next;
-    }
-    return nullptr;
-}
-
-static OnTheFlyEventListItem_t* otfeFindBySessionId(uint32_t sessionId)
-{
-    OnTheFlyEventListItem_t *current = otfeFirst;
-
-    while (current) {
-        if (current->session->id == sessionId) {
-            return current;
-        }
-        current = current->next;
-    }
-    return nullptr;
 }

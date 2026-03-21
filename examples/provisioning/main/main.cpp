@@ -10,9 +10,9 @@
 
 static void setupTask(void *arg);
 
-static void iotCommEventHandler(IotCommEvent_t event, void *eventData);
+static void iotCommEventHandler(IotCommEvent_t *event);
 static void wifiMgrEventHandler(WifiMgrEvent_t event, void *ctx);
-static esp_err_t captivePortalCredentialsHandler(CaptivePortalCredentials_t *creds, void *ctx);
+static esp_err_t captivePortalCredentialsHandler(CaptivePortalSetupData_t *creds, void *ctx);
 static esp_err_t loadUsersFromStorage(void *dest, size_t destLen, void *ctx);
 static esp_err_t saveUsersToStorage(const void *data, size_t dataLen, void *ctx);
 
@@ -49,7 +49,7 @@ static void setupTask(void *arg)
         capPortalConfig.setupDeviceHostname = true;
         return capPortalInit(&capPortalConfig);
     };
-    wifiConfig.softAP.captivePortal.done = [](void *) -> void
+    wifiConfig.softAP.captivePortal.deinit = [](void *) -> void
     {
         capPortalDeinit();
     };
@@ -64,17 +64,17 @@ static void setupTask(void *arg)
     vTaskDelete(nullptr);
 }
 
-static void iotCommEventHandler(IotCommEvent_t event, void *eventData)
+static void iotCommEventHandler(IotCommEvent_t *)
 {
 
 }
 
-static void wifiMgrEventHandler(WifiMgrEvent_t event, void *ctx)
+static void wifiMgrEventHandler(WifiMgrEvent_t, void *)
 {
 
 }
 
-static esp_err_t captivePortalCredentialsHandler(CaptivePortalCredentials_t *creds, void *ctx)
+static esp_err_t captivePortalCredentialsHandler(CaptivePortalSetupData_t *creds, void *)
 {
     esp_err_t err;
 

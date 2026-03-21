@@ -2,6 +2,9 @@
 
 `esp-iot-comm` is an enterprise-grade ESP-IDF component that handles secure device-to-server communication, wireless provisioning, and network services. It integrates cryptographic operations (AES, P-256 ECC), protocol handling, and a lightweight HTTP/WebSocket server.
 
+> [!WARNING]
+> This project is under active development, so its structure, APIs, and definitions may change between releases without prior notice.
+
 ## Key Features
 
 - **Secure Communication**: AES encryption, ECDSA signatures, and challenge-response authentication.

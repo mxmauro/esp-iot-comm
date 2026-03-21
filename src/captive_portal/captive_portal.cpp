@@ -46,7 +46,7 @@ extern const uint8_t webui_assets_app_css_end[]   asm("_binary_app_css_end");
 // -----------------------------------------------------------------------------
 
 static RWMutex rwNtx;
-static CaptivePortalCredentialsHandler_t handler = nullptr;
+static CaptivePortalSetupDataHandler_t handler = nullptr;
 static void *handlerCtx = nullptr;
 static uint8_t serverEcdhPrivateKey[P256_PRIVATE_KEY_SIZE] = {0};
 static char serverEcdhPublicKeyB64[P256_MAX_B64_PUBLIC_KEY_SIZE] = {0};
@@ -389,7 +389,7 @@ static esp_err_t handleProvision(httpd_req_t *req)
     cJSON *json = nullptr;
     char *clientPublicKeyValue, *nonceValue, *ivValue, *encryptedPayloadValue;
     char *wifiSsidValue, *wifiPasswordValue, *rootUserPublicKeyValue, *hostnameValue;
-    CaptivePortalCredentials_t creds;
+    CaptivePortalSetupData_t creds;
     size_t clientPublicKeyLen, nonceLen, ivLen, encryptedPayloadLen;
     size_t rootUserPublicKeyLen;
     size_t plaintextLen;
