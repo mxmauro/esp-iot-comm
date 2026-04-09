@@ -380,7 +380,7 @@ static esp_err_t handleProvision(httpd_req_t *req)
     GrowableBuffer_t encryptedPayloadBuffer = GB_STATIC_INIT;
     GrowableBuffer_t plaintextBuffer = GB_STATIC_INIT;
     P256KeyPair_t ecdhKeyPair;
-    mbedtls_gcm_context aesCtx;
+    AesContext_t aesCtx;
     uint8_t sharedSecret[P256_SHARED_SECRET_SIZE] = {0};
     uint8_t derivedAesKey[AES_KEY_SIZE] = {0};
     uint8_t clientPublicKey[P256_PUBLIC_KEY_SIZE];

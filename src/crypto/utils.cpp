@@ -1,13 +1,19 @@
 #include "iot_comm/crypto/utils.h"
+#include <assert.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
 #include <mutex.h>
 #include <string.h>
 #include <task.h>
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+    #include <psa/crypto.h>
+#else
+    #include <mbedtls/ctr_drbg.h>
+    #include <mbedtls/entropy.h>
+#endif
 
 static const char* TAG = "Crypto-Utils";
 
@@ -16,13 +22,17 @@ static const char* TAG = "Crypto-Utils";
 static Mutex initMtx;
 static bool initialized = false;
 
+#if ESP_IDF_VERSION_MAJOR < 6
 static mbedtls_entropy_context entropyCtx;
 static mbedtls_ctr_drbg_context ctrDrbgCtx;
+#endif
 
 // -----------------------------------------------------------------------------
 
 static esp_err_t init();
+#if ESP_IDF_VERSION_MAJOR < 6
 static void initTask(Task_t *task, void *arg);
+#endif
 
 // -----------------------------------------------------------------------------
 
@@ -30,9 +40,15 @@ esp_err_t randomize(uint8_t *dest, size_t destLen)
 {
     esp_err_t err;
 
+    assert(dest);
+
     err = init();
-    if (err == ESP_OK) {
+    if (err == ESP_OK && destLen > 0) {
+#if ESP_IDF_VERSION_MAJOR >= 6
+        err = psa_generate_random(dest, destLen);
+#else
         err = mbedtls_ctr_drbg_random(&ctrDrbgCtx, dest, destLen);
+#endif
     }
     return err;
 }
@@ -59,9 +75,20 @@ static esp_err_t init()
     AutoMutex lock(initMtx);
 
     if (!initialized) {
+#if ESP_IDF_VERSION_MAJOR >= 6
+        psa_status_t status;
+#else
         Task_t task;
         esp_err_t err, taskErr;
+#endif
 
+#if ESP_IDF_VERSION_MAJOR >= 6
+        status = psa_crypto_init();
+        if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE) {
+            ESP_LOGE(TAG, "Failed to initialize PSA Crypto. Error: %d", status);
+            return status;
+        }
+#else
         taskInit(&task);
         taskErr = ESP_FAIL;
         err = taskCreate(&task, initTask, "rand-init", 3072, &taskErr, uxTaskPriorityGet(nullptr) + 1, tskNO_AFFINITY);
@@ -73,6 +100,7 @@ static esp_err_t init()
             ESP_LOGE(TAG, "Failed to seed the random number generator. Error: %d", err);
             return err;
         }
+#endif
 
         initialized = true;
     }
@@ -81,6 +109,7 @@ static esp_err_t init()
     return ESP_OK;
 }
 
+#if ESP_IDF_VERSION_MAJOR < 6
 static void initTask(Task_t *task, void *arg)
 {
     esp_err_t *err = (esp_err_t *)arg;
@@ -98,3 +127,4 @@ static void initTask(Task_t *task, void *arg)
         mbedtls_entropy_free(&entropyCtx);
     }
 }
+#endif

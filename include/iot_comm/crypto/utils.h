@@ -1,8 +1,9 @@
 #pragma once
 
 #include "sdkconfig.h"
-#include <stdint.h>
 #include <esp_err.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 // -----------------------------------------------------------------------------
 
@@ -17,5 +18,5 @@ esp_err_t randomize(uint8_t *dest, size_t destLen);
 bool constantTimeCompare(const void *buf1, const void *buf2, size_t len);
 
 #ifdef __cplusplus
-};
+}
 #endif // __cplusplus

@@ -2,13 +2,15 @@
 
 #include "sdkconfig.h"
 #include <esp_err.h>
-#include <mbedtls/ecp.h>
-#include <mbedtls/ecdh.h>
-#include <mbedtls/pk.h>
+#include <esp_idf_version.h>
+#include <stdbool.h>
 #include <stdint.h>
+#if ESP_IDF_VERSION_MAJOR < 6
+    #include <mbedtls/ecp.h>
+#endif
 
-#if (!defined(CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED)) || (!defined(CONFIG_MBEDTLS_HKDF_C))
-    #error This library requires CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED and CONFIG_MBEDTLS_HKDF_C to be enabled
+#if (!defined(CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED))
+    #error This library requires CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED to be enabled
 #endif
 
 #if (!defined(CONFIG_MBEDTLS_PK_PARSE_EC_EXTENDED)) || (!defined(CONFIG_MBEDTLS_PK_PARSE_EC_COMPRESSED))
@@ -17,6 +19,12 @@
 
 #if (!defined(CONFIG_MBEDTLS_ECDH_C)) || (!defined(CONFIG_MBEDTLS_ECDSA_C))
     #error This library requires CONFIG_MBEDTLS_ECDH_C and CONFIG_MBEDTLS_ECDSA_C to be enabled
+#endif
+
+#if ESP_IDF_VERSION_MAJOR < 6
+    #if (!defined(CONFIG_MBEDTLS_HKDF_C))
+        #error This library requires CONFIG_MBEDTLS_HKDF_C to be enabled
+    #endif
 #endif
 
 #define P256_PUBLIC_KEY_SIZE  65
@@ -30,12 +38,20 @@
 #define P256_HASH_SIZE      32
 #define P256_SIGNATURE_SIZE 64
 
+#if ESP_IDF_VERSION_MAJOR >= 6
+    #define ESP_ERR_SIGNATURE_VERIFICATION_FAILED PSA_ERROR_INVALID_SIGNATURE
+#else
+    #define ESP_ERR_SIGNATURE_VERIFICATION_FAILED MBEDTLS_ERR_ECP_VERIFY_FAILED
+#endif
+
 // -----------------------------------------------------------------------------
 
 // Stores a P-256 private key together with its public point.
 typedef struct P256KeyPair_s {
-    mbedtls_mpi       d; // Private key
-    mbedtls_ecp_point q; // Public key
+    uint8_t privateKey[P256_PRIVATE_KEY_SIZE];
+    uint8_t publicKey[P256_PUBLIC_KEY_SIZE];
+    bool    hasPrivateKey;
+    bool    hasPublicKey;
 } P256KeyPair_t;
 
 // -----------------------------------------------------------------------------

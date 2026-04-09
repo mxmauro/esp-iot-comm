@@ -4,7 +4,6 @@
 #include <fnv.h>
 #include <freertos/FreeRTOS.h>
 #include <lightstd/vector.h>
-#include <mbedtls/pkcs5.h>
 #include <string.h>
 #include <time.h>
 

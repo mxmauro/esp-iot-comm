@@ -1,6 +1,7 @@
 #include "iot_comm/iot_comm.h"
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hkdf.h"
+#include "iot_comm/crypto/sha.h"
 #include "iot_comm/crypto/utils.h"
 #include "iot_comm/utils/binary.h"
 #include "iot_comm/utils/network.h"
@@ -15,7 +16,6 @@
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <growable_buffer.h>
-#include <mbedtls/sha256.h>
 #include <mutex.h>
 #include <rundown_protection.h>
 #include <stdatomic.h>
@@ -39,8 +39,6 @@ static const char* TAG = "IotComm";
 
 #define SESSION_IV_LEN     12
 #define SESSION_AES_KEY_LEN    32
-
-#define SHA256_SIZE 32
 
 #define MIN_WS_PACKET_SIZE 1024
 
@@ -78,9 +76,9 @@ typedef struct SessionInfo_s {
     uint32_t nextRxCounter;
     uint32_t nextTxCounter;
     ChallengeNonce_t nonce;
-    mbedtls_gcm_context clientAesCtx;
+    AesContext_t clientAesCtx;
     uint8_t clientBaseIV[SESSION_IV_LEN];
-    mbedtls_gcm_context serverAesCtx;
+    AesContext_t serverAesCtx;
     uint8_t serverBaseIV[SESSION_IV_LEN];
     uint8_t isAdmin : 1;
     uint8_t mustChangeCredentials : 1;
@@ -161,7 +159,7 @@ static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t c
                                    bool closeOnError);
 
 static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason);
-static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, esp_err_t err);
+static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, const char *zone, esp_err_t err);
 
 static void destroyServerCtx(void *ctx);
 static void destroySessionCtx(void *ctx);
@@ -494,7 +492,7 @@ esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t * reply, siz
         otfe->replySent = true;
         if (otfe->savedErr != ESP_OK) {
             otfe->closeSent = true;
-            otfe->closeErr = closeWsWithCmdCtxAndError(otfe->commandCtx, otfe->savedErr);
+            otfe->closeErr = closeWsWithCmdCtxAndError(otfe->commandCtx, "send-reply", otfe->savedErr);
         }
 
         // Done
@@ -531,7 +529,7 @@ esp_err_t iotCommEventReplyWithError(IotCommSessionHandle_t h, uint32_t code, co
         otfe->replySent = true;
         if (otfe->savedErr != ESP_OK) {
             otfe->closeSent = true;
-            otfe->closeErr = closeWsWithCmdCtxAndError(otfe->commandCtx, otfe->savedErr);
+            otfe->closeErr = closeWsWithCmdCtxAndError(otfe->commandCtx, "send-reply", otfe->savedErr);
         }
 
         // Done
@@ -777,7 +775,7 @@ static esp_err_t serveWsAuth(httpd_req_t *req)
     size_t authNonceLen;
     size_t signatureLen;
     Challenge_t *challenge;
-    mbedtls_sha256_context sha256Ctx;
+    Sha256Context_t sha256Ctx;
     uint8_t th[SHA256_SIZE];
     bool b;
     esp_err_t err;
@@ -794,7 +792,7 @@ static esp_err_t serveWsAuth(httpd_req_t *req)
     // Prepare
     reqBody = GB_STATIC_INIT;
     respBody = GB_STATIC_INIT;
-    mbedtls_sha256_init(&sha256Ctx);
+    sha256Init(&sha256Ctx);
 
     // Send CORS
     err = httpSendDefaultCORS(req);
@@ -865,39 +863,39 @@ error_not_auth:
     removeChallenge = true;
 
     // th = SHA256("ws-login-v1" || c_pk || s_pk || s_nonce || c_nonce || cookie || auth_nonce)
-    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    err = sha256Start(&sha256Ctx);
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    err = sha256Update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->ecdhServerPublicKey, sizeof(challenge->ecdhServerPublicKey));
+    err = sha256Update(&sha256Ctx, challenge->ecdhServerPublicKey, sizeof(challenge->ecdhServerPublicKey));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
+    err = sha256Update(&sha256Ctx, challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    err = sha256Update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    err = sha256Update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    err = sha256Update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, authNonce, sizeof(authNonce));
+    err = sha256Update(&sha256Ctx, authNonce, sizeof(authNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_finish(&sha256Ctx, th);
+    err = sha256Finish(&sha256Ctx, th);
     if (err != ESP_OK) {
         goto done;
     }
@@ -905,7 +903,7 @@ error_not_auth:
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
-        if (err == ESP_ERR_NOT_FOUND || err == MBEDTLS_ERR_ECP_VERIFY_FAILED || err == ESP_ERR_INVALID_STATE) {
+        if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_SIGNATURE_VERIFICATION_FAILED || err == ESP_ERR_INVALID_STATE) {
             challengesRemove(challengeCookie);
             goto error_not_auth;
         }
@@ -967,7 +965,7 @@ done:
     memset(signature, 0, sizeof(signature));
     memset(authNonce, 0, sizeof(authNonce));
     memset(&challengeCookie, 0, sizeof(challengeCookie));
-    mbedtls_sha256_free(&sha256Ctx);
+    sha256Done(&sha256Ctx);
     gbWipe(&respBody);
     gbReset(&respBody, true);
     gbWipe(&reqBody);
@@ -1007,7 +1005,7 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
     size_t wsNonceLen;
     size_t signatureLen;
     Challenge_t *challenge;
-    mbedtls_sha256_context sha256Ctx;
+    Sha256Context_t sha256Ctx;
     uint8_t th[SHA256_SIZE];
     P256KeyPair_t ecdhKeyPair;
     uint8_t info[6 + 2 * P256_PUBLIC_KEY_SIZE];
@@ -1025,7 +1023,7 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
 
     // Prepare
     reqQueryParams = GB_STATIC_INIT;
-    mbedtls_sha256_init(&sha256Ctx);
+    sha256Init(&sha256Ctx);
     p256KeyPairInit(&ecdhKeyPair);
 
     // Send CORS
@@ -1102,31 +1100,31 @@ error_not_auth:
     }
 
     // th = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie || ws_nonce)
-    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    err = sha256Start(&sha256Ctx);
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    err = sha256Update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    err = sha256Update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    err = sha256Update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    err = sha256Update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, wsNonce, sizeof(wsNonce));
+    err = sha256Update(&sha256Ctx, wsNonce, sizeof(wsNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_finish(&sha256Ctx, th);
+    err = sha256Finish(&sha256Ctx, th);
     if (err != ESP_OK) {
         goto done;
     }
@@ -1134,7 +1132,7 @@ error_not_auth:
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
-        if (err == MBEDTLS_ERR_ECP_VERIFY_FAILED) {
+        if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_SIGNATURE_VERIFICATION_FAILED || err == ESP_ERR_INVALID_STATE) {
             challengesRemove(challengeCookie);
             goto error_not_auth;
         }
@@ -1147,27 +1145,27 @@ error_not_auth:
     memcpy(info + 6 + sizeof(challenge->ecdhServerPublicKey), challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
 
     // Build salt = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie)
-    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    err = sha256Start(&sha256Ctx);
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    err = sha256Update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    err = sha256Update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    err = sha256Update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    err = sha256Update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
     if (err != ESP_OK) {
         goto done;
     }
-    err = mbedtls_sha256_finish(&sha256Ctx, salt);
+    err = sha256Finish(&sha256Ctx, salt);
     if (err != ESP_OK) {
         goto done;
     }
@@ -1290,7 +1288,7 @@ done:
     memset(wsNonceB64, 0, sizeof(wsNonceB64));
     memset(tokenB64, 0, sizeof(tokenB64));
     p256KeyPairDone(&ecdhKeyPair);
-    mbedtls_sha256_free(&sha256Ctx);
+    sha256Done(&sha256Ctx);
     gbWipe(&reqQueryParams);
     gbReset(&reqQueryParams, true);
 
@@ -1331,7 +1329,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
         else {
             ESP_LOGD(TAG, "Unable to read WebSocket packet. Error: %ld.", err);
         }
-        return closeWsWithCmdCtxAndError(&commandCtx, err);
+        return closeWsWithCmdCtxAndError(&commandCtx, "read", err);
     }
     if (!messageComplete) {
         // Nothing to do if the message is not complete
@@ -1374,7 +1372,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     // Prepare output for decrypted message
     gbReset(&commandCtx.session->plaintextIn, false);
     if (!gbEnsureSize(&commandCtx.session->plaintextIn, dataAndTagLen - TAG_LEN)) {
-        return closeWsWithCmdCtxAndError(&commandCtx, ESP_ERR_NO_MEM);
+        return closeWsWithCmdCtxAndError(&commandCtx, "read", ESP_ERR_NO_MEM);
     }
 
     // Decrypt message
@@ -1385,7 +1383,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
         if (err == MBEDTLS_ERR_GCM_AUTH_FAILED) {
             return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
         }
-        return closeWsWithCmdCtxAndError(&commandCtx, err);
+        return closeWsWithCmdCtxAndError(&commandCtx, "decode", err);
     }
 
     // Cleanup incoming message internals
@@ -1586,7 +1584,7 @@ static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
     const uint8_t *signature;
     const uint8_t *publicKey;
     uint8_t publicKeyBuf[P256_PUBLIC_KEY_SIZE];
-    mbedtls_sha256_context sha256Ctx;
+    Sha256Context_t sha256Ctx;
     uint8_t th[SHA256_SIZE];
     uint8_t signatureToVerify[P256_SIGNATURE_SIZE];
     esp_err_t err;
@@ -1605,21 +1603,21 @@ static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
 
     // th = SHA256("ws-chgcreds-v1" || publicKey || ws_nonce)
-    mbedtls_sha256_init(&sha256Ctx);
-    err = mbedtls_sha256_starts(&sha256Ctx, 0);
+    sha256Init(&sha256Ctx);
+    err = sha256Start(&sha256Ctx);
     if (err == ESP_OK) {
-        err = mbedtls_sha256_update(&sha256Ctx, (const uint8_t *)"ws-chgcreds-v1", 14);
+        err = sha256Update(&sha256Ctx, (const uint8_t *)"ws-chgcreds-v1", 14);
         if (err == ESP_OK) {
-            err = mbedtls_sha256_update(&sha256Ctx, publicKeyBuf, P256_PUBLIC_KEY_SIZE);
+            err = sha256Update(&sha256Ctx, publicKeyBuf, P256_PUBLIC_KEY_SIZE);
             if (err == ESP_OK) {
-                err = mbedtls_sha256_update(&sha256Ctx, commandCtx->session->nonce, sizeof(commandCtx->session->nonce));
+                err = sha256Update(&sha256Ctx, commandCtx->session->nonce, sizeof(commandCtx->session->nonce));
                 if (err == ESP_OK) {
-                    err = mbedtls_sha256_finish(&sha256Ctx, th);
+                    err = sha256Finish(&sha256Ctx, th);
                 }
             }
         }
     }
-    mbedtls_sha256_free(&sha256Ctx);
+    sha256Done(&sha256Ctx);
     if (err != ESP_OK) {
 error_validation_failed:
         ESP_LOGD(TAG, "CHANGE PASSWORD command: Validation failed.");
@@ -1757,7 +1755,7 @@ static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *
     if (!gbEnsureSize(ciphertextOut, sizeof(WebSocketPacketHeader_t) + plaintextOutLen + TAG_LEN)) {
         err = ESP_ERR_NO_MEM;
 on_error:
-        return (closeOnError) ? closeWsWithCmdCtxAndError(commandCtx, err) : err;
+        return (closeOnError) ? closeWsWithCmdCtxAndError(commandCtx, "reply", err) : err;
     }
 
     // Header
@@ -1849,9 +1847,12 @@ static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, 
     return closeWs(commandCtx->serverHandle, commandCtx->sockfd, code, reason) ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, esp_err_t err)
+static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, const char *zone, esp_err_t err)
 {
-    return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INTERNAL_ERROR, (err == ESP_ERR_NO_MEM) ? "Out of memory" : nullptr);
+    char reason[64];
+
+    snprintf(reason, sizeof(reason), "%s:%d", zone, err);
+    return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INTERNAL_ERROR, reason);
 }
 
 static void destroyServerCtx(void *ctx)

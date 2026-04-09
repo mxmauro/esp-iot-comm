@@ -1,5 +1,5 @@
 ## IDF Component Manager Manifest File
-version: 0.2.4
+version: 0.3.0
 description: IoT Communications Library for ESP-IDF
 url: https://github.com/mxmauro/esp-iot-comm
 repository: https://github.com/mxmauro/esp-iot-comm.git
@@ -9,12 +9,12 @@ maintainers:
   - "Mauro H. Leggieri"
 dependencies:
   idf:
-    version: '>=5.5.0,<6.0.0'
+    version: '>=5.5.0,<7.0.0'
   espressif/network_provisioning: ^1.2.2
   espressif/cjson: ^1.7.19
   mxmauro/esp-utils:
     git: https://github.com/mxmauro/esp-utils.git
-    version: v0.2.5
+    version: v0.3.0
 files:
   include:
     - "src/captive_portal/web/dist/**/*"

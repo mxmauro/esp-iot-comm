@@ -2,11 +2,14 @@
 #include <iot_comm/crypto/aes.h>
 #include <iot_comm/crypto/hkdf.h>
 #include <iot_comm/crypto/p256.h>
+#include <iot_comm/crypto/sha.h>
 #include <iot_comm/crypto/utils.h>
 #include <esp_log.h>
-#include <mbedtls/ecp.h>
-#include <mbedtls/gcm.h>
 #include <string.h>
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+    #include <psa/crypto.h>
+#endif
 
 // -----------------------------------------------------------------------------
 
@@ -58,9 +61,55 @@ TEST_CASE("hkdfSha256DeriveKey matches RFC5869 test vector", "[crypto]")
     TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, out, sizeof(expected));
 }
 
+TEST_CASE("sha256 helpers hash incrementally", "[crypto]")
+{
+    static const uint8_t expected[SHA256_SIZE] = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+    };
+    Sha256Context_t ctx;
+    uint8_t out[SHA256_SIZE];
+
+    sha256Init(&ctx);
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Start(&ctx));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&ctx, (const uint8_t *)"a", 1));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&ctx, (const uint8_t *)"bc", 2));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Finish(&ctx, out));
+    sha256Done(&ctx);
+
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, out, sizeof(expected));
+}
+
+TEST_CASE("sha512 helpers hash incrementally", "[crypto]")
+{
+    static const uint8_t expected[SHA512_SIZE] = {
+        0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba,
+        0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31,
+        0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9, 0x7e, 0xa2,
+        0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a,
+        0x21, 0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8,
+        0x36, 0xba, 0x3c, 0x23, 0xa3, 0xfe, 0xeb, 0xbd,
+        0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e,
+        0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f
+    };
+    Sha512Context_t ctx;
+    uint8_t out[SHA512_SIZE];
+
+    sha512Init(&ctx);
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Start(&ctx));
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Update(&ctx, (const uint8_t *)"a", 1));
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Update(&ctx, (const uint8_t *)"bc", 2));
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Finish(&ctx, out));
+    sha512Done(&ctx);
+
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, out, sizeof(expected));
+}
+
 TEST_CASE("aesEncrypt and aesDecrypt roundtrip and detect tampering", "[crypto]")
 {
-    mbedtls_gcm_context ctx;
+    AesContext_t ctx;
     uint8_t key[32];
     uint8_t iv[12];
     uint8_t aad[20];
@@ -181,7 +230,7 @@ TEST_CASE("ecdsa verify reports invalid signature after tampering", "[crypto]")
     signature[0] ^= 0x01;
     previousLogLevel = esp_log_level_get("P-256");
     esp_log_level_set("P-256", ESP_LOG_NONE);
-    TEST_ASSERT_EQUAL(MBEDTLS_ERR_ECP_VERIFY_FAILED, ecdsaVerify(&pair, hash, signature));
+    TEST_ASSERT_EQUAL(ESP_ERR_SIGNATURE_VERIFICATION_FAILED, ecdsaVerify(&pair, hash, signature));
     esp_log_level_set("P-256", previousLogLevel);
 
     p256KeyPairDone(&pair);
