@@ -85,7 +85,7 @@ static esp_err_t init()
 #if ESP_IDF_VERSION_MAJOR >= 6
         status = psa_crypto_init();
         if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE) {
-            ESP_LOGE(TAG, "Failed to initialize PSA Crypto. Error: %d", status);
+            ESP_LOGE(TAG, "Failed to initialize PSA Crypto. Error: %d.", status);
             return status;
         }
 #else
@@ -97,7 +97,7 @@ static esp_err_t init()
             err = taskErr;
         }
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to seed the random number generator. Error: %d", err);
+            ESP_LOGE(TAG, "Failed to seed the random number generator. Error: %d.", err);
             return err;
         }
 #endif

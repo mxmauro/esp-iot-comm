@@ -62,7 +62,7 @@ esp_err_t usersInit(UsersConfig_t *config)
     usersDataLen = (1 + config->maxUsersCount) * sizeof(User_t);
     users = (User_t *)malloc(usersDataLen);
     if (!users) {
-        ESP_LOGE(TAG, "Unable to allocate memory for users.");
+        ESP_LOGE(TAG, "Failed to allocate memory for the user table.");
         return ESP_ERR_NO_MEM;
     }
 
@@ -75,7 +75,7 @@ esp_err_t usersInit(UsersConfig_t *config)
         uint8_t tempPublicKey[P256_PUBLIC_KEY_SIZE];
 
         if (err != ESP_ERR_NOT_FOUND) {
-            ESP_LOGE(TAG, "Unable to read users from flash memory. Error: %d.", err);
+            ESP_LOGE(TAG, "Failed to load users from storage. Error: %d.", err);
             usersDeinit();
             return err;
         }
@@ -91,7 +91,7 @@ esp_err_t usersInit(UsersConfig_t *config)
         if (config->rootKey.cb) {
             err = config->rootKey.cb(tempPublicKey, config->rootKey.ctx);
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Unable to create the default administrator user. Error: %d.", err);
+                ESP_LOGE(TAG, "Failed to load the default root user key. Error: %d.", err);
                 usersDeinit();
                 return err;
             }
@@ -132,13 +132,13 @@ uint32_t userCreate(const char *name, size_t nameLen, const uint8_t publicKey[P2
     esp_err_t err;
 
     if (!validateUserName(name, nameLen)) {
-        ESP_LOGE(TAG, "Invalid parameters for create user.");
+        ESP_LOGE(TAG, "Invalid arguments for user creation.");
         return 0;
     }
 
     user = findUserByName(name, nameLen);
     if (user) {
-        ESP_LOGE(TAG, "User already exists.");
+        ESP_LOGE(TAG, "Cannot create user: the user name already exists.");
         return 0;
     }
 
@@ -149,7 +149,7 @@ uint32_t userCreate(const char *name, size_t nameLen, const uint8_t publicKey[P2
         }
     }
     if (!user) {
-        ESP_LOGE(TAG, "Reached the maximum number of users.");
+        ESP_LOGE(TAG, "Cannot create user: the maximum number of users has been reached.");
         return 0;
     }
 
@@ -164,7 +164,7 @@ uint32_t userCreate(const char *name, size_t nameLen, const uint8_t publicKey[P2
     }
 
     // Done
-    ESP_LOGI(TAG, "User '%.*s' successfully created with ID #%u.", (int)nameLen, name, user->id);
+    ESP_LOGI(TAG, "Created user '%.*s' with ID %u.", (int)nameLen, name, user->id);
     return user->id;
 }
 
@@ -176,7 +176,7 @@ esp_err_t userDestroy(uint32_t userId)
 
     user = findUserByID(userId);
     if ((!user) || user == &users[0]) {
-        ESP_LOGE(TAG, "User not found.");
+        ESP_LOGE(TAG, "Cannot delete user: the user was not found or is the root administrator.");
         return ESP_ERR_NOT_FOUND;
     }
     // Make a copy of the original user data for logging and recovery if needed
@@ -194,7 +194,7 @@ esp_err_t userDestroy(uint32_t userId)
     }
 
     // Done
-    ESP_LOGI(TAG, "User '%.*s' with ID #%u was successfully deleted.", (int)getUserNameLength(&oldUser), oldUser.name, oldUser.id);
+    ESP_LOGI(TAG, "Deleted user '%.*s' with ID %u.", (int)getUserNameLength(&oldUser), oldUser.name, oldUser.id);
     memset(&oldUser, 0, sizeof(User_t));
     return ESP_OK;
 }
@@ -216,7 +216,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
 
     user = findUserByID(userId);
     if (!user) {
-        ESP_LOGE(TAG, "User not found.");
+        ESP_LOGE(TAG, "Cannot change credentials: the user was not found.");
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -230,14 +230,14 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
         forceAndReset = true;
     }
     else {
-        ESP_LOGE(TAG, "Only admin users can change other users' credentials.");
+        ESP_LOGE(TAG, "Only the root administrator can change another user's credentials.");
         memset(&origUser, 0, sizeof(User_t));
         return ESP_ERR_INVALID_STATE;
     }
 
     // Try to load the public key to check if valid
     if (!p256ValidatePublicKey(publicKey, P256_PUBLIC_KEY_SIZE)) {
-        ESP_LOGE(TAG, "Invalid public key in user change credentials call.");
+        ESP_LOGE(TAG, "Cannot change credentials: the supplied public key is invalid.");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -247,7 +247,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     // Update credentials
     err = internalChangeUserCredentials(user, publicKey, forceAndReset, forceAndReset);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to change user credentials.");
+        ESP_LOGE(TAG, "Failed to update the user's credentials.");
         memcpy(user, &origUser, sizeof(User_t));
         memset(&origUser, 0, sizeof(User_t));
         return err;
@@ -262,7 +262,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     }
 
     // Done
-    ESP_LOGI(TAG, "Credentials successfully changed.");
+    ESP_LOGI(TAG, "User credentials updated successfully.");
     memset(&origUser, 0, sizeof(User_t));
     return ESP_OK;
 }
@@ -275,7 +275,7 @@ esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE
 
     user = findUserByID(userId);
     if (!user) {
-        ESP_LOGE(TAG, "User not found or credentials mismatch.");
+        ESP_LOGE(TAG, "Cannot verify the signature: the user was not found.");
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -289,11 +289,11 @@ esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE
         // Verify
         err = ecdsaVerify(&keyPair, hash, signature);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Signature verification failed. Error: %d.", err);
+            ESP_LOGE(TAG, "User signature verification failed. Error: %d.", err);
         }
     }
     else {
-        ESP_LOGE(TAG, "Unable to load user credentials. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to load the user's public key. Error: %d.", err);
     }
 
     // Done
@@ -343,7 +343,7 @@ static esp_err_t saveAllUsers()
 
     err = saveUsers(users, (1 + maxUsersCount) * sizeof(User_t), saveUsersCtx);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to save users into storage. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to save users to storage. Error: %d.", err);
     }
     return err;
 }

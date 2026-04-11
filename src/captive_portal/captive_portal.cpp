@@ -101,13 +101,13 @@ esp_err_t capPortalInit(CaptivePortalConfig_t *config)
     p256KeyPairDone(&keyPair);
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize captive portal. Error: %d", err);
+        ESP_LOGE(TAG, "Failed to initialize state. Error: %d.", err);
         capPortalDeinitNoLock();
         return err;
     }
 
     // Done
-    ESP_LOGI(TAG, "Captive portal initialized");
+    ESP_LOGI(TAG, "Initialized.");
     return ESP_OK;
 }
 

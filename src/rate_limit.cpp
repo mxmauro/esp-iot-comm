@@ -39,7 +39,7 @@ esp_err_t rateLimitInit(size_t _maxSlots, uint32_t _windowSizeInMs, uint8_t _max
 
     rateLimits = (RateLimit_t *)malloc(_maxSlots * sizeof(RateLimit_t));
     if (!rateLimits) {
-        ESP_LOGE(TAG, "Unable to allocate memory for rate limits.");
+        ESP_LOGE(TAG, "Failed to allocate memory for the rate-limit table.");
         return ESP_ERR_NO_MEM;
     }
     memset(rateLimits, 0, _maxSlots * sizeof(RateLimit_t));

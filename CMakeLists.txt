@@ -15,6 +15,7 @@ set(srcs "src/challenge.cpp"
          "src/crypto/sha.cpp"
          "src/crypto/utils.cpp"
          "src/http/http_helpers.cpp"
+         "src/ota/ota.cpp"
          "src/provisioning/wifi.cpp"
          "src/utils/binary.cpp"
          "src/utils/network.cpp"
@@ -24,7 +25,7 @@ idf_component_register(SRCS "${srcs}"
                        INCLUDE_DIRS "include"
                        PRIV_INCLUDE_DIRS "private_include"
                        REQUIRES mbedtls esp_http_server
-                       PRIV_REQUIRES esp_netif esp_event esp_wifi nvs_flash
+                       PRIV_REQUIRES esp_netif esp_event esp_wifi nvs_flash app_update
                        EMBED_FILES "src/captive_portal/web/dist/index.html"
                                    "src/captive_portal/web/dist/assets/app.js"
                                    "src/captive_portal/web/dist/assets/app.css")

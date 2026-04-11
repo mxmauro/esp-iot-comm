@@ -100,7 +100,7 @@ esp_err_t wifiMgrInit(WifiMgrConfig_t *config)
         }
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to initialize NVS. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to initialize NVS. Error: %d.", err);
         wifiMgrDeinitNoLock();
         return err;
     }
@@ -111,7 +111,7 @@ esp_err_t wifiMgrInit(WifiMgrConfig_t *config)
         return err;
     }
 
-    ESP_LOGI(TAG, "Wi-Fi manager sucessfully initialized.");
+    ESP_LOGI(TAG, "Manager initialized successfully.");
     return ESP_OK;
 }
 
@@ -150,7 +150,7 @@ bool wifiMgrDeleteConfig()
 
     err = esp_wifi_restore();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to delete Wi-Fi configuration. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to erase the stored configuration. Error: %d.", err);
         return false;
     }
 
@@ -189,8 +189,8 @@ esp_err_t wifiMgrStoreSTA(const char *ssid, const char *password)
     staConfig.sta.pmf_cfg.capable = true;
     staConfig.sta.pmf_cfg.required = false;
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "Failed to select Wi-Fi flash storage");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &staConfig), TAG, "Failed to configure Wi-Fi STA");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "Failed to select flash storage");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &staConfig), TAG, "Failed to configure STA mode");
 
     // Done
     provisioned = true;
@@ -220,11 +220,11 @@ esp_err_t wifiMgrStartSTA()
         timerArgs.callback = &staTransitionTimerCallback;
         timerArgs.dispatch_method = ESP_TIMER_TASK;
         timerArgs.name = "iotcomm-wifi_sta_sw";
-        ESP_RETURN_ON_ERROR(esp_timer_create(&timerArgs, &staTransitionTimer), TAG, "Failed to create STA transition timer");
+        ESP_RETURN_ON_ERROR(esp_timer_create(&timerArgs, &staTransitionTimer), TAG, "Failed to create the STA transition timer");
     }
 
     staTransitionPending = true;
-    ESP_RETURN_ON_ERROR(esp_timer_start_once(staTransitionTimer, STA_TRANSITION_DELAY_US), TAG, "Failed to start STA transition timer");
+    ESP_RETURN_ON_ERROR(esp_timer_start_once(staTransitionTimer, STA_TRANSITION_DELAY_US), TAG, "Failed to start the STA transition timer");
 
     // Done
     return ESP_OK;
@@ -290,47 +290,47 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
     esp_err_t err;
 
     // Initialize network interface engine
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "Failed to initialize TCP/IP stack");
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "Failed to initialize the TCP/IP stack");
 
     // Create default event loop if not done yet
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Failed to create default event loop. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to create the default event loop. Error: %d.", err);
         return err;
     }
 
     // Create default interfaces
     defNetIfWifiSta = esp_netif_create_default_wifi_sta();
-    ESP_RETURN_ON_FALSE(defNetIfWifiSta, ESP_FAIL, TAG, "Failed to create Wi-Fi STA interface");
+    ESP_RETURN_ON_FALSE(defNetIfWifiSta, ESP_FAIL, TAG, "Failed to create the default STA interface");
 
     defNetIfWifiAp = esp_netif_create_default_wifi_ap();
-    ESP_RETURN_ON_FALSE(defNetIfWifiAp, ESP_FAIL, TAG, "Failed to create Wi-Fi AP interface");
-    ESP_RETURN_ON_ERROR(setCustomAddressInAP(defNetIfWifiAp), TAG, "Failed to set up a custom IP for the AP interface");
+    ESP_RETURN_ON_FALSE(defNetIfWifiAp, ESP_FAIL, TAG, "Failed to create the default AP interface");
+    ESP_RETURN_ON_ERROR(setCustomAddressInAP(defNetIfWifiAp), TAG, "Failed to configure a custom IP address for the AP interface");
 
     // Register event handlers
     ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &onEvent, nullptr), TAG,
-                        "Failed to register Wi-Fi event handler");
+                        "Failed to register the event handler");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &onEvent, nullptr), TAG,
-                        "Failed to register IPv4 event handler");
+                        "Failed to register the IPv4 event handler");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_GOT_IP6, &onEvent, nullptr), TAG,
-                        "Failed to register IPv6 event handler");
+                        "Failed to register the IPv6 event handler");
 
     // Initialize Wi-Fi engine
     cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "Failed to initialize Wi-Fi");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "Failed to select Wi-Fi flash storage");
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "Failed to initialize the driver");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "Failed to select flash storage");
 
     // Get stored configuration
     memset(&staConfig, 0, sizeof(staConfig));
     provisioned = false;
-    ESP_RETURN_ON_ERROR(esp_wifi_get_config(WIFI_IF_STA, &staConfig), TAG, "Unable to read stored Wi-Fi STA configuration");
+    ESP_RETURN_ON_ERROR(esp_wifi_get_config(WIFI_IF_STA, &staConfig), TAG, "Failed to read the stored STA configuration");
     provisioned = staConfig.sta.ssid[0] != 0;
 
     // If provisioned, start STA mode
     if (provisioned) {
-        ESP_LOGI(TAG, "Stored Wi-Fi credentials found. Starting STA mode.");
-        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Failed to set Wi-Fi mode");
-        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Unable to start Wi-Fi");
+        ESP_LOGI(TAG, "Stored credentials were found; starting STA mode.");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Failed to set STA mode");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start the interface");
     }
     else {
         wifi_config_t apConfig;
@@ -338,7 +338,7 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
         httpd_uri_t catchAllHandler;
         esp_err_t ret;
 
-        ESP_LOGI(TAG, "No stored Wi-Fi credentials found. Starting provisioning SoftAP.");
+        ESP_LOGI(TAG, "No stored credentials were found; starting the provisioning SoftAP.");
 
         // Setup AP configuration
         memset(&apConfig, 0, sizeof(apConfig));
@@ -355,13 +355,13 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
         apConfig.ap.beacon_interval = 100;
 
         // Start Wi-Fi in AP mode
-        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "Failed to set Wi-Fi mode");
-        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &apConfig), TAG, "Failed to set Wi-Fi AP configuration");
-        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Unable to start Wi-Fi");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "Failed to set AP+STA mode");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &apConfig), TAG, "Failed to configure AP mode");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start the interface");
 
         // Setup DNS and DHCP for captive portal
-        ESP_RETURN_ON_ERROR(captivePortalSetupDhcpUrl(), TAG, "Unable to setup DCHP capture portal uri");
-        ESP_RETURN_ON_ERROR(captivePortalSetupDns(), TAG, "Unable to setup catch-all DNS");
+        ESP_RETURN_ON_ERROR(captivePortalSetupDhcpUrl(), TAG, "Failed to configure the DHCP captive portal URI");
+        ESP_RETURN_ON_ERROR(captivePortalSetupDns(), TAG, "Failed to configure catch-all DNS");
 
         // Call the custom captive portal initialization callback
         if (config->softAP.captivePortal.init) {
@@ -379,13 +379,13 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
         // Initialize the HTTP server
         serverConfig = HTTPD_DEFAULT_CONFIG();
         serverConfig.uri_match_fn = httpd_uri_match_wildcard;
-        ESP_GOTO_ON_ERROR(httpd_start(&cpHttpServer, &serverConfig), after_http, TAG, "Unable to start http server");
+        ESP_GOTO_ON_ERROR(httpd_start(&cpHttpServer, &serverConfig), after_http, TAG, "Failed to start the HTTP server");
 
         memset(&catchAllHandler, 0, sizeof(catchAllHandler));
         catchAllHandler.uri = "/*";
         catchAllHandler.method = (httpd_method_t)HTTP_ANY;
         catchAllHandler.handler = captivePortalCatchAllHandler;
-        ESP_GOTO_ON_ERROR(httpd_register_uri_handler(cpHttpServer, &catchAllHandler), after_http, TAG, "Unable to register http handler");
+        ESP_GOTO_ON_ERROR(httpd_register_uri_handler(cpHttpServer, &catchAllHandler), after_http, TAG, "Failed to register the HTTP handler");
 
         ret = ESP_OK;
 after_http:
@@ -395,7 +395,7 @@ after_http:
         }
     }
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "Failed to disable Wi-Fi power saving");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "Failed to disable power saving");
 
     // Done
     return ESP_OK;
@@ -416,7 +416,7 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
                 break;
 
             case WIFI_EVENT_STA_DISCONNECTED:
-                ESP_LOGI(TAG, "Wi-Fi disconnected. Trying to re-connect to the AP...");
+                ESP_LOGI(TAG, "Disconnected; reconnecting to the configured access point.");
 
                 {
                     AutoRundownProtection rpLock(rp);
@@ -429,11 +429,11 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
                 break;
 
             case WIFI_EVENT_AP_START:
-                ESP_LOGI(TAG, "Wi-Fi Access point started.");
+                ESP_LOGI(TAG, "Access point started.");
                 break;
 
             case WIFI_EVENT_AP_STOP:
-                ESP_LOGI(TAG, "Wi-Fi Access point stopped.");
+                ESP_LOGI(TAG, "Access point stopped.");
                 break;
         }
     }
@@ -444,7 +444,7 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
                     AutoRundownProtection rpLock(rp);
                     ip_event_got_ip_t *event = (ip_event_got_ip_t *)eventData;
 
-                    ESP_LOGI(TAG, "Wi-Fi connected. IPv4 address: " IPSTR, IP2STR(&event->ip_info.ip));
+                    ESP_LOGI(TAG, "Connected; acquired IPv4 address " IPSTR ".", IP2STR(&event->ip_info.ip));
                     if (rpLock.acquired()) {
                         setConnectedStateAndCallCallback(true);
                     }
@@ -456,7 +456,7 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
                     AutoRundownProtection rpLock(rp);
                     ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)eventData;
 
-                    ESP_LOGI(TAG, "Wi-Fi connected. IPv6 address: " IPV6STR, IPV62STR(event->ip6_info.ip));
+                    ESP_LOGI(TAG, "Connected; acquired IPv6 address " IPV6STR ".", IPV62STR(event->ip6_info.ip));
                     if (rpLock.acquired()) {
                         setConnectedStateAndCallCallback(true);
                     }
@@ -495,25 +495,25 @@ static void performStaModeTransition()
 
     staTransitionPending = false;
 
-    ESP_LOGI(TAG, "Switching Wi-Fi from provisioning SoftAP to STA mode.");
+    ESP_LOGI(TAG, "Switching from provisioning SoftAP mode to STA mode.");
 
     stopCaptivePortal();
 
     err = esp_wifi_stop();
     if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
-        ESP_LOGE(TAG, "Unable to stop Wi-Fi before STA switch. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to stop the interface before switching to STA mode. Error: %d.", err);
         return;
     }
 
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to switch Wi-Fi to STA mode. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to switch to STA mode. Error: %d.", err);
         return;
     }
 
     err = esp_wifi_start();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to start Wi-Fi in STA mode. Error: %d.", err);
+        ESP_LOGE(TAG, "Failed to start STA mode. Error: %d.", err);
     }
 }
 
@@ -617,7 +617,7 @@ static esp_err_t captivePortalSetupDns()
 
     cpDnsSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (cpDnsSocket < 0) {
-        ESP_LOGE(TAG, "Cannot create captive portal DNS socket");
+        ESP_LOGE(TAG, "Failed to create the DNS socket.");
         return ESP_FAIL;
     }
 
@@ -626,7 +626,7 @@ static esp_err_t captivePortalSetupDns()
     addr.sin_port = htons(53);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(cpDnsSocket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        ESP_LOGE(TAG, "Cannot bind DNS socket");
+        ESP_LOGE(TAG, "Failed to bind the DNS socket.");
         close(cpDnsSocket);
         cpDnsSocket = -1;
         return ESP_FAIL;
@@ -634,7 +634,7 @@ static esp_err_t captivePortalSetupDns()
 
     err = taskCreate(&cpDnsTask, cpDnsServerTask, "cp_dns_server", 4096, nullptr, 4, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to start DNS server");
+        ESP_LOGE(TAG, "Failed to start the DNS server.");
         close(cpDnsSocket);
         cpDnsSocket = -1;
         return err;

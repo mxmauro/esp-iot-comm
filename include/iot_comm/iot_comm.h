@@ -24,6 +24,10 @@
 #define IOTCOMM_DEFAULT_MAX_CHALLENGES_SLOTS                10
 #define IOTCOMM_DEFAULT_CHALLENGE_WINDOW_TIME_MS            60000
 
+// The following commands are handled by the IoT-Comm engine.
+//
+// NOTE: Command in the 0x7F00-0x7FFF range are reserved for current and future use.
+//
 // CMD_CREATE_USER (0x7FF1)
 //           name: NUL-terminated string
 //     public key: raw 65-byte uncompressed ECDSA public key
@@ -38,9 +42,14 @@
 // CMD_CHANGE_USER_CREDENTIALS (0x7FF4)
 //     new public key: raw 65-byte uncompressed ECDSA public key
 //
-// CMD_SET_HOSTNAME (0x7FF5)
-//     key id: 1-byte value of id.
-//        key: 16-byte pre-shared key blob.
+// CMD_OTA_BEGIN (0x7FF5)
+//     image size: 4-byte big-endian image size in bytes
+//
+// CMD_OTA_WRITE (0x7FF6)
+//     chunk: remaining packet payload bytes
+//
+// CMD_OTA_CANCEL (0x7FF7)
+//     no payload
 //
 
 // Websocket close codes
@@ -187,7 +196,7 @@ IPAddress_t iotCommGetSessionIpAddress(IotCommSessionHandle_t h);
 // NOTE: Event replies are synchronous to the event callback. Do not retain event data
 //       or defer completion to another task/core after the callback returns.
 // Sends a successful reply for the current event callback.
-esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t * reply, size_t replyLen);
+esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t *reply, size_t replyLen);
 // Sends an error reply for the current event callback.
 esp_err_t iotCommEventReplyWithError(IotCommSessionHandle_t h, uint32_t code, const char *message);
 

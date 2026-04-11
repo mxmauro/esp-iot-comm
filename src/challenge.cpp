@@ -30,7 +30,7 @@ esp_err_t challengesInit(size_t _maxChallengesCount, uint32_t _windowSizeInMs)
 
     challenges = (SuperChallenge_t *)malloc(_maxChallengesCount * sizeof(SuperChallenge_t));
     if (!challenges) {
-        ESP_LOGE(TAG, "Unable to allocate memory for challenges.");
+        ESP_LOGE(TAG, "Failed to allocate memory for the challenge table.");
         return ESP_ERR_NO_MEM;
     }
     memset(challenges, 0, _maxChallengesCount * sizeof(SuperChallenge_t));

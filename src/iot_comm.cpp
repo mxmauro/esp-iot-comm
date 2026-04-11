@@ -1,6 +1,7 @@
 #include "iot_comm/iot_comm.h"
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hkdf.h"
+#include "iot_comm/ota/ota.h"
 #include "iot_comm/crypto/sha.h"
 #include "iot_comm/crypto/utils.h"
 #include "iot_comm/utils/binary.h"
@@ -15,12 +16,16 @@
 #include <esp_check.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <growable_buffer.h>
 #include <mutex.h>
 #include <rundown_protection.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <sys/_types.h>
+#include <task.h>
 
 static const char* TAG = "IotComm";
 
@@ -36,6 +41,11 @@ static const char* TAG = "IotComm";
 #define CMD_DELETE_USER             0x7FF2
 #define CMD_RESET_USER_CREDENTIALS  0x7FF3
 #define CMD_CHANGE_USER_CREDENTIALS 0x7FF4
+#define CMD_OTA_BEGIN               0x7FF5
+#define CMD_OTA_WRITE               0x7FF6
+#define CMD_OTA_CANCEL              0x7FF7
+
+#define SESSION_FLAG_OTA_UPDATE     0x00000001UL
 
 #define SESSION_IV_LEN     12
 #define SESSION_AES_KEY_LEN    32
@@ -84,6 +94,7 @@ typedef struct SessionInfo_s {
     uint8_t mustChangeCredentials : 1;
     uint8_t credentialsChangeAttempts : 2;
     uint8_t isClosed : 1;
+    uint32_t flags;
     IncomingBufferType_t incomingMessageType;
     GrowableBuffer_t plaintextIn;
     GrowableBuffer_t ciphertextIn;
@@ -132,6 +143,7 @@ static IotCommEventHandler_t handler = nullptr;
 static void *handlerCtx = nullptr;
 static httpd_handle_t server = nullptr;
 static _Atomic(uint32_t) nextSessionId = {0};
+static Task_t otaRestartTask = TASK_INIT_STATIC;
 
 // -----------------------------------------------------------------------------
 
@@ -148,6 +160,9 @@ static esp_err_t handleCreateUser(CommandContext_t *commandCtx);
 static esp_err_t handleDeleteUser(CommandContext_t *commandCtx);
 static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx);
 static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx);
+static esp_err_t handleOtaBegin(CommandContext_t *commandCtx);
+static esp_err_t handleOtaWrite(CommandContext_t *commandCtx);
+static esp_err_t handleOtaCancel(CommandContext_t *commandCtx);
 static esp_err_t handleCustomCommand(CommandContext_t *commandCtx);
 
 static bool handleSessionStart(SessionInfo_t *session, httpd_req_t *req, esp_err_t *closeErr);
@@ -170,6 +185,7 @@ static void destroySession(SessionInfo_t *session);
 static esp_err_t readWsPacket(ServerContext_t *serverCtx, SessionInfo_t *session, httpd_req_t *req, bool *messageComplete);
 
 static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason);
+static void otaRestartTaskMain(Task_t *task, void *arg);
 
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl);
 
@@ -199,7 +215,7 @@ esp_err_t iotCommInit(IotCommConfig_t *config)
     usersConfig.storage.load = config->storage.load;
     usersConfig.storage.save = config->storage.save;
     usersConfig.storage.ctx = config->storage.ctx;
-    ESP_GOTO_ON_ERROR(usersInit(&usersConfig), on_error, TAG, "Unable to initialize users manager");
+    ESP_GOTO_ON_ERROR(usersInit(&usersConfig), on_error, TAG, "Failed to initialize the user manager");
 
     // The authentication flow is INIT+AUTH+WS so let's multiply the provided request limit by three.
     maxRequestsPerWindow = config->rateLimit.maxRequestsPerWindow;
@@ -211,17 +227,17 @@ esp_err_t iotCommInit(IotCommConfig_t *config)
     }
     ESP_GOTO_ON_ERROR(rateLimitInit(config->rateLimit.maxSlots, config->rateLimit.windowSizeInMs, maxRequestsPerWindow,
                                     config->rateLimit.maxConsecutiveAuthFailures),
-                      on_error, TAG, "Unable to initialize rate limit handler");
+                      on_error, TAG, "Failed to initialize the rate-limit handler");
 
     ESP_GOTO_ON_ERROR(challengesInit(config->challenge.maxSlots, config->challenge.windowSizeInMs), on_error, TAG,
-                      "Unable to initialize challenges manager");
+                      "Failed to initialize the challenge manager");
 
     // Save event handler
     handler = config->handler;
     handlerCtx = config->handlerCtx;
 
     // Done
-    ESP_LOGI(TAG, "IotComm engine initialized");
+    ESP_LOGI(TAG, "Initialized.");
     return ESP_OK;
 
 on_error:
@@ -325,11 +341,11 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t *config)
     }
 
     // Done
-    ESP_LOGI(TAG, "Server initialized and listening at %u", config->listenPort);
+    ESP_LOGI(TAG, "Server initialized and listening on port %u.", config->listenPort);
     return ESP_OK;
 
 on_error:
-    ESP_LOGE(TAG, "Unable to start http server. Error: %d.", err);
+    ESP_LOGE(TAG, "Failed to start the HTTP server. Error: %d.", err);
     iotCommStopServerNoLock();
     return err;
 }
@@ -466,7 +482,7 @@ IPAddress_t iotCommGetSessionIpAddress(IotCommSessionHandle_t h)
     return addr;
 }
 
-esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t * reply, size_t replyLen)
+esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t *reply, size_t replyLen)
 {
     AutoRundownProtection rpLock(rp);
 
@@ -649,7 +665,7 @@ static esp_err_t serveWsInit(httpd_req_t *req)
 
     // Get request IP address
     if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
-        ESP_LOGE(TAG, "Failed to get client IP address");
+        ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
         goto done;
     }
@@ -802,7 +818,7 @@ static esp_err_t serveWsAuth(httpd_req_t *req)
 
     // Get request IP address
     if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
-        ESP_LOGE(TAG, "Failed to get client IP address");
+        ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
         goto done;
     }
@@ -1041,7 +1057,7 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
 
     // Get request IP address
     if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
-        ESP_LOGE(TAG, "Failed to get client IP address");
+        ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
         goto done;
     }
@@ -1260,7 +1276,7 @@ error_destroy_session_and_done:
         }
 
         if (otherSession->userId == session->userId) {
-            ESP_LOGD(TAG, "Closing old session %u for user %u", otherSession->id, otherSession->userId);
+            ESP_LOGD(TAG, "Closing existing session %u for user %u.", otherSession->id, otherSession->userId);
             otherSession->isClosed = true;
             closeWs(req->handle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "New connection detected");
         }
@@ -1311,7 +1327,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     commandCtx.sockfd = httpd_req_to_sockfd(req);
     commandCtx.session = (SessionInfo_t *)httpd_sess_get_ctx(commandCtx.serverHandle, commandCtx.sockfd);
     if (!commandCtx.session) {
-        ESP_LOGD(TAG, "Session not found.");
+        ESP_LOGD(TAG, "WebSocket session context was not found.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_APP_SESSION_NOT_FOUND, nullptr);
     }
 
@@ -1324,10 +1340,10 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     err = readWsPacket(commandCtx.serverCtx, commandCtx.session, req, &messageComplete);
     if (err != ESP_OK) {
         if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_SIZE || err == ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGD(TAG, "Invalid or unexpected WebSocket packet. Error: %ld.", err);
+            ESP_LOGD(TAG, "Received an invalid or unexpected WebSocket packet. Error: %d.", err);
         }
         else {
-            ESP_LOGD(TAG, "Unable to read WebSocket packet. Error: %ld.", err);
+            ESP_LOGD(TAG, "Failed to read the WebSocket packet. Error: %d.", err);
         }
         return closeWsWithCmdCtxAndError(&commandCtx, "read", err);
     }
@@ -1338,25 +1354,25 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
 
     // We only accept binary messages
     if (commandCtx.session->incomingMessageType != IncomingBufferTypeBinary) {
-        ESP_LOGD(TAG, "Non binary packet.");
+        ESP_LOGD(TAG, "Received a non-binary WebSocket packet.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_UNSUPPORTED_DATA, nullptr);
     }
 
     // Check message size (the payload must be, at least, 1 byte plus the TAG)
     if (commandCtx.session->ciphertextIn.used <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
-        ESP_LOGD(TAG, "Short packet.");
+        ESP_LOGD(TAG, "Received a WebSocket packet that is too short.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Extract header and validate version and RX counter (a.k.a. nonce)
     hdr = (WebSocketPacketHeader_t *)commandCtx.session->ciphertextIn.buffer;
     if (hdr->v != VERSION) {
-        ESP_LOGD(TAG, "Unsupported version packet.");
+        ESP_LOGD(TAG, "Received a WebSocket packet with an unsupported protocol version.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     commandCtx.rxCounter = be32dec(hdr->counter);
     if (commandCtx.session->nextRxCounter != commandCtx.rxCounter) {
-        ESP_LOGD(TAG, "Counter mismatch.");
+        ESP_LOGD(TAG, "Received a WebSocket packet with an unexpected counter value.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     commandCtx.session->nextRxCounter += 1;
@@ -1379,7 +1395,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     err = aesDecrypt(&commandCtx.session->clientAesCtx, commandCtx.session->ciphertextIn.buffer + sizeof(WebSocketPacketHeader_t),
                      dataAndTagLen, iv, sizeof(iv), nullptr, 0, commandCtx.session->plaintextIn.buffer);
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Unable to decrypt message. Error: %ld.", err);
+        ESP_LOGD(TAG, "Failed to decrypt the WebSocket payload. Error: %d.", err);
         if (err == MBEDTLS_ERR_GCM_AUTH_FAILED) {
             return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
         }
@@ -1392,7 +1408,7 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
 
     // Check if the only accepted command is to change the credentials
     if (commandCtx.session->mustChangeCredentials != 0 && commandCtx.cmd != CMD_CHANGE_USER_CREDENTIALS) {
-        ESP_LOGD(TAG, "User must change the access credentials.");
+        ESP_LOGD(TAG, "The user must change their credentials before issuing other commands.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
     }
 
@@ -1409,6 +1425,15 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
 
         case CMD_CHANGE_USER_CREDENTIALS:
             return handleChangeUserCredentials(&commandCtx);
+
+        case CMD_OTA_BEGIN:
+            return handleOtaBegin(&commandCtx);
+
+        case CMD_OTA_WRITE:
+            return handleOtaWrite(&commandCtx);
+
+        case CMD_OTA_CANCEL:
+            return handleOtaCancel(&commandCtx);
     }
 
     // Custom command received
@@ -1423,31 +1448,31 @@ static esp_err_t handleCreateUser(CommandContext_t *commandCtx)
     uint8_t publicKeyBuf[P256_PUBLIC_KEY_SIZE];
 
     if (commandCtx->session->isAdmin == 0) {
-        ESP_LOGD(TAG, "CREATE USER command: Insufficient privileges.");
+        ESP_LOGD(TAG, "CREATE USER command: insufficient privileges.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
     }
 
     // Get user name
     if ((!br_read_str(&commandCtx->br, &name, &nameLen)) || nameLen == 0) {
-        ESP_LOGD(TAG, "CREATE USER command: Invalid packet.");
+        ESP_LOGD(TAG, "CREATE USER command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Get the new public key
     if (!br_read_blob(&commandCtx->br, P256_PUBLIC_KEY_SIZE, &publicKey)) {
-        ESP_LOGD(TAG, "CREATE USER command: Invalid packet.");
+        ESP_LOGD(TAG, "CREATE USER command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
 
     // Check if the user already exists
     if (userCreate(name, nameLen, publicKeyBuf) == 0) {
-        ESP_LOGD(TAG, "CREATE USER command: Unable to create new user.");
+        ESP_LOGD(TAG, "CREATE USER command: failed to create the user.");
         return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to create new user", commandCtx->rxCounter, true);
     }
 
     // Done
-    ESP_LOGD(TAG, "CREATE USER command: User successfully created.");
+    ESP_LOGD(TAG, "CREATE USER command: user created successfully.");
     return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
@@ -1459,26 +1484,26 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
     bool isAdmin = false;
 
     if (commandCtx->session->isAdmin == 0) {
-        ESP_LOGD(TAG, "DELETE USER command: Insufficient privileges.");
+        ESP_LOGD(TAG, "DELETE USER command: insufficient privileges.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
     }
 
     // Get user name
     if ((!br_read_str(&commandCtx->br, &name, &nameLen)) || nameLen == 0) {
-        ESP_LOGD(TAG, "DELETE USER command: Invalid packet.");
+        ESP_LOGD(TAG, "DELETE USER command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Find the user
     targetUserId = userGetID(name, nameLen);
     if (targetUserId == 0 || userIsAdmin(targetUserId, &isAdmin) != ESP_OK) {
-        ESP_LOGD(TAG, "DELETE USER command: User not found.");
+        ESP_LOGD(TAG, "DELETE USER command: user not found.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter, true);
     }
 
     // Check if the user is admin
     if (isAdmin) {
-        ESP_LOGD(TAG, "DELETE USER command: Cannot delete administrator.");
+        ESP_LOGD(TAG, "DELETE USER command: cannot delete an administrator.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot delete admin user", commandCtx->rxCounter, true);
     }
 
@@ -1494,7 +1519,7 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
         }
 
         if (otherSession->userId == targetUserId) {
-            ESP_LOGD(TAG, "Closing session %u for deleted user %u", otherSession->id, otherSession->userId);
+            ESP_LOGD(TAG, "Closing session %u for deleted user %u.", otherSession->id, otherSession->userId);
             otherSession->isClosed = true;
             closeWs(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User has been deleted");
         }
@@ -1502,7 +1527,7 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
     rwMutexUnlockRead(&commandCtx->serverCtx->sessions.mtx);
 
     // Done
-    ESP_LOGD(TAG, "DELETE USER command: User successfully deleted.");
+    ESP_LOGD(TAG, "DELETE USER command: user deleted successfully.");
     return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
@@ -1516,19 +1541,19 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
     uint8_t publicKeyBuf[P256_PUBLIC_KEY_SIZE];
 
     if (commandCtx->session->isAdmin == 0) {
-        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Insufficient privileges.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: insufficient privileges.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
     }
 
     // Get user name
     if ((!br_read_str(&commandCtx->br, &name, &nameLen)) || nameLen == 0) {
-        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Invalid packet.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Get the new public key
     if (!br_read_blob(&commandCtx->br, P256_PUBLIC_KEY_SIZE, &publicKey)) {
-        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Invalid packet.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
@@ -1536,25 +1561,25 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
     // Find the user
     targetUserId = userGetID(name, nameLen);
     if (targetUserId == 0) {
-        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: User not found.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: user not found.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter, true);
     }
 
     // Check if the user is the same than us
     if (commandCtx->session->userId == targetUserId) {
-        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Cannot reset own credentials.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: cannot reset the current user's credentials.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset own credentials", commandCtx->rxCounter, true);
     }
 
     // Check if the target user is an admin
     if (userIsAdmin(targetUserId, &targetIsAdmin) != ESP_OK || targetIsAdmin) {
-        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: Cannot reset user credentials.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: the target user's credentials cannot be reset.");
         return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset user credentials", commandCtx->rxCounter, true);
     }
 
     // Change the user public key
     if (userChangeCredentials(targetUserId, commandCtx->session->userId, publicKeyBuf) != ESP_OK) {
-        ESP_LOGD(TAG, "RESET USER PASSWORD command: Unable to reset user credentials.");
+        ESP_LOGD(TAG, "RESET USER CREDENTIALS command: failed to reset the user's credentials.");
         return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to reset user credentials", commandCtx->rxCounter, true);
     }
 
@@ -1567,7 +1592,7 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
         }
 
         if (otherSession->userId == targetUserId) {
-            ESP_LOGD(TAG, "Closing session %u for deleted user %u", otherSession->id, otherSession->userId);
+            ESP_LOGD(TAG, "Closing session %u for user %u after a credential reset.", otherSession->id, otherSession->userId);
             otherSession->isClosed = true;
             closeWs(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User credentials has been reset");
         }
@@ -1575,7 +1600,7 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
     rwMutexUnlockRead(&commandCtx->serverCtx->sessions.mtx);
 
     // Done
-    ESP_LOGD(TAG, "RESET USER PASSWORD command: User password successfully changed.");
+    ESP_LOGD(TAG, "RESET USER CREDENTIALS command: credentials reset successfully.");
     return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
@@ -1591,13 +1616,13 @@ static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
 
     // Get the signature validation for the old key
     if (!br_read_blob(&commandCtx->br, P256_SIGNATURE_SIZE, &signature)) {
-        ESP_LOGD(TAG, "CHANGE PASSWORD command: Invalid packet.");
+        ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Get the new public key
     if (!br_read_blob(&commandCtx->br, P256_PUBLIC_KEY_SIZE, &publicKey)) {
-        ESP_LOGD(TAG, "CHANGE PASSWORD command: Invalid packet.");
+        ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: invalid payload.");
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     memcpy(publicKeyBuf, publicKey, P256_PUBLIC_KEY_SIZE);
@@ -1620,7 +1645,7 @@ static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
     sha256Done(&sha256Ctx);
     if (err != ESP_OK) {
 error_validation_failed:
-        ESP_LOGD(TAG, "CHANGE PASSWORD command: Validation failed.");
+        ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: credential validation failed.");
         if (commandCtx->session->credentialsChangeAttempts < 2) {
             commandCtx->session->credentialsChangeAttempts += 1;
             return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Validation failed", commandCtx->rxCounter, true);
@@ -1639,14 +1664,103 @@ error_validation_failed:
 
     // Change the user public key
     if (userChangeCredentials(commandCtx->session->userId, commandCtx->session->userId, publicKeyBuf) != ESP_OK) {
-        ESP_LOGD(TAG, "CHANGE PASSWORD command: Unable to change user credentials.");
+        ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: failed to update the user's credentials.");
         return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to change user credentials", commandCtx->rxCounter, true);
     }
 
     commandCtx->session->mustChangeCredentials = 0;
 
     // Done
-    ESP_LOGD(TAG, "CHANGE PASSWORD command: Credentials successfully changed.");
+    ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: credentials updated successfully.");
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+}
+
+static esp_err_t handleOtaBegin(CommandContext_t *commandCtx)
+{
+    uint32_t imageSize;
+    esp_err_t err;
+
+    if (commandCtx->session->isAdmin == 0) {
+        ESP_LOGD(TAG, "OTA BEGIN command: insufficient privileges.");
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
+    }
+    if (commandCtx->session->flags & SESSION_FLAG_OTA_UPDATE) {
+        ESP_LOGD(TAG, "OTA BEGIN command: an update is already active for this session.");
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "Update already active", commandCtx->rxCounter, true);
+    }
+
+    // Get the image size
+    if ((!br_read_be32(&commandCtx->br, &imageSize)) || commandCtx->br.len != 0 || imageSize == 0) {
+        ESP_LOGD(TAG, "OTA BEGIN command: invalid payload.");
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
+    }
+
+    // Begin OTA update
+    err = otaBegin(imageSize);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "OTA BEGIN command: failed to start the update.");
+        return buildAndSendErrorReply(commandCtx, err, "Failed to start update", commandCtx->rxCounter, true);
+    }
+
+    // Done
+    commandCtx->session->flags |= SESSION_FLAG_OTA_UPDATE;
+    ESP_LOGD(TAG, "OTA BEGIN command: update started successfully.");
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+}
+
+static esp_err_t handleOtaWrite(CommandContext_t *commandCtx)
+{
+    bool completed;
+    esp_err_t err, restartErr;
+
+    if (!(commandCtx->session->flags & SESSION_FLAG_OTA_UPDATE)) {
+        ESP_LOGD(TAG, "OTA WRITE command: no update is active for this session.");
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "No update active", commandCtx->rxCounter, true);
+    }
+
+    // Get the chunk size
+    if (commandCtx->br.len == 0) {
+        ESP_LOGD(TAG, "OTA WRITE command: invalid payload.");
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
+    }
+
+    // Write chunk
+    err = otaWrite(commandCtx->br.ptr, commandCtx->br.len, &completed);
+    if (completed || err != ESP_OK) {
+        commandCtx->session->flags &= ~SESSION_FLAG_OTA_UPDATE;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "OTA WRITE command: failed to write the image data.");
+        return buildAndSendErrorReply(commandCtx, err, "Failed to write image data", commandCtx->rxCounter, true);
+    }
+
+    // Done
+    ESP_LOGD(TAG, "OTA WRITE command: update completed successfully; rebooting in 5 seconds...");
+    err = buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    restartErr = taskCreate(&otaRestartTask, otaRestartTaskMain, "iotcomm-restart", 2048, nullptr, 5, tskNO_AFFINITY);
+    if (restartErr != ESP_OK) {
+        esp_restart();
+    }
+    return err;
+}
+
+static esp_err_t handleOtaCancel(CommandContext_t *commandCtx)
+{
+    if (commandCtx->br.len != 0) {
+        ESP_LOGD(TAG, "OTA CANCEL command: invalid payload.");
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
+    }
+    if (!(commandCtx->session->flags & SESSION_FLAG_OTA_UPDATE)) {
+        ESP_LOGD(TAG, "OTA CANCEL command: no update is active for this session.");
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "No update active", commandCtx->rxCounter, true);
+    }
+
+    // Cancel current update operation
+    otaCancel();
+    commandCtx->session->flags &= ~SESSION_FLAG_OTA_UPDATE;
+
+    // Done
+    ESP_LOGD(TAG, "OTA CANCEL command: update canceled.");
     return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
@@ -1717,6 +1831,11 @@ static void handleSessionEnd(SessionInfo_t *session)
     IotCommEvent_t event;
     OnTheFlyEvent_t otfe;
 
+    if (session->flags & SESSION_FLAG_OTA_UPDATE) {
+        otaCancel();
+        session->flags &= ~SESSION_FLAG_OTA_UPDATE;
+    }
+
     // Setup on-the-fly event
     memset(&otfe, 0, sizeof(otfe));
     otfe.session = session;
@@ -1778,7 +1897,7 @@ on_error:
     err = aesEncrypt(&commandCtx->session->serverAesCtx, plaintextOut, plaintextOutLen, iv, SESSION_IV_LEN,
                      nullptr, 0, ciphertextOut->buffer + sizeof(WebSocketPacketHeader_t));
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Unable to encrypt message. Error: %ld.", err);
+        ESP_LOGD(TAG, "Failed to encrypt the WebSocket payload. Error: %d.", err);
         goto on_error;
     }
 
@@ -1806,7 +1925,7 @@ on_error:
 
         err = httpd_ws_send_frame_async(commandCtx->serverHandle, commandCtx->sockfd, &frame);
         if (err != ESP_OK) {
-            ESP_LOGD(TAG, "Unable to deliver message. Error: %ld.", err);
+            ESP_LOGD(TAG, "Failed to send the WebSocket frame. Error: %d.", err);
             goto on_error;
         }
     }
@@ -2043,6 +2162,12 @@ static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, cons
 
     return httpd_ws_send_frame_async(serverHandle, sockfd, &frame) == ESP_OK &&
            httpd_sess_trigger_close(serverHandle, sockfd) == ESP_OK;
+}
+
+static void otaRestartTaskMain(Task_t *task, void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    esp_restart();
 }
 
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl)
