@@ -1,4 +1,5 @@
 #include "iot_comm/provisioning/wifi.h"
+#include "iot_comm/utils/network.h"
 #include <esp_check.h>
 #include <esp_event.h>
 #include <esp_log.h>
@@ -10,10 +11,13 @@
 #include <mutex.h>
 #include <nvs_flash.h>
 #include <rundown_protection.h>
+#include <storage/nvs.h>
 #include <string.h>
 #include <task.h>
 
 static const char *TAG = "WIFI-PROV";
+static const char *NVSNamespace = "iotcomm-wifi";
+static const char *NVSKeyHostname = "hostname";
 
 #define STA_TRANSITION_DELAY_US 150000
 
@@ -57,10 +61,13 @@ static esp_timer_handle_t staTransitionTimer = nullptr;
 static void wifiMgrDeinitNoLock();
 static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config);
 static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void *eventData);
-static void setConnectedStateAndCallCallback(bool isConnected);
 static void staTransitionTimerCallback(void *arg);
 static void performStaModeTransition();
+static esp_err_t loadStoredHostnameOrDefault(char hostname[MAX_HOSTNAME_LEN + 1]);
+static esp_err_t saveStoredHostname(const char *hostname);
+static esp_err_t eraseStoredHostname();
 static esp_err_t setCustomAddressInAP(esp_netif_t *netIf);
+static esp_err_t setNetifHostname(esp_netif_t *netIf, const char *hostname);
 static esp_err_t captivePortalSetupDhcpUrl();
 static esp_err_t captivePortalSetupDns();
 static esp_err_t captivePortalCatchAllHandler(httpd_req_t *req);
@@ -139,7 +146,7 @@ bool wifiMgrDeleteConfig()
     AutoRundownProtection rpLock(rp);
     esp_err_t err;
 
-    if (!rpLock.acquired() || !handler) {
+    if (!rpLock.acquired() || (!handler)) {
         return false;
     }
 
@@ -156,6 +163,46 @@ bool wifiMgrDeleteConfig()
 
     provisioned = false;
     return true;
+}
+
+esp_err_t wifiMgrSetHostname(const char *hostname)
+{
+    AutoMutex lock(mtx);
+    esp_err_t err;
+
+    if (hostname && *hostname != 0 && (!isValidHostname(hostname))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = (hostname && *hostname != 0) ? saveStoredHostname(hostname) : eraseStoredHostname();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (defNetIfWifiSta) {
+        err = setNetifHostname(defNetIfWifiSta, hostname);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    if (defNetIfWifiAp) {
+        err = setNetifHostname(defNetIfWifiAp, hostname);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t wifiMgrGetHostname(char hostname[MAX_HOSTNAME_LEN + 1])
+{
+    AutoMutex lock(mtx);
+
+    if (!hostname) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return loadStoredHostnameOrDefault(hostname);
 }
 
 esp_err_t wifiMgrStoreSTA(const char *ssid, const char *password)
@@ -200,6 +247,7 @@ esp_err_t wifiMgrStoreSTA(const char *ssid, const char *password)
 esp_err_t wifiMgrStartSTA()
 {
     AutoMutex lock(mtx);
+    esp_err_t err;
 
     // Check current state
     if (!(handler && cpHttpServer)) {
@@ -220,11 +268,20 @@ esp_err_t wifiMgrStartSTA()
         timerArgs.callback = &staTransitionTimerCallback;
         timerArgs.dispatch_method = ESP_TIMER_TASK;
         timerArgs.name = "iotcomm-wifi_sta_sw";
-        ESP_RETURN_ON_ERROR(esp_timer_create(&timerArgs, &staTransitionTimer), TAG, "Failed to create the STA transition timer");
+        err = esp_timer_create(&timerArgs, &staTransitionTimer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create the STA transition timer. Error: %d.", err);
+            return err;
+        }
     }
 
     staTransitionPending = true;
-    ESP_RETURN_ON_ERROR(esp_timer_start_once(staTransitionTimer, STA_TRANSITION_DELAY_US), TAG, "Failed to start the STA transition timer");
+    err = esp_timer_start_once(staTransitionTimer, STA_TRANSITION_DELAY_US);
+    if (err != ESP_OK) {
+        staTransitionPending = false;
+        ESP_LOGE(TAG, "Failed to start the STA transition timer. Error: %d.", err);
+        return err;
+    }
 
     // Done
     return ESP_OK;
@@ -287,6 +344,7 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
 {
     wifi_init_config_t cfg;
     wifi_config_t staConfig;
+    char hostname[MAX_HOSTNAME_LEN + 1];
     esp_err_t err;
 
     // Initialize network interface engine
@@ -299,12 +357,20 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
         return err;
     }
 
+    err = loadStoredHostnameOrDefault(hostname);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "Failed to read the configured hostname. Error: %d.", err);
+        return err;
+    }
+
     // Create default interfaces
     defNetIfWifiSta = esp_netif_create_default_wifi_sta();
     ESP_RETURN_ON_FALSE(defNetIfWifiSta, ESP_FAIL, TAG, "Failed to create the default STA interface");
+    ESP_RETURN_ON_ERROR(setNetifHostname(defNetIfWifiSta, hostname), TAG, "Failed to set the initial STA hostname");
 
     defNetIfWifiAp = esp_netif_create_default_wifi_ap();
     ESP_RETURN_ON_FALSE(defNetIfWifiAp, ESP_FAIL, TAG, "Failed to create the default AP interface");
+    ESP_RETURN_ON_ERROR(setNetifHostname(defNetIfWifiAp, hostname), TAG, "Failed to set the initial AP hostname");
     ESP_RETURN_ON_ERROR(setCustomAddressInAP(defNetIfWifiAp), TAG, "Failed to configure a custom IP address for the AP interface");
 
     // Register event handlers
@@ -401,6 +467,13 @@ after_http:
     return ESP_OK;
 }
 
+static esp_err_t setNetifHostname(esp_netif_t *netIf, const char *hostname)
+{
+    const char *effectiveHostname = (hostname && *hostname != 0) ? hostname : CONFIG_LWIP_LOCAL_HOSTNAME;
+
+    return esp_netif_set_hostname(netIf, effectiveHostname);
+}
+
 static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void *eventData)
 {
     if (eventBase == WIFI_EVENT) {
@@ -416,13 +489,25 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
                 break;
 
             case WIFI_EVENT_STA_DISCONNECTED:
-                ESP_LOGI(TAG, "Disconnected; reconnecting to the configured access point.");
-
                 {
+                    wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)eventData;
+
+                    ESP_LOGI(TAG, "Disconnected; reconnecting to the configured access point.");
+
                     AutoRundownProtection rpLock(rp);
 
                     if (rpLock.acquired() && provisioned) {
-                        setConnectedStateAndCallCallback(false);
+                        // Raise disconnected state or notify if authentication failed
+                        if (connected) {
+                            connected = false;
+                            handler(WifiMgrEventDisconnected, handlerCtx);
+                        }
+                        else {
+                            if (event && event->reason == WIFI_REASON_AUTH_FAIL) {
+                                handler(WifiMgrEventAuthenticationFailed, handlerCtx);
+                            }
+                        }
+
                         esp_wifi_connect();
                     }
                 }
@@ -446,7 +531,13 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
 
                     ESP_LOGI(TAG, "Connected; acquired IPv4 address " IPSTR ".", IP2STR(&event->ip_info.ip));
                     if (rpLock.acquired()) {
-                        setConnectedStateAndCallCallback(true);
+
+
+                        // Raise connected state
+                        if (!connected) {
+                            connected = true;
+                            handler(WifiMgrEventConnected, handlerCtx);
+                        }
                     }
                 }
                 break;
@@ -458,23 +549,14 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
 
                     ESP_LOGI(TAG, "Connected; acquired IPv6 address " IPV6STR ".", IPV62STR(event->ip6_info.ip));
                     if (rpLock.acquired()) {
-                        setConnectedStateAndCallCallback(true);
+                        // Raise connected state
+                        if (!connected) {
+                            connected = true;
+                            handler(WifiMgrEventConnected, handlerCtx);
+                        }
                     }
                 }
                 break;
-        }
-    }
-}
-
-static void setConnectedStateAndCallCallback(bool isConnected)
-{
-    if (isConnected != connected) {
-        connected = isConnected;
-        if (connected) {
-            handler(WifiMgrEventConnected, handlerCtx);
-        }
-        else {
-            handler(WifiMgrEventDisconnected, handlerCtx);
         }
     }
 }
@@ -491,6 +573,7 @@ static void staTransitionTimerCallback(void *arg)
 static void performStaModeTransition()
 {
     AutoMutex lock(mtx);
+    char hostname[MAX_HOSTNAME_LEN + 1];
     esp_err_t err;
 
     staTransitionPending = false;
@@ -511,10 +594,78 @@ static void performStaModeTransition()
         return;
     }
 
+    err = loadStoredHostnameOrDefault(hostname);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "Failed to read the STA hostname before switching modes. Error: %d.", err);
+        return;
+    }
+
+    err = setNetifHostname(defNetIfWifiSta, hostname);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set the STA hostname before switching modes. Error: %d.", err);
+        return;
+    }
+
     err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start STA mode. Error: %d.", err);
     }
+}
+
+static esp_err_t loadStoredHostnameOrDefault(char hostname[MAX_HOSTNAME_LEN + 1])
+{
+    NVSStorage storage(NVSNamespace);
+    lightstd::string value;
+    esp_err_t err;
+
+    hostname[0] = 0;
+
+    err = storage.readStr(NVSKeyHostname, value);
+    if (err == ESP_OK) {
+        if (value.length() != 0 && value.length() <= MAX_HOSTNAME_LEN && isValidHostname(value.c_str())) {
+            strlcpy(hostname, value.c_str(), MAX_HOSTNAME_LEN + 1);
+        }
+        else {
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    if (err != ESP_OK) {
+        strlcpy(hostname, CONFIG_LWIP_LOCAL_HOSTNAME, MAX_HOSTNAME_LEN + 1);
+    }
+    return err;
+}
+
+static esp_err_t saveStoredHostname(const char *hostname)
+{
+    NVSStorage storage(NVSNamespace);
+    esp_err_t err;
+
+    if (!hostname || hostname[0] == 0) {
+        return eraseStoredHostname();
+    }
+    if (!isValidHostname(hostname)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = storage.writeStr(NVSKeyHostname, hostname);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return storage.commit();
+}
+
+static esp_err_t eraseStoredHostname()
+{
+    NVSStorage storage(NVSNamespace);
+    esp_err_t err;
+
+    err = storage.erase(NVSKeyHostname);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return storage.commit();
 }
 
 static esp_err_t setCustomAddressInAP(esp_netif_t *netIf)

@@ -7,20 +7,20 @@
 
 // -----------------------------------------------------------------------------
 
-// Holds the Wi-Fi and device setup data gathered from the captive portal workflow.
-typedef struct CaptivePortalSetupData_s {
+// Holds the validated Wi-Fi and device provisioning config gathered from the captive portal workflow.
+typedef struct CaptivePortalProvisioningConfig_s {
     char    wifiSSID[32];
     char    wifiPassword[64];
     uint8_t rootUserPublicKey[P256_PUBLIC_KEY_SIZE];
     char    hostname[MAX_HOSTNAME_LEN + 1];
-} CaptivePortalSetupData_t;
+} CaptivePortalProvisioningConfig_t;
 
-// Receives the setup data submitted through the captive portal.
-typedef esp_err_t (*CaptivePortalSetupDataHandler_t)(CaptivePortalSetupData_t *setupData, void *ctx);
+// Receives the validated provisioning config submitted through the captive portal.
+typedef esp_err_t (*CaptivePortalProvisioningConfigHandler_t)(CaptivePortalProvisioningConfig_t *config, void *ctx);
 
-// Configures how the captive portal collects and applies setup data.
+// Configures how the captive portal collects and applies provisioning data.
 typedef struct CaptivePortalConfig_s {
-    CaptivePortalSetupDataHandler_t handler;
+    CaptivePortalProvisioningConfigHandler_t handler;
     void *handlerCtx;
     bool setupRootUser;
     bool setupDeviceHostname;

@@ -152,8 +152,8 @@ static void iotCommStopServerNoLock();
 
 static esp_err_t serveWsInit(httpd_req_t *req);
 static esp_err_t serveWsAuth(httpd_req_t *req);
+static esp_err_t serveWsPreHandshake(httpd_req_t *req);
 static esp_err_t serveWs(httpd_req_t *req);
-static esp_err_t serveWsUpgrade(httpd_req_t *req);
 static esp_err_t serveWsPacket(httpd_req_t *req);
 
 static esp_err_t handleCreateUser(CommandContext_t *commandCtx);
@@ -330,6 +330,7 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t *config)
     uri.uri = "/ws";
     uri.method = HTTP_GET;
     uri.handler = serveWs;
+    uri.ws_pre_handshake_cb = serveWsPreHandshake;
     uri.is_websocket = true;
     err = httpd_register_uri_handler(server, &uri);
     if (err == ESP_OK) {
@@ -670,6 +671,11 @@ static esp_err_t serveWsInit(httpd_req_t *req)
         goto done;
     }
 
+    if (rateLimitIsAddressBlocked(&remoteAddr)) {
+        err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
+        goto done;
+    }
+
     // Check rate limit
     if (!rateLimitCheckRequest(&remoteAddr)) {
         err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
@@ -823,6 +829,11 @@ static esp_err_t serveWsAuth(httpd_req_t *req)
         goto done;
     }
 
+    if (rateLimitIsAddressBlocked(&remoteAddr)) {
+        err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
+        goto done;
+    }
+
     // Check rate limit
     if (!rateLimitCheckRequest(&remoteAddr)) {
         err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
@@ -919,6 +930,7 @@ error_not_auth:
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
+        rateLimitIncrementFailedAuth(&remoteAddr);
         if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_SIGNATURE_VERIFICATION_FAILED || err == ESP_ERR_INVALID_STATE) {
             challengesRemove(challengeCookie);
             goto error_not_auth;
@@ -991,22 +1003,9 @@ done:
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t serveWs(httpd_req_t *req)
+static esp_err_t serveWsPreHandshake(httpd_req_t *req)
 {
     AutoRundownProtection rpLock(rp);
-
-    if (!rpLock.acquired()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (req->method == 0) {
-        return serveWsPacket(req);
-    }
-    return serveWsUpgrade(req);
-}
-
-static esp_err_t serveWsUpgrade(httpd_req_t *req)
-{
     ServerContext_t *serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
     IPAddress_t remoteAddr;
     GrowableBuffer_t reqQueryParams;
@@ -1030,11 +1029,11 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
     uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN];
     SessionInfo_t *session;
     bool b;
+    bool success = false;
     esp_err_t err;
 
-    // Is OPTIONS?
-    if (req->method == HTTP_OPTIONS) {
-        return httpSendPreflightResponse(req);
+    if (!rpLock.acquired()) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     // Prepare
@@ -1042,23 +1041,15 @@ static esp_err_t serveWsUpgrade(httpd_req_t *req)
     sha256Init(&sha256Ctx);
     p256KeyPairInit(&ecdhKeyPair);
 
-    // Send CORS
-    err = httpSendDefaultCORS(req);
-    if (err != ESP_OK) {
-        goto done;
-    }
-
-    // Check if it is a real websocket request. ESP_HTTP_SERVER calls the handle even
-    // when not a websocket connection
-    if (httpd_req_get_hdr_value_len(req, "Upgrade") == 0) {
-        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
-        goto done;
-    }
-
     // Get request IP address
     if (!httpGetClientIpFromRequest(req, &remoteAddr)) {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
+        goto done;
+    }
+
+    if (rateLimitIsAddressBlocked(&remoteAddr)) {
+        err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
         goto done;
     }
 
@@ -1112,6 +1103,7 @@ error_not_auth:
     if ((!challenge->verified) ||
         (!constantTimeCompare(challenge->wsNonce, wsNonce, CHALLENGE_NONCE_SIZE))
     ) {
+        rateLimitIncrementFailedAuth(&remoteAddr);
         goto error_not_auth;
     }
 
@@ -1148,6 +1140,7 @@ error_not_auth:
     // Verify signature of th
     err = userVerifySignature(challenge->userId, th, signature);
     if (err != ESP_OK) {
+        rateLimitIncrementFailedAuth(&remoteAddr);
         if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_SIGNATURE_VERIFICATION_FAILED || err == ESP_ERR_INVALID_STATE) {
             challengesRemove(challengeCookie);
             goto error_not_auth;
@@ -1244,9 +1237,6 @@ error_destroy_session_and_done:
     }
     session->mustChangeCredentials = (b) ? 1 : 0;
 
-    // Bind our internal session to the connection
-    httpd_sess_set_ctx(req->handle, session->sockfd, session, destroySessionCtx);
-
     // Add the session to the server's sessions list
     rwMutexLockWrite(&serverCtx->sessions.mtx);
     session->prev = serverCtx->sessions.last;
@@ -1258,6 +1248,9 @@ error_destroy_session_and_done:
     }
     serverCtx->sessions.last = session;
     rwMutexUnlockWrite(&serverCtx->sessions.mtx);
+
+    // Bind our internal session to the connection
+    httpd_sess_set_ctx(req->handle, session->sockfd, session, destroySessionCtx);
 
     // Call session start callback
     if (handleSessionStart(session, req, &err)) {
@@ -1286,8 +1279,9 @@ error_destroy_session_and_done:
     // Reset rate limits for successful access
     rateLimitResetAddress(&remoteAddr);
 
-    // Upgrade to WebSockets
+    // Continue handshake to upgrade to WebSockets
     err = ESP_OK;
+    success = true;
 
 done:
     // Cleanup
@@ -1309,7 +1303,44 @@ done:
     gbReset(&reqQueryParams, true);
 
     // Done
-    return httpSendInternalErrorResponse(req, err, nullptr);
+    if (err != ESP_OK) {
+        httpSendInternalErrorResponse(req, err, nullptr);
+    }
+    return (success) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t serveWs(httpd_req_t *req)
+{
+    AutoRundownProtection rpLock(rp);
+
+    if (!rpLock.acquired()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    switch (req->method) {
+        case HTTP_OPTIONS:
+            return httpSendPreflightResponse(req);
+
+        case HTTP_GET:
+            // Send CORS
+            if (httpSendDefaultCORS(req) != ESP_OK) {
+                return ESP_FAIL;
+            }
+
+            // Check if it is a real websocket request. ESP_HTTP_SERVER calls the handle even when not a websocket connection
+            if (httpd_req_get_hdr_value_len(req, "Upgrade") == 0) {
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
+            }
+
+            // Done
+            return ESP_OK;
+
+        case 0:
+            return serveWsPacket(req);
+    }
+
+    // Drop connection (should not reach here)
+    return ESP_FAIL;
 }
 
 static esp_err_t serveWsPacket(httpd_req_t *req)
@@ -1841,7 +1872,7 @@ static void handleSessionEnd(SessionInfo_t *session)
     otfe.session = session;
     otfe.event = &event;
 
-    // Populate event data'
+    // Populate event data
     memset(&event, 0, sizeof(event));
     event.eventType = IotCommEventTypeSessionEnd;
     event.sessionHandle = &otfe;
@@ -1962,7 +1993,9 @@ static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t c
 
 static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason)
 {
-    commandCtx->session->isClosed = 1;
+    if (commandCtx->session) {
+        commandCtx->session->isClosed = 1;
+    }
     return closeWs(commandCtx->serverHandle, commandCtx->sockfd, code, reason) ? ESP_OK : ESP_FAIL;
 }
 

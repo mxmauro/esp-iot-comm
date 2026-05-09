@@ -1,6 +1,6 @@
 # Provisioning example
 
-To compile and run the example, open an ESP-IDF v5.5 or later terminal and run the following commands:
+To build and run the example, open an ESP-IDF v5.5 or later terminal and run:
 
 ```bash
 idf.py set-target esp32c3    # replace esp32c3 with your device type

@@ -46,7 +46,7 @@ extern const uint8_t webui_assets_app_css_end[]   asm("_binary_app_css_end");
 // -----------------------------------------------------------------------------
 
 static RWMutex rwNtx;
-static CaptivePortalSetupDataHandler_t handler = nullptr;
+static CaptivePortalProvisioningConfigHandler_t handler = nullptr;
 static void *handlerCtx = nullptr;
 static uint8_t serverEcdhPrivateKey[P256_PRIVATE_KEY_SIZE] = {0};
 static char serverEcdhPublicKeyB64[P256_MAX_B64_PUBLIC_KEY_SIZE] = {0};
@@ -137,7 +137,6 @@ esp_err_t capPortalHandleRequest(httpd_req_t *req)
     };
 
     AutoRWMutex lock(rwNtx, true);
-    esp_err_t err;
 
     if (!req) {
         return ESP_ERR_INVALID_ARG;
@@ -154,37 +153,19 @@ esp_err_t capPortalHandleRequest(httpd_req_t *req)
                     if (!handlers[i].get) {
                         goto error_not_found;
                     }
-                    err = httpSendDefaultCORS(req);
-                    if (err == ESP_OK) {
-                        err =  handlers[i].get(req);
-                    }
-                    return err;
+                    return handlers[i].get(req);
 
                 case HTTP_POST:
                     if (!handlers[i].post) {
                         goto error_not_found;
                     }
-                    err = httpSendDefaultCORS(req);
-                    if (err == ESP_OK) {
-                        err =  handlers[i].post(req);
-                    }
-                    return err;
-
-                case HTTP_OPTIONS:
-                    if (!(handlers[i].get || handlers[i].post)) {
-                        goto error_not_found;
-                    }
-                    return httpSendPreflightResponse(req);
+                    return handlers[i].post(req);
             }
         }
     }
 
     // Not found
 error_not_found:
-    err = httpSendDefaultCORS(req);
-    if (err != ESP_OK) {
-        return err;
-    }
     return httpSendNotFound(req);
 }
 
@@ -389,7 +370,7 @@ static esp_err_t handleProvision(httpd_req_t *req)
     cJSON *json = nullptr;
     char *clientPublicKeyValue, *nonceValue, *ivValue, *encryptedPayloadValue;
     char *wifiSsidValue, *wifiPasswordValue, *rootUserPublicKeyValue, *hostnameValue;
-    CaptivePortalSetupData_t creds;
+    CaptivePortalProvisioningConfig_t creds;
     size_t clientPublicKeyLen, nonceLen, ivLen, encryptedPayloadLen;
     size_t rootUserPublicKeyLen;
     size_t plaintextLen;
@@ -543,7 +524,7 @@ error_no_mem:
             goto error_invalid_data;
         }
 
-        if (*hostnameValue != 0 && !isValidHostname(hostnameValue)) {
+        if (*hostnameValue != 0 && (!isValidHostname(hostnameValue))) {
             err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Hostname must be RFC1123 compliant.");
             goto done;
         }

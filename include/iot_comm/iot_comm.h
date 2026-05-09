@@ -8,8 +8,8 @@
 #include <stdint.h>
 #include <string.h>
 
-#if (!defined(CONFIG_HTTPD_WS_SUPPORT))
-    #error This library requires CONFIG_HTTPD_WS_SUPPORT to be enabled
+#if (!defined(CONFIG_HTTPD_WS_SUPPORT)) || (!defined(CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT))
+    #error This library requires CONFIG_HTTPD_WS_SUPPORT and CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT to be enabled
 #endif
 
 #if (!defined(CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE)) || CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE < 4096

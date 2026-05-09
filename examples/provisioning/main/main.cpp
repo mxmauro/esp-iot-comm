@@ -12,7 +12,7 @@ static void setupTask(void *arg);
 
 static void iotCommEventHandler(IotCommEvent_t *event);
 static void wifiMgrEventHandler(WifiMgrEvent_t event, void *ctx);
-static esp_err_t captivePortalCredentialsHandler(CaptivePortalSetupData_t *creds, void *ctx);
+static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig_t *creds, void *ctx);
 static esp_err_t loadUsersFromStorage(void *dest, size_t destLen, void *ctx);
 static esp_err_t saveUsersToStorage(const void *data, size_t dataLen, void *ctx);
 
@@ -74,13 +74,16 @@ static void wifiMgrEventHandler(WifiMgrEvent_t, void *)
 
 }
 
-static esp_err_t captivePortalCredentialsHandler(CaptivePortalSetupData_t *creds, void *)
+static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig_t *creds, void *)
 {
     esp_err_t err;
 
     err = iotCommInitRootUserPublicKey(creds->rootUserPublicKey);
-    if (err == ESP_OK && *creds->hostname != 0) {
+    if (err == ESP_OK && creds->hostname[0] != 0) {
         err = mdns_hostname_set(creds->hostname);
+    }
+    if (err == ESP_OK) {
+        err = wifiMgrSetHostname(creds->hostname[0] != 0 ? creds->hostname : nullptr);
     }
     if (err == ESP_OK) {
         err = wifiMgrStoreSTA(creds->wifiSSID, creds->wifiPassword);

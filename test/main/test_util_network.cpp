@@ -74,9 +74,9 @@ TEST_CASE("isValidHostname accepts valid hostnames", "[mdns]")
 {
     TEST_ASSERT_TRUE(isValidHostname("device"));
     TEST_ASSERT_TRUE(isValidHostname("device-01"));
-    TEST_ASSERT_TRUE(isValidHostname("sensor.hallway"));
-    TEST_ASSERT_TRUE(isValidHostname("sensor.hallway.local."));
+    TEST_ASSERT_TRUE(isValidHostname("sensorhallway"));
     TEST_ASSERT_TRUE(isValidHostname("a"));
+    TEST_ASSERT_TRUE(isValidHostname("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 }
 
 TEST_CASE("isValidHostname rejects invalid hostnames", "[mdns]")
@@ -85,9 +85,12 @@ TEST_CASE("isValidHostname rejects invalid hostnames", "[mdns]")
     TEST_ASSERT_FALSE(isValidHostname(""));
     TEST_ASSERT_FALSE(isValidHostname("-device"));
     TEST_ASSERT_FALSE(isValidHostname("device-"));
+    TEST_ASSERT_FALSE(isValidHostname("sensor.hallway"));
+    TEST_ASSERT_FALSE(isValidHostname("sensor.hallway.local."));
     TEST_ASSERT_FALSE(isValidHostname("device..local"));
     TEST_ASSERT_FALSE(isValidHostname("device_.local"));
     TEST_ASSERT_FALSE(isValidHostname(".device"));
+    TEST_ASSERT_FALSE(isValidHostname("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 }
 
 // -----------------------------------------------------------------------------

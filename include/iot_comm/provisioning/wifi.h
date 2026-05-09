@@ -2,14 +2,16 @@
 
 #include <esp_err.h>
 #include <esp_http_server.h>
+#include <iot_comm/utils/network.h>
 #include <stdint.h>
 
 // -----------------------------------------------------------------------------
 
 // Identifies Wi-Fi manager state changes reported to the application.
 typedef enum WifiMgrEvent_e {
-    WifiMgrEventConnected    = 1,
-    WifiMgrEventDisconnected = 2
+    WifiMgrEventConnected            = 1,
+    WifiMgrEventDisconnected         = 2,
+    WifiMgrEventAuthenticationFailed = 3
 } WifiMgrEvent_t;
 
 // Receives Wi-Fi manager events.
@@ -61,8 +63,17 @@ bool wifiMgrIsProvisioned();
 // Removes any stored Wi-Fi provisioning data.
 bool wifiMgrDeleteConfig();
 
+// Stores the device hostname and applies it to active Wi-Fi interfaces.
+// This can be called without initializing the Wi-Fi manager.
+esp_err_t wifiMgrSetHostname(const char *hostname);
+
+// Reads the stored device hostname or returns CONFIG_LWIP_LOCAL_HOSTNAME when unset.
+// This can be called without initializing the Wi-Fi manager.
+esp_err_t wifiMgrGetHostname(char hostname[MAX_HOSTNAME_LEN + 1]);
+
 // Persists station credentials for later connection attempts.
 esp_err_t wifiMgrStoreSTA(const char *ssid, const char *password);
+
 // Starts connecting in station mode using the stored credentials.
 esp_err_t wifiMgrStartSTA();
 

@@ -148,61 +148,31 @@ bool ipAddressEqual(const IPAddress_t *addr1, const IPAddress_t *addr2)
 
 bool isValidHostname(const char *hostname)
 {
-    size_t i, j;
-    size_t len, effectiveLen;
-    size_t labelStart, labelLen;
+    size_t i;
+    size_t len;
     char ch;
 
     if ((!hostname) || *hostname == 0) {
         return false;
     }
     len = strlen(hostname);
-    if (len > MAX_HOSTNAME_LEN) {
+    if (len > 63) {
+        return false;
+    }
+    if (!isalnum((unsigned char)hostname[0])) {
+        return false;
+    }
+    if (!isalnum((unsigned char)hostname[len - 1])) {
         return false;
     }
 
-    // Handle trailing dot (FQDN)
-    effectiveLen = (hostname[len - 1] == '.') ? len - 1 : len;
-
-    labelStart = 0;
-    labelLen = 0;
-    for (i = 0; i <= effectiveLen; i++) {
-        ch = (i < effectiveLen) ? hostname[i] : '.';
-
-        if (ch == '.') {
-            // End of label - validate it
-            if (labelLen == 0 || labelLen > 63) {
-                return false;
-            }
-
-            // Check first character of label
-            if (!isalnum((unsigned char)hostname[labelStart])) {
-                return false;
-            }
-
-            // Check last character of label
-            if (!isalnum((unsigned char)hostname[labelStart + labelLen - 1])) {
-                return false;
-            }
-
-            // Check all characters in label
-            for (j = labelStart; j < labelStart + labelLen; j++) {
-                ch = hostname[j];
-                if (!isalnum((unsigned char)ch) && ch != '-') {
-                    return false;
-                }
-            }
-
-            // Start next label
-            labelStart = i + 1;
-            labelLen = 0;
-        }
-        else {
-            labelLen += 1;
+    for (i = 0; i < len; i++) {
+        ch = hostname[i];
+        if (!isalnum((unsigned char)ch) && ch != '-') {
+            return false;
         }
     }
 
-    // Done
     return true;
 }
 

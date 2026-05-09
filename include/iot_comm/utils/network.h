@@ -40,7 +40,7 @@ bool parseIP(IPAddress_t *addr, const char *s, size_t len = (size_t)-1);
 // Compares two IP addresses for exact equality.
 bool ipAddressEqual(const IPAddress_t *addr1, const IPAddress_t *addr2);
 
-// Validates whether a string can be used as a device hostname.
+// Validates whether a string can be used as a single-label device hostname.
 bool isValidHostname(const char *hostname);
 
 #ifdef __cplusplus
