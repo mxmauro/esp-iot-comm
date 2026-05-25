@@ -167,7 +167,6 @@ bool httpGetClientIpFromRequest(httpd_req_t *req, IPAddress_t *out)
         while (hdr[len] != 0 && hdr[len] != ',' && len < sizeof(hdr) - 1) {
             len++;
         }
-
         if (parseIP(out, hdr, len)) {
             return true;
         }

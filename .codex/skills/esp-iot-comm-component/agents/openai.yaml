@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP IoT Comm Component"
+  short_description: "Repository-wide guidance for the ESP-IDF component"
+  default_prompt: "Use this skill when working anywhere in the esp-iot-comm repository, then switch to the subsystem-specific skill if the task narrows to protocol, provisioning, or captive portal UI."

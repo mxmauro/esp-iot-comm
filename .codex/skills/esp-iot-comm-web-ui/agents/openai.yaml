@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP IoT Comm Web UI"
+  short_description: "Svelte/Vite captive portal frontend work"
+  default_prompt: "Use this skill for captive portal frontend edits and regenerate the embedded web-dist assets after source changes."

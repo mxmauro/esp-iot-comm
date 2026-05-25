@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP IoT Comm Protocol"
+  short_description: "Server, session, command, and transport work"
+  default_prompt: "Use this skill for authenticated server protocol changes, especially when counters, command layouts, locking, reply timing, or UDP/WebSocket behavior are involved."

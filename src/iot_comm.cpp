@@ -18,6 +18,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <growable_buffer.h>
 #include <mutex.h>
@@ -34,6 +35,10 @@ static const char* TAG = "IotComm";
 #define TAG_LEN     16
 #define AES_KEY_LEN 32
 
+#define SESSION_MASTER_INFO "mx-iot-session-master-v1"
+#define WS_TRANSPORT_INFO   "mx-iot-ws-v1"
+#define UDP_TRANSPORT_INFO  "mx-iot-udp-v1"
+
 #define MAX_BODY_SIZE 10240
 #define MAX_QUERY_SIZE 1024
 
@@ -44,6 +49,7 @@ static const char* TAG = "IotComm";
 #define CMD_OTA_BEGIN               0x7FF5
 #define CMD_OTA_WRITE               0x7FF6
 #define CMD_OTA_CANCEL              0x7FF7
+#define CMD_UDP_OPEN                0x7FF8
 
 #define SESSION_FLAG_OTA_UPDATE     0x00000001UL
 
@@ -65,6 +71,7 @@ typedef enum IncomingBufferType_e {
 typedef struct ServerContext_s {
     size_t maxPacketSize;
     size_t maxConnectionsCount;
+    uint16_t udpListenPort;
 
     struct {
         RwMutex_t mtx;
@@ -86,6 +93,13 @@ typedef struct SessionInfo_s {
     uint32_t nextRxCounter;
     uint32_t nextTxCounter;
     ChallengeNonce_t nonce;
+    ChallengeNonce_t clientUdpNonce;
+    ChallengeNonce_t serverUdpNonce;
+    uint32_t udpConnectionId;
+    uint32_t udpNextRxCounter;
+    uint8_t udpClientAesKey[AES_KEY_LEN];
+    uint8_t udpClientBaseIV[SESSION_IV_LEN];
+    uint8_t sessionMasterKey[SESSION_AES_KEY_LEN];
     AesContext_t clientAesCtx;
     uint8_t clientBaseIV[SESSION_IV_LEN];
     AesContext_t serverAesCtx;
@@ -94,7 +108,10 @@ typedef struct SessionInfo_s {
     uint8_t mustChangeCredentials : 1;
     uint8_t credentialsChangeAttempts : 2;
     uint8_t isClosed : 1;
+    uint32_t refCount;
+    uint32_t udpInFlight;
     uint32_t flags;
+    SemaphoreHandle_t dispatchMtx;
     IncomingBufferType_t incomingMessageType;
     GrowableBuffer_t plaintextIn;
     GrowableBuffer_t ciphertextIn;
@@ -142,8 +159,11 @@ static RundownProtection_t rp = RUNDOWN_PROTECTION_INIT_STATIC;
 static IotCommEventHandler_t handler = nullptr;
 static void *handlerCtx = nullptr;
 static httpd_handle_t server = nullptr;
+static ServerContext_t *activeServerCtx = nullptr;
 static _Atomic(uint32_t) nextSessionId = {0};
 static Task_t otaRestartTask = TASK_INIT_STATIC;
+static Task_t udpServerTask = TASK_INIT_STATIC;
+static int udpServerSocket = -1;
 
 // -----------------------------------------------------------------------------
 
@@ -155,6 +175,7 @@ static esp_err_t serveWsAuth(httpd_req_t *req);
 static esp_err_t serveWsPreHandshake(httpd_req_t *req);
 static esp_err_t serveWs(httpd_req_t *req);
 static esp_err_t serveWsPacket(httpd_req_t *req);
+static esp_err_t dispatchCommand(CommandContext_t *commandCtx);
 
 static esp_err_t handleCreateUser(CommandContext_t *commandCtx);
 static esp_err_t handleDeleteUser(CommandContext_t *commandCtx);
@@ -163,6 +184,7 @@ static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx);
 static esp_err_t handleOtaBegin(CommandContext_t *commandCtx);
 static esp_err_t handleOtaWrite(CommandContext_t *commandCtx);
 static esp_err_t handleOtaCancel(CommandContext_t *commandCtx);
+static esp_err_t handleUdpOpen(CommandContext_t *commandCtx);
 static esp_err_t handleCustomCommand(CommandContext_t *commandCtx);
 
 static bool handleSessionStart(SessionInfo_t *session, httpd_req_t *req, esp_err_t *closeErr);
@@ -180,14 +202,26 @@ static void destroyServerCtx(void *ctx);
 static void destroySessionCtx(void *ctx);
 
 static SessionInfo_t *createSession();
-static void destroySession(SessionInfo_t *session);
+static void incrementSessionRefCount(SessionInfo_t *session);
+static void decrementSessionRefCount(SessionInfo_t *session);
+static void freeSession(SessionInfo_t *session);
 
 static esp_err_t readWsPacket(ServerContext_t *serverCtx, SessionInfo_t *session, httpd_req_t *req, bool *messageComplete);
 
 static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, const char *reason);
 static void otaRestartTaskMain(Task_t *task, void *arg);
 
+static esp_err_t startUdpServer(ServerContext_t *serverCtx);
+static void stopUdpServer();
+static void udpServerTaskMain(Task_t *task, void *arg);
+static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, size_t packetLen, const IPAddress_t *remoteAddr);
+
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl);
+static esp_err_t deriveSessionMasterKey(const uint8_t sharedSecret[P256_SHARED_SECRET_SIZE], const uint8_t *salt, size_t saltLen,
+                                        uint8_t sessionMasterKey[SESSION_AES_KEY_LEN]);
+static esp_err_t deriveTransportKeys(const uint8_t sessionMasterKey[SESSION_AES_KEY_LEN], const uint8_t *salt, size_t saltLen,
+                                     const uint8_t *info, size_t infoLen,
+                                     uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN]);
 
 // -----------------------------------------------------------------------------
 
@@ -283,12 +317,14 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t *config)
     memset(serverCtx, 0, sizeof(ServerContext_t));
     serverCtx->maxConnectionsCount = (size_t)config->maxConnections;
     serverCtx->maxPacketSize = (config->maxPacketSize > MIN_WS_PACKET_SIZE) ? (size_t)config->maxPacketSize : MIN_WS_PACKET_SIZE;
+    serverCtx->udpListenPort = config->udpListenPort;
     rwMutexInit(&serverCtx->sessions.mtx);
 
     // Setup http server configuration
     httpdConfig = HTTPD_DEFAULT_CONFIG();
     httpdConfig.server_port = config->listenPort;
     httpdConfig.max_open_sockets = config->maxConnections;
+    httpdConfig.core_id = tskNO_AFFINITY;
     httpdConfig.keep_alive_enable = true;
     httpdConfig.keep_alive_idle = 10;
     httpdConfig.global_user_ctx = serverCtx;
@@ -299,6 +335,14 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t *config)
     if (err != ESP_OK) {
         destroyServerCtx(serverCtx);
         goto on_error;
+    }
+    activeServerCtx = serverCtx;
+
+    if (serverCtx->udpListenPort != 0) {
+        err = startUdpServer(serverCtx);
+        if (err != ESP_OK) {
+            goto on_error;
+        }
     }
 
     // Setup URI handlers
@@ -622,6 +666,8 @@ static void iotCommDeinitNoLock()
 
 static void iotCommStopServerNoLock()
 {
+    stopUdpServer();
+
     if (server) {
         httpd_stop(server);
         server = nullptr;
@@ -1023,9 +1069,9 @@ static esp_err_t serveWsPreHandshake(httpd_req_t *req)
     Sha256Context_t sha256Ctx;
     uint8_t th[SHA256_SIZE];
     P256KeyPair_t ecdhKeyPair;
-    uint8_t info[6 + 2 * P256_PUBLIC_KEY_SIZE];
     uint8_t salt[SHA256_SIZE];
     uint8_t sharedSecret[AES_KEY_LEN];
+    uint8_t sessionMasterKey[SESSION_AES_KEY_LEN];
     uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN];
     SessionInfo_t *session;
     bool b;
@@ -1148,12 +1194,7 @@ error_not_auth:
         goto done;
     }
 
-    // Build info
-    memcpy(info, "mx-iot", 6);
-    memcpy(info + 6, challenge->ecdhServerPublicKey, sizeof(challenge->ecdhServerPublicKey));
-    memcpy(info + 6 + sizeof(challenge->ecdhServerPublicKey), challenge->ecdhClientPublicKey, sizeof(challenge->ecdhClientPublicKey));
-
-    // Build salt = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie)
+    // Build session salt = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie)
     err = sha256Start(&sha256Ctx);
     if (err != ESP_OK) {
         goto done;
@@ -1190,7 +1231,43 @@ error_not_auth:
     if (err != ESP_OK) {
         goto done;
     }
-    err = hkdfSha256DeriveKey(sharedSecret, AES_KEY_LEN, salt, sizeof(salt), info, sizeof(info), derivedKey, sizeof(derivedKey));
+    err = deriveSessionMasterKey(sharedSecret, salt, sizeof(salt), sessionMasterKey);
+    if (err != ESP_OK) {
+        goto done;
+    }
+
+    // Build WebSocket salt = SHA256("ws-login-v1" || s_nonce || c_nonce || cookie || ws_nonce)
+    err = sha256Start(&sha256Ctx);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = sha256Update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = sha256Update(&sha256Ctx, challenge->serverNonce, sizeof(challenge->serverNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = sha256Update(&sha256Ctx, challenge->clientNonce, sizeof(challenge->clientNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = sha256Update(&sha256Ctx, challengeCookie, sizeof(challengeCookie));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = sha256Update(&sha256Ctx, challenge->wsNonce, sizeof(challenge->wsNonce));
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = sha256Finish(&sha256Ctx, salt);
+    if (err != ESP_OK) {
+        goto done;
+    }
+
+    err = deriveTransportKeys(sessionMasterKey, salt, sizeof(salt), (const uint8_t *)WS_TRANSPORT_INFO,
+                              sizeof(WS_TRANSPORT_INFO) - 1, derivedKey);
     if (err != ESP_OK) {
         goto done;
     }
@@ -1210,12 +1287,12 @@ error_not_auth:
     session->userId = challenge->userId;
     session->nextRxCounter = 1;
     session->nextTxCounter = 1;
-
+    memcpy(session->sessionMasterKey, sessionMasterKey, sizeof(session->sessionMasterKey));
     memcpy(session->nonce, challenge->wsNonce, sizeof(ChallengeNonce_t));
     err = aesSetKey(&session->clientAesCtx, derivedKey, AES_KEY_LEN);
     if (err != ESP_OK) {
 error_destroy_session_and_done:
-        destroySession(session);
+        decrementSessionRefCount(session);
         goto done;
     }
     err = aesSetKey(&session->serverAesCtx, derivedKey + AES_KEY_LEN, AES_KEY_LEN);
@@ -1289,9 +1366,9 @@ done:
         challengesRemove(challengeCookie);
     }
     memset(derivedKey, 0, sizeof(derivedKey));
+    memset(sessionMasterKey, 0, sizeof(sessionMasterKey));
     memset(sharedSecret, 0, sizeof(sharedSecret));
     memset(salt, 0, sizeof(salt));
-    memset(info, 0, sizeof(info));
     wsNonceLen = challengeCookieLen = 0;
     memset(wsNonce, 0, sizeof(wsNonce));
     memset(challengeCookie, 0, sizeof(challengeCookie));
@@ -1437,38 +1514,71 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
     commandCtx.session->incomingMessageType = IncomingBufferTypeNone;
     gbReset(&commandCtx.session->ciphertextIn, false);
 
+    commandCtx.br = br_init(commandCtx.session->plaintextIn.buffer, dataAndTagLen - TAG_LEN);
+    return dispatchCommand(&commandCtx);
+}
+
+static esp_err_t dispatchCommand(CommandContext_t *commandCtx)
+{
+    incrementSessionRefCount(commandCtx->session);
+
+    if (!commandCtx->session->dispatchMtx) {
+        decrementSessionRefCount(commandCtx->session);
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(commandCtx->session->dispatchMtx, portMAX_DELAY);
+
     // Check if the only accepted command is to change the credentials
-    if (commandCtx.session->mustChangeCredentials != 0 && commandCtx.cmd != CMD_CHANGE_USER_CREDENTIALS) {
+    if (commandCtx->session->mustChangeCredentials != 0 && commandCtx->cmd != CMD_CHANGE_USER_CREDENTIALS) {
         ESP_LOGD(TAG, "The user must change their credentials before issuing other commands.");
-        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
+        esp_err_t err = closeWsWithCmdCtx(commandCtx, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
+        xSemaphoreGive(commandCtx->session->dispatchMtx);
+        decrementSessionRefCount(commandCtx->session);
+        return err;
     }
 
-    commandCtx.br = br_init(commandCtx.session->plaintextIn.buffer, dataAndTagLen - TAG_LEN);
-    switch (commandCtx.cmd) {
+    esp_err_t err;
+    switch (commandCtx->cmd) {
         case CMD_CREATE_USER:
-            return handleCreateUser(&commandCtx);
+            err = handleCreateUser(commandCtx);
+            break;
 
         case CMD_DELETE_USER:
-            return handleDeleteUser(&commandCtx);
+            err = handleDeleteUser(commandCtx);
+            break;
 
         case CMD_RESET_USER_CREDENTIALS:
-            return handleResetUserCredentials(&commandCtx);
+            err = handleResetUserCredentials(commandCtx);
+            break;
 
         case CMD_CHANGE_USER_CREDENTIALS:
-            return handleChangeUserCredentials(&commandCtx);
+            err = handleChangeUserCredentials(commandCtx);
+            break;
 
         case CMD_OTA_BEGIN:
-            return handleOtaBegin(&commandCtx);
+            err = handleOtaBegin(commandCtx);
+            break;
 
         case CMD_OTA_WRITE:
-            return handleOtaWrite(&commandCtx);
+            err = handleOtaWrite(commandCtx);
+            break;
 
         case CMD_OTA_CANCEL:
-            return handleOtaCancel(&commandCtx);
+            err = handleOtaCancel(commandCtx);
+            break;
+
+        case CMD_UDP_OPEN:
+            err = handleUdpOpen(commandCtx);
+            break;
+
+        default:
+            err = handleCustomCommand(commandCtx);
+            break;
     }
 
-    // Custom command received
-    return handleCustomCommand(&commandCtx);
+    xSemaphoreGive(commandCtx->session->dispatchMtx);
+    decrementSessionRefCount(commandCtx->session);
+    return err;
 }
 
 static esp_err_t handleCreateUser(CommandContext_t *commandCtx)
@@ -1795,6 +1905,126 @@ static esp_err_t handleOtaCancel(CommandContext_t *commandCtx)
     return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
 }
 
+static esp_err_t handleUdpOpen(CommandContext_t *commandCtx)
+{
+    const uint8_t *clientUdpNonce;
+    Sha256Context_t sha256Ctx;
+    uint8_t udpSalt[SHA256_SIZE];
+    uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN];
+    uint8_t reply[4 + 2 + 4 + CHALLENGE_NONCE_SIZE];
+    ChallengeNonce_t serverUdpNonce;
+    uint32_t udpConnectionId = 0;
+    uint8_t udpClientAesKey[AES_KEY_LEN];
+    uint8_t udpClientBaseIV[SESSION_IV_LEN];
+    uint8_t udpConnectionIdBuf[4];
+    binary_writer_t bw;
+    esp_err_t err;
+
+    if (!br_read_blob(&commandCtx->br, CHALLENGE_NONCE_SIZE, &clientUdpNonce) || commandCtx->br.len != 0) {
+        ESP_LOGD(TAG, "UDP OPEN command: invalid payload.");
+        return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
+    }
+    if (commandCtx->serverCtx->udpListenPort == 0) {
+        ESP_LOGD(TAG, "UDP OPEN command: UDP support is disabled.");
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_SUPPORTED, "UDP disabled", commandCtx->rxCounter, true);
+    }
+
+    memset(serverUdpNonce, 0, sizeof(serverUdpNonce));
+    memset(udpClientAesKey, 0, sizeof(udpClientAesKey));
+    memset(udpClientBaseIV, 0, sizeof(udpClientBaseIV));
+
+    if (randomize(serverUdpNonce, sizeof(serverUdpNonce)) != ESP_OK)
+    {
+        ESP_LOGD(TAG, "UDP OPEN command: failed to allocate UDP negotiation state.");
+        err = ESP_FAIL;
+on_error:
+        memset(serverUdpNonce, 0, sizeof(serverUdpNonce));
+        memset(udpClientAesKey, 0, sizeof(udpClientAesKey));
+        memset(udpClientBaseIV, 0, sizeof(udpClientBaseIV));
+        memset(udpSalt, 0, sizeof(udpSalt));
+        memset(derivedKey, 0, sizeof(derivedKey));
+        memset(udpConnectionIdBuf, 0, sizeof(udpConnectionIdBuf));
+        return buildAndSendErrorReply(commandCtx, err, "Failed to open UDP session", commandCtx->rxCounter, true);
+    }
+    do {
+        if (randomize((uint8_t *)&udpConnectionId, sizeof(udpConnectionId)) != ESP_OK) {
+            ESP_LOGD(TAG, "UDP OPEN command: failed to allocate UDP negotiation state.");
+            err = ESP_FAIL;
+            goto on_error;
+        }
+    }
+    while (udpConnectionId == 0);
+
+    // Build UDP salt = SHA256("udp-open-v1" || client_udp_nonce || server_udp_nonce || connection_id)
+    sha256Init(&sha256Ctx);
+    err = sha256Start(&sha256Ctx);
+    if (err == ESP_OK) {
+        err = sha256Update(&sha256Ctx, (const uint8_t *)"udp-open-v1", 11);
+        if (err == ESP_OK) {
+            err = sha256Update(&sha256Ctx, clientUdpNonce, CHALLENGE_NONCE_SIZE);
+            if (err == ESP_OK) {
+                err = sha256Update(&sha256Ctx, serverUdpNonce, sizeof(serverUdpNonce));
+                if (err == ESP_OK) {
+                    be32enc(udpConnectionIdBuf, udpConnectionId);
+                    err = sha256Update(&sha256Ctx, udpConnectionIdBuf, sizeof(udpConnectionIdBuf));
+                    if (err == ESP_OK) {
+                        err = sha256Finish(&sha256Ctx, udpSalt);
+                    }
+                }
+            }
+        }
+    }
+    sha256Done(&sha256Ctx);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "UDP OPEN command: failed to derive UDP transport material.");
+        err = ESP_FAIL;
+        goto on_error;
+    }
+
+    err = deriveTransportKeys(commandCtx->session->sessionMasterKey, udpSalt, sizeof(udpSalt), (const uint8_t *)UDP_TRANSPORT_INFO,
+                              sizeof(UDP_TRANSPORT_INFO) - 1, derivedKey);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "UDP OPEN command: failed to derive UDP transport material.");
+        err = ESP_FAIL;
+        goto on_error;
+    }
+
+    memcpy(udpClientAesKey, derivedKey, sizeof(udpClientAesKey));
+    memcpy(udpClientBaseIV, derivedKey + 2 * AES_KEY_LEN, sizeof(udpClientBaseIV));
+
+    bw = bw_init(reply, sizeof(reply));
+    if ((!bw_write_be32(&bw, ESP_OK)) ||
+        (!bw_write_be16(&bw, commandCtx->serverCtx->udpListenPort)) ||
+        (!bw_write_be32(&bw, udpConnectionId)) ||
+        (!bw_write_blob(&bw, serverUdpNonce, sizeof(serverUdpNonce))))
+    {
+        ESP_LOGD(TAG, "UDP OPEN command: failed to build reply.");
+        err = ESP_FAIL;
+        goto on_error;
+    }
+
+    ESP_LOGD(TAG, "UDP OPEN command: UDP negotiation parameters generated.");
+    memset(udpSalt, 0, sizeof(udpSalt));
+    memset(derivedKey, 0, sizeof(derivedKey));
+    memset(udpConnectionIdBuf, 0, sizeof(udpConnectionIdBuf));
+    err = buildAndSendReply(commandCtx, reply, bw.written, commandCtx->rxCounter, true);
+    if (err == ESP_OK) {
+        rwMutexLockWrite(&commandCtx->serverCtx->sessions.mtx);
+        memcpy(commandCtx->session->clientUdpNonce, clientUdpNonce, sizeof(commandCtx->session->clientUdpNonce));
+        memcpy(commandCtx->session->serverUdpNonce, serverUdpNonce, sizeof(commandCtx->session->serverUdpNonce));
+        commandCtx->session->udpConnectionId = udpConnectionId;
+        commandCtx->session->udpNextRxCounter = 1;
+        memcpy(commandCtx->session->udpClientAesKey, udpClientAesKey, sizeof(commandCtx->session->udpClientAesKey));
+        memcpy(commandCtx->session->udpClientBaseIV, udpClientBaseIV, sizeof(commandCtx->session->udpClientBaseIV));
+        rwMutexUnlockWrite(&commandCtx->serverCtx->sessions.mtx);
+    }
+
+    memset(serverUdpNonce, 0, sizeof(serverUdpNonce));
+    memset(udpClientAesKey, 0, sizeof(udpClientAesKey));
+    memset(udpClientBaseIV, 0, sizeof(udpClientBaseIV));
+    return err;
+}
+
 static esp_err_t handleCustomCommand(CommandContext_t *commandCtx)
 {
     IotCommCustomCommandEvent_t customCommandEvent;
@@ -1813,6 +2043,7 @@ static esp_err_t handleCustomCommand(CommandContext_t *commandCtx)
     event.eventType = IotCommEventTypeCustomCommand;
     event.ctx = handlerCtx;
     event.command = &customCommandEvent;
+    customCommandEvent.transportType = (commandCtx->serverHandle != nullptr) ? IotCommTransportTypeWebSocket : IotCommTransportTypeUDP;
     customCommandEvent.cmd = commandCtx->cmd;
     customCommandEvent.data = commandCtx->br.ptr;
     customCommandEvent.dataLen = commandCtx->br.len;
@@ -1894,6 +2125,10 @@ static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *
     uint8_t *toSendPtr;
     httpd_ws_type_t toSendFrameType;
     esp_err_t err;
+
+    if (commandCtx->serverHandle == nullptr) {
+        return ESP_OK;
+    }
 
     // The plain text must not be empty
     if (plaintextOutLen == 0) {
@@ -1993,6 +2228,9 @@ static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t c
 
 static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason)
 {
+    if (commandCtx->serverHandle == nullptr) {
+        return ESP_OK;
+    }
     if (commandCtx->session) {
         commandCtx->session->isClosed = 1;
     }
@@ -2012,6 +2250,9 @@ static void destroyServerCtx(void *ctx)
     if (ctx) {
         ServerContext_t *serverCtx = (ServerContext_t *)ctx;
 
+        if (activeServerCtx == serverCtx) {
+            activeServerCtx = nullptr;
+        }
         rwMutexDeinit(&serverCtx->sessions.mtx);
 
         free(serverCtx);
@@ -2026,6 +2267,13 @@ static void destroySessionCtx(void *ctx)
 
         // Remove the session from the server's session list
         rwMutexLockWrite(&serverCtx->sessions.mtx);
+        session->isClosed = 1;
+        session->udpConnectionId = 0;
+        session->udpNextRxCounter = 0;
+        memset(session->clientUdpNonce, 0, sizeof(session->clientUdpNonce));
+        memset(session->serverUdpNonce, 0, sizeof(session->serverUdpNonce));
+        memset(session->udpClientAesKey, 0, sizeof(session->udpClientAesKey));
+        memset(session->udpClientBaseIV, 0, sizeof(session->udpClientBaseIV));
         if (session->prev) {
             session->prev->next = session->next;
         }
@@ -2040,10 +2288,14 @@ static void destroySessionCtx(void *ctx)
         }
         rwMutexUnlockWrite(&serverCtx->sessions.mtx);
 
+        while (__atomic_load_n(&session->udpInFlight, __ATOMIC_ACQUIRE) != 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
         // Call session end callback
         handleSessionEnd(session);
 
-        destroySession(session);
+        decrementSessionRefCount(session);
     }
 }
 
@@ -2057,6 +2309,12 @@ static SessionInfo_t *createSession()
         return nullptr;
     }
     memset(session, 0, sizeof(SessionInfo_t));
+    session->refCount = 1;
+    session->dispatchMtx = xSemaphoreCreateMutex();
+    if (!session->dispatchMtx) {
+        free(session);
+        return nullptr;
+    }
 
     session->incomingMessageType = IncomingBufferTypeNone;
     session->plaintextIn = GB_STATIC_INIT;
@@ -2079,33 +2337,50 @@ static SessionInfo_t *createSession()
     return session;
 }
 
-static void destroySession(SessionInfo_t *session)
+static void incrementSessionRefCount(SessionInfo_t *session)
 {
-    if (session) {
+    assert(session);
+    __atomic_fetch_add(&session->refCount, 1, __ATOMIC_ACQ_REL);
+}
 
-        // Free user data
-        if (session->userData) {
-            if (session->userDataFreeFn) {
-                session->userDataFreeFn(session->userData);
-            }
-            else {
-                free(session->userData);
-            }
-        }
-
-        aesDone(&session->clientAesCtx);
-        aesDone(&session->serverAesCtx);
-
-        gbWipe(&session->plaintextIn);
-        gbReset(&session->plaintextIn, true);
-        gbWipe(&session->ciphertextIn);
-        gbReset(&session->ciphertextIn, true);
-        gbWipe(&session->ciphertextOut);
-        gbReset(&session->ciphertextOut, true);
-
-        memset(session, 0, sizeof(SessionInfo_t));
-        free(session);
+static void decrementSessionRefCount(SessionInfo_t *session)
+{
+    assert(session);
+    if (__atomic_sub_fetch(&session->refCount, 1, __ATOMIC_ACQ_REL) == 0) {
+        freeSession(session);
     }
+}
+
+static void freeSession(SessionInfo_t *session)
+{
+    assert(session);
+
+    // Free user data
+    if (session->userData) {
+        if (session->userDataFreeFn) {
+            session->userDataFreeFn(session->userData);
+        }
+        else {
+            free(session->userData);
+        }
+    }
+
+    aesDone(&session->clientAesCtx);
+    aesDone(&session->serverAesCtx);
+    memset(session->sessionMasterKey, 0, sizeof(session->sessionMasterKey));
+
+    gbWipe(&session->plaintextIn);
+    gbReset(&session->plaintextIn, true);
+    gbWipe(&session->ciphertextIn);
+    gbReset(&session->ciphertextIn, true);
+    gbWipe(&session->ciphertextOut);
+    gbReset(&session->ciphertextOut, true);
+    if (session->dispatchMtx) {
+        vSemaphoreDelete(session->dispatchMtx);
+        session->dispatchMtx = nullptr;
+    }
+    memset(session, 0, sizeof(SessionInfo_t));
+    free(session);
 }
 
 static esp_err_t readWsPacket(ServerContext_t *serverCtx, SessionInfo_t *session, httpd_req_t *req, bool *messageComplete)
@@ -2203,6 +2478,225 @@ static void otaRestartTaskMain(Task_t *task, void *arg)
     esp_restart();
 }
 
+static esp_err_t startUdpServer(ServerContext_t *serverCtx)
+{
+    struct sockaddr_in addr;
+    esp_err_t err;
+
+    stopUdpServer();
+
+    udpServerSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (udpServerSocket < 0) {
+        ESP_LOGE(TAG, "Failed to create the UDP socket.");
+        return ESP_FAIL;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(serverCtx->udpListenPort);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(udpServerSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "Failed to bind the UDP socket.");
+        close(udpServerSocket);
+        udpServerSocket = -1;
+        return ESP_FAIL;
+    }
+
+    err = taskCreate(&udpServerTask, udpServerTaskMain, "iotcomm-udp", 6144, serverCtx, 4, tskNO_AFFINITY);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start the UDP server task.");
+        close(udpServerSocket);
+        udpServerSocket = -1;
+        return err;
+    }
+
+    ESP_LOGI(TAG, "UDP server listening on port %u.", serverCtx->udpListenPort);
+    return ESP_OK;
+}
+
+static void stopUdpServer()
+{
+    if (taskIsRunning(&udpServerTask)) {
+        if (udpServerSocket >= 0) {
+            close(udpServerSocket);
+            udpServerSocket = -1;
+        }
+
+        taskJoin(&udpServerTask);
+        taskInit(&udpServerTask);
+    }
+    else if (udpServerSocket >= 0) {
+        close(udpServerSocket);
+        udpServerSocket = -1;
+    }
+}
+
+static void udpServerTaskMain(Task_t *task, void *arg)
+{
+    ServerContext_t *serverCtx = (ServerContext_t *)arg;
+    uint8_t *rxBuffer;
+
+    taskSignalContinue(task);
+
+    rxBuffer = (uint8_t *)malloc(serverCtx->maxPacketSize);
+    if (!rxBuffer) {
+        ESP_LOGE(TAG, "Failed to allocate the UDP receive buffer.");
+        return;
+    }
+
+    while (!taskShouldQuit(task)) {
+        struct sockaddr_storage srcAddr = {};
+        socklen_t srcAddrLen = sizeof(srcAddr);
+        IPAddress_t remoteAddr;
+        int len;
+
+        len = recvfrom(udpServerSocket, rxBuffer, serverCtx->maxPacketSize, 0, (struct sockaddr *)&srcAddr, &srcAddrLen);
+        if (taskShouldQuit(task)) {
+            break;
+        }
+        if (len <= 0) {
+            continue;
+        }
+
+        switch (srcAddr.ss_family) {
+            case AF_INET:
+                parseIPv4(&remoteAddr, (const struct sockaddr_in *)&srcAddr);
+                break;
+
+            case AF_INET6:
+                parseIPv6(&remoteAddr, (const struct sockaddr_in6 *)&srcAddr);
+                break;
+
+            default:
+                continue;
+        }
+
+        processUdpPacket(serverCtx, rxBuffer, (size_t)len, &remoteAddr);
+    }
+
+    free(rxBuffer);
+}
+
+static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, size_t packetLen, const IPAddress_t *remoteAddr)
+{
+    const WebSocketPacketHeader_t *hdr;
+    SessionInfo_t *session = nullptr;
+    uint32_t udpConnectionId;
+    uint32_t rxCounter;
+    uint32_t expectedRxCounter = 0;
+    uint8_t udpClientAesKey[AES_KEY_LEN];
+    uint8_t udpClientBaseIV[SESSION_IV_LEN];
+    uint8_t iv[SESSION_IV_LEN];
+    uint8_t *plaintext = nullptr;
+    size_t ciphertextLen;
+    size_t plaintextLen;
+    AesContext_t aesCtx;
+    CommandContext_t commandCtx;
+    esp_err_t err;
+
+    if (packetLen <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
+        return;
+    }
+
+    hdr = (const WebSocketPacketHeader_t *)packet;
+    if (hdr->v != VERSION) {
+        return;
+    }
+
+    udpConnectionId = be32dec(hdr->replyCounter);
+    rxCounter = be32dec(hdr->counter);
+    ciphertextLen = packetLen - sizeof(WebSocketPacketHeader_t);
+    plaintextLen = ciphertextLen - TAG_LEN;
+
+    ESP_LOGD(TAG, "Received %d bytes. conn:%u ipv6:%d %u.%u.%u.%u", packetLen, udpConnectionId,
+        remoteAddr->isIPv6 ? 1 : 0, remoteAddr->ip[0], remoteAddr->ip[1], remoteAddr->ip[2], remoteAddr->ip[3]);
+
+
+    rwMutexLockRead(&serverCtx->sessions.mtx);
+    for (SessionInfo_t *candidate = serverCtx->sessions.first; candidate; candidate = candidate->next) {
+
+        ESP_LOGD(TAG, "Candidate[%d]. conn:%u ipv6:%d %u.%u.%u.%u", candidate->isClosed, candidate->udpConnectionId,
+            candidate->addr.isIPv6 ? 1 : 0, candidate->addr.ip[0], candidate->addr.ip[1], candidate->addr.ip[2], candidate->addr.ip[3]);
+
+        if (candidate->isClosed == 0 && candidate->udpConnectionId == udpConnectionId && ipAddressEqual(&candidate->addr, remoteAddr)) {
+            session = candidate;
+            incrementSessionRefCount(session);
+            __atomic_fetch_add(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
+            expectedRxCounter = session->udpNextRxCounter;
+            memcpy(udpClientAesKey, session->udpClientAesKey, sizeof(udpClientAesKey));
+            memcpy(udpClientBaseIV, session->udpClientBaseIV, sizeof(udpClientBaseIV));
+            break;
+        }
+    }
+    rwMutexUnlockRead(&serverCtx->sessions.mtx);
+
+    if ((!session) || rxCounter < expectedRxCounter) {
+
+        ESP_LOGD(TAG, "Error 1 %u %u.", rxCounter, expectedRxCounter);
+        if (session) {
+            __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
+            decrementSessionRefCount(session);
+        }
+        return;
+    }
+
+    plaintext = (uint8_t *)malloc(plaintextLen);
+    if (!plaintext) {
+        __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
+        decrementSessionRefCount(session);
+        return;
+    }
+
+    memcpy(iv, udpClientBaseIV, sizeof(iv));
+    for (size_t i = 0; i < 4; i++) {
+        iv[SESSION_IV_LEN - i - 1] ^= (uint8_t)((rxCounter >> (i << 3)) & 0xFF);
+    }
+
+    aesInit(&aesCtx);
+    err = aesSetKey(&aesCtx, udpClientAesKey, sizeof(udpClientAesKey));
+    if (err == ESP_OK) {
+        err = aesDecrypt(&aesCtx, packet + sizeof(WebSocketPacketHeader_t), ciphertextLen, iv, sizeof(iv), nullptr, 0, plaintext);
+    }
+    aesDone(&aesCtx);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "Error 2 %d.", err);
+
+        free(plaintext);
+        __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
+        decrementSessionRefCount(session);
+        return;
+    }
+
+    ESP_LOGD(TAG, "no Error.");
+
+    memset(&commandCtx, 0, sizeof(commandCtx));
+    commandCtx.serverCtx = serverCtx;
+    commandCtx.sockfd = udpServerSocket;
+    commandCtx.session = session;
+    commandCtx.cmd = be16dec(hdr->cmd);
+    commandCtx.br = br_init(plaintext, plaintextLen);
+    commandCtx.rxCounter = rxCounter;
+    dispatchCommand(&commandCtx);
+
+    if (session->udpConnectionId == udpConnectionId && session->udpNextRxCounter <= rxCounter) {
+        if (rxCounter == UINT32_MAX) {
+            session->udpConnectionId = 0;
+            session->udpNextRxCounter = 0;
+            memset(session->clientUdpNonce, 0, sizeof(session->clientUdpNonce));
+            memset(session->serverUdpNonce, 0, sizeof(session->serverUdpNonce));
+            memset(session->udpClientAesKey, 0, sizeof(session->udpClientAesKey));
+            memset(session->udpClientBaseIV, 0, sizeof(session->udpClientBaseIV));
+        }
+        else {
+            session->udpNextRxCounter = rxCounter + 1;
+        }
+    }
+
+    free(plaintext);
+    __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
+    decrementSessionRefCount(session);
+}
+
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl)
 {
     size_t maxLen, usedLen;
@@ -2220,4 +2714,19 @@ static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen
         gbDel(buf, buf->used - (maxLen - usedLen), maxLen - usedLen);
     }
     return true;
+}
+
+static esp_err_t deriveSessionMasterKey(const uint8_t sharedSecret[P256_SHARED_SECRET_SIZE], const uint8_t *salt, size_t saltLen,
+                                        uint8_t sessionMasterKey[SESSION_AES_KEY_LEN])
+{
+    return hkdfSha256DeriveKey(sharedSecret, P256_SHARED_SECRET_SIZE, salt, saltLen, (const uint8_t *)SESSION_MASTER_INFO,
+                               sizeof(SESSION_MASTER_INFO) - 1, sessionMasterKey, SESSION_AES_KEY_LEN);
+}
+
+static esp_err_t deriveTransportKeys(const uint8_t sessionMasterKey[SESSION_AES_KEY_LEN], const uint8_t *salt, size_t saltLen,
+                                     const uint8_t *info, size_t infoLen,
+                                     uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN])
+{
+    return hkdfSha256DeriveKey(sessionMasterKey, SESSION_AES_KEY_LEN, salt, saltLen, info, infoLen, derivedKey,
+                               2 * AES_KEY_LEN + 2 * SESSION_IV_LEN);
 }

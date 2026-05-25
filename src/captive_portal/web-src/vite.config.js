@@ -8,7 +8,8 @@ import { decryptEncryptedRequest, readJsonBody } from './vite.config.helpers.js'
 export default defineConfig({
     base: './',
     build: {
-        outDir: 'dist',
+        outDir: '../web-dist',
+        emptyOutDir: true,
         assetsDir: 'assets',
         rollupOptions: {
             output: {

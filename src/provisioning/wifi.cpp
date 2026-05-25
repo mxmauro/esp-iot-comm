@@ -33,6 +33,7 @@ typedef struct dhcps_lease_s {
 
 static RundownProtection_t rp = RUNDOWN_PROTECTION_INIT_STATIC;
 static Mutex mtx;
+static Mutex cpDnsMtx;
 
 static esp_netif_t *defNetIfWifiSta = nullptr;
 static esp_netif_t *defNetIfWifiAp = nullptr;
@@ -761,10 +762,14 @@ static esp_err_t captivePortalSetupDns()
         return err;
     }
 
-    cpDnsIP[0] = esp_ip4_addr1(&ipInfo.ip);
-    cpDnsIP[1] = esp_ip4_addr2(&ipInfo.ip);
-    cpDnsIP[2] = esp_ip4_addr3(&ipInfo.ip);
-    cpDnsIP[3] = esp_ip4_addr4(&ipInfo.ip);
+    {
+        AutoMutex lock(cpDnsMtx);
+
+        cpDnsIP[0] = esp_ip4_addr1(&ipInfo.ip);
+        cpDnsIP[1] = esp_ip4_addr2(&ipInfo.ip);
+        cpDnsIP[2] = esp_ip4_addr3(&ipInfo.ip);
+        cpDnsIP[3] = esp_ip4_addr4(&ipInfo.ip);
+    }
 
     cpDnsSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (cpDnsSocket < 0) {
@@ -783,7 +788,7 @@ static esp_err_t captivePortalSetupDns()
         return ESP_FAIL;
     }
 
-    err = taskCreate(&cpDnsTask, cpDnsServerTask, "cp_dns_server", 4096, nullptr, 4, 0);
+    err = taskCreate(&cpDnsTask, cpDnsServerTask, "cp_dns_server", 4096, nullptr, 4, tskNO_AFFINITY);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start the DNS server.");
         close(cpDnsSocket);
@@ -812,13 +817,28 @@ static void cpDnsServerTask(Task_t *task, void *arg)
     while (!taskShouldQuit(task)) {
         sockaddr_in srcAddr = {};
         socklen_t srcAddrLen = sizeof(srcAddr);
+        uint8_t dnsIP[4];
+        int dnsSocket;
         int len;
         int idx;
 
-        len = recvfrom(cpDnsSocket, rxBuffer, sizeof(rxBuffer), 0, reinterpret_cast<sockaddr *>(&srcAddr), &srcAddrLen);
+        {
+            AutoMutex lock(cpDnsMtx);
+
+            dnsSocket = cpDnsSocket;
+            memcpy(dnsIP, cpDnsIP, sizeof(dnsIP));
+        }
+        if (dnsSocket < 0) {
+            break;
+        }
+
+        len = recvfrom(dnsSocket, rxBuffer, sizeof(rxBuffer), 0, reinterpret_cast<sockaddr *>(&srcAddr), &srcAddrLen);
 
         if (taskShouldQuit(task)) {
             break;
+        }
+        if (len < 0) {
+            continue;
         }
         if (len < 12) {
             continue;
@@ -849,37 +869,48 @@ static void cpDnsServerTask(Task_t *task, void *arg)
         rxBuffer[idx++] = 0x3C;
         rxBuffer[idx++] = 0x00;
         rxBuffer[idx++] = 0x04;
-        rxBuffer[idx++] = cpDnsIP[0];
-        rxBuffer[idx++] = cpDnsIP[1];
-        rxBuffer[idx++] = cpDnsIP[2];
-        rxBuffer[idx++] = cpDnsIP[3];
+        rxBuffer[idx++] = dnsIP[0];
+        rxBuffer[idx++] = dnsIP[1];
+        rxBuffer[idx++] = dnsIP[2];
+        rxBuffer[idx++] = dnsIP[3];
 
-        sendto(cpDnsSocket, rxBuffer, idx, 0, reinterpret_cast<sockaddr *>(&srcAddr), srcAddrLen);
+        sendto(dnsSocket, rxBuffer, idx, 0, reinterpret_cast<sockaddr *>(&srcAddr), srcAddrLen);
     }
 }
 
 static void stopCaptivePortal()
 {
+    int dnsSocketToClose = -1;
+
     if (cpHttpServer) {
         httpd_stop(cpHttpServer);
         cpHttpServer = nullptr;
     }
 
+    {
+        AutoMutex lock(cpDnsMtx);
+
+        dnsSocketToClose = cpDnsSocket;
+        cpDnsSocket = -1;
+    }
+
     if (taskIsRunning(&cpDnsTask)) {
-        if (cpDnsSocket >= 0) {
-            close(cpDnsSocket);
-            cpDnsSocket = -1;
+        if (dnsSocketToClose >= 0) {
+            close(dnsSocketToClose);
         }
 
         taskJoin(&cpDnsTask);
         taskInit(&cpDnsTask);
     }
-    else if (cpDnsSocket >= 0) {
-        close(cpDnsSocket);
-        cpDnsSocket = -1;
+    else if (dnsSocketToClose >= 0) {
+        close(dnsSocketToClose);
     }
 
-    memset(cpDnsIP, 0, sizeof(cpDnsIP));
+    {
+        AutoMutex lock(cpDnsMtx);
+
+        memset(cpDnsIP, 0, sizeof(cpDnsIP));
+    }
     memset(cpDhcpUri, 0, sizeof(cpDhcpUri));
 
     if (cpDeinitHandler) {

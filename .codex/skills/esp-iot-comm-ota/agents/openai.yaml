@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP IoT Comm OTA"
+  short_description: "Firmware update and rollback-confirmation work"
+  default_prompt: "Use this skill for OTA helper changes and OTA command integration, especially when update state, cancellation, finalization, rollback, or reboot behavior are involved."

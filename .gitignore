@@ -1,6 +1,9 @@
 *.~*
 .DS_Store
 .cache
+.codex/*
+!.codex/skills/
+!.codex/skills/**
 .vscode
 build
 managed_components

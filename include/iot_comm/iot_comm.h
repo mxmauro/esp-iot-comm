@@ -51,6 +51,16 @@
 // CMD_OTA_CANCEL (0x7FF7)
 //     no payload
 //
+// CMD_UDP_OPEN (0x7FF8)
+//     client UDP nonce: raw 16-byte nonce
+//     reply:
+//           UDP listen port: 2-byte big-endian port
+//         UDP connection id: 4-byte big-endian opaque identifier
+//           server UDP nonce: raw 16-byte nonce
+//
+// UDP data packets reuse the encrypted binary packet header layout:
+//     version(1) | cmd(2) | reserved(1) | udpConnectionId(4) | counter(4) | reserved(4)
+//
 
 // Websocket close codes
 #define WS_CLOSE_NORMAL                           1000  // Normal closure; connection completed successfully
@@ -93,11 +103,19 @@ typedef esp_err_t (*IotCommSaveUsersToStorageCallback_t)(const void *data, size_
 // Opaque handle used to identify an active client session.
 typedef void* IotCommSessionHandle_t;
 
+// Identifies which transport delivered a command.
+typedef enum IotCommTransportType_e {
+    IotCommTransportTypeUnknown = 0,
+    IotCommTransportTypeWebSocket = 1,
+    IotCommTransportTypeUDP = 2
+} IotCommTransportType_t;
+
 // Carries the payload associated with a custom command event.
 typedef struct IotCommCustomCommandEvent_s {
-    uint16_t      cmd;
-    const uint8_t *data;
-    size_t        dataLen;
+    IotCommTransportType_t transportType;
+    uint16_t               cmd;
+    const uint8_t          *data;
+    size_t                 dataLen;
 } IotCommCustomCommandEvent_t;
 
 // Describes an event emitted by the IoT communication server.
@@ -156,6 +174,7 @@ typedef struct IotCommConfig_s {
 // Defines the network settings for the embedded server.
 typedef struct IotCommServerConfig_s {
     uint16_t listenPort;
+    uint16_t udpListenPort;
     uint16_t maxConnections;
     uint32_t maxPacketSize;
 } IotCommServerConfig_t;
@@ -234,6 +253,7 @@ static inline IotCommServerConfig_t iotCommDefaultServerConfig()
     memset(&cfg, 0, sizeof(cfg));
 
     cfg.listenPort = 80;
+    cfg.udpListenPort = 0;
     cfg.maxConnections = IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2; // +2 for unauthenticated session
 
     return cfg;

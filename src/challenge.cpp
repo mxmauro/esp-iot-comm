@@ -57,7 +57,7 @@ void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Chal
 {
     uint64_t now = now_ms();
     uint64_t oldestSlotTime;
-    size_t i, oldest;
+    size_t i, toReplace;
 
     if (now == 0) {
         now = 1;
@@ -66,38 +66,35 @@ void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Chal
     // First try to find existing slot for this IP (replace old nonce)
     for (i = 0; i < maxChallengesCount; i++) {
         if (ipAddressEqual(&challenges[i].clientIP, addr)) {
-            memcpy(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t));
-            memcpy(&challenges[i].challenge, challenge, sizeof(Challenge_t));
-            challenges[i].createdAt = now;
-            return;
+            toReplace = i;
+            goto do_replacement_skip_ip;
         }
     }
 
     // Find empty or expired slot
     for (i = 0; i < maxChallengesCount; i++) {
         if (challenges[i].createdAt == 0 || now - challenges[i].createdAt > windowSizeInMs) {
-            memcpy(&challenges[i].clientIP, addr, sizeof(IPAddress_t));
-            memcpy(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t));
-            memcpy(&challenges[i].challenge, challenge, sizeof(Challenge_t));
-            challenges[i].createdAt = now;
-            return;
+            toReplace = i;
+            goto do_replacement;
         }
     }
 
     // If still no slot, replace oldest
-    oldest = 0;
+    toReplace = 0;
     oldestSlotTime = challenges[0].createdAt;
     for (i = 1; i < maxChallengesCount; i++) {
         if (challenges[i].createdAt < oldestSlotTime) {
-            oldest = i;
+            toReplace = i;
             oldestSlotTime = challenges[i].createdAt;
         }
     }
 
-    memcpy(&challenges[oldest].clientIP, addr, sizeof(IPAddress_t));
-    memcpy(challenges[oldest].cookie, cookie, sizeof(ChallengeCookie_t));
-    memcpy(&challenges[oldest].challenge, challenge, sizeof(Challenge_t));
-    challenges[oldest].createdAt = now;
+do_replacement:
+    memcpy(&challenges[toReplace].clientIP, addr, sizeof(IPAddress_t));
+do_replacement_skip_ip:
+    memcpy(challenges[toReplace].cookie, cookie, sizeof(ChallengeCookie_t));
+    memcpy(&challenges[toReplace].challenge, challenge, sizeof(Challenge_t));
+    challenges[toReplace].createdAt = now;
 }
 
 void challengesRemove(const ChallengeCookie_t cookie)

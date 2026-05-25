@@ -13,11 +13,32 @@
 
 // -----------------------------------------------------------------------------
 
+static constexpr size_t kChallengeCookieSize = 12;
+static constexpr size_t kChallengeNonceSize = 16;
+
 static void fillPattern(uint8_t *dest, size_t len, uint8_t seed)
 {
     for (size_t i = 0; i < len; i++) {
         dest[i] = (uint8_t)(seed + i * 13);
     }
+}
+
+static void deriveWsLoginSalt(const uint8_t serverNonce[kChallengeNonceSize], const uint8_t clientNonce[kChallengeNonceSize],
+                              const uint8_t cookie[kChallengeCookieSize], const uint8_t *wsNonce, uint8_t out[SHA256_SIZE])
+{
+    Sha256Context_t sha256Ctx;
+
+    sha256Init(&sha256Ctx);
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Start(&sha256Ctx));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, serverNonce, kChallengeNonceSize));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, clientNonce, kChallengeNonceSize));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, cookie, kChallengeCookieSize));
+    if (wsNonce) {
+        TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, wsNonce, kChallengeNonceSize));
+    }
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Finish(&sha256Ctx, out));
+    sha256Done(&sha256Ctx);
 }
 
 TEST_CASE("constantTimeCompare reports equality and inequality", "[crypto]")
@@ -196,6 +217,92 @@ TEST_CASE("ecdh shared secret matches on both sides", "[crypto]")
 
     p256KeyPairDone(&bob);
     p256KeyPairDone(&alice);
+}
+
+TEST_CASE("session master key derives WebSocket transport material", "[crypto]")
+{
+    static const char sessionInfo[] = "mx-iot-session-master-v1";
+    static const char wsInfo[] = "mx-iot-ws-v1";
+    P256KeyPair_t alice;
+    P256KeyPair_t bob;
+    uint8_t alicePublic[P256_PUBLIC_KEY_SIZE];
+    uint8_t bobPublic[P256_PUBLIC_KEY_SIZE];
+    uint8_t aliceSecret[P256_SHARED_SECRET_SIZE];
+    uint8_t bobSecret[P256_SHARED_SECRET_SIZE];
+    uint8_t serverNonce[kChallengeNonceSize];
+    uint8_t clientNonce[kChallengeNonceSize];
+    uint8_t wsNonce[kChallengeNonceSize];
+    uint8_t cookie[kChallengeCookieSize];
+    uint8_t sessionSalt[SHA256_SIZE];
+    uint8_t wsSalt[SHA256_SIZE];
+    uint8_t aliceSessionMasterKey[32];
+    uint8_t bobSessionMasterKey[32];
+    uint8_t aliceWsMaterial[2 * 32 + 2 * 12];
+    uint8_t bobWsMaterial[2 * 32 + 2 * 12];
+
+    fillPattern(serverNonce, sizeof(serverNonce), 0x11);
+    fillPattern(clientNonce, sizeof(clientNonce), 0x22);
+    fillPattern(wsNonce, sizeof(wsNonce), 0x33);
+    fillPattern(cookie, sizeof(cookie), 0x44);
+    deriveWsLoginSalt(serverNonce, clientNonce, cookie, nullptr, sessionSalt);
+    deriveWsLoginSalt(serverNonce, clientNonce, cookie, wsNonce, wsSalt);
+
+    p256KeyPairInit(&alice);
+    p256KeyPairInit(&bob);
+
+    TEST_ASSERT_EQUAL(ESP_OK, ecdhGeneratePair(&alice));
+    TEST_ASSERT_EQUAL(ESP_OK, ecdhGeneratePair(&bob));
+    TEST_ASSERT_EQUAL(ESP_OK, p256SavePublicKey(&alice, alicePublic));
+    TEST_ASSERT_EQUAL(ESP_OK, p256SavePublicKey(&bob, bobPublic));
+    TEST_ASSERT_EQUAL(ESP_OK, p256LoadPublicKey(&alice, bobPublic));
+    TEST_ASSERT_EQUAL(ESP_OK, p256LoadPublicKey(&bob, alicePublic));
+    TEST_ASSERT_EQUAL(ESP_OK, ecdhComputeSharedSecret(&alice, aliceSecret));
+    TEST_ASSERT_EQUAL(ESP_OK, ecdhComputeSharedSecret(&bob, bobSecret));
+
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(aliceSecret, sizeof(aliceSecret), sessionSalt, sizeof(sessionSalt),
+                                                  (const uint8_t *)sessionInfo, sizeof(sessionInfo) - 1,
+                                                  aliceSessionMasterKey, sizeof(aliceSessionMasterKey)));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(bobSecret, sizeof(bobSecret), sessionSalt, sizeof(sessionSalt),
+                                                  (const uint8_t *)sessionInfo, sizeof(sessionInfo) - 1,
+                                                  bobSessionMasterKey, sizeof(bobSessionMasterKey)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(aliceSessionMasterKey, bobSessionMasterKey, sizeof(aliceSessionMasterKey));
+
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(aliceSessionMasterKey, sizeof(aliceSessionMasterKey), wsSalt, sizeof(wsSalt),
+                                                  (const uint8_t *)wsInfo, sizeof(wsInfo) - 1,
+                                                  aliceWsMaterial, sizeof(aliceWsMaterial)));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(bobSessionMasterKey, sizeof(bobSessionMasterKey), wsSalt, sizeof(wsSalt),
+                                                  (const uint8_t *)wsInfo, sizeof(wsInfo) - 1,
+                                                  bobWsMaterial, sizeof(bobWsMaterial)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(aliceWsMaterial, bobWsMaterial, sizeof(aliceWsMaterial));
+
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(aliceSessionMasterKey, aliceWsMaterial, sizeof(aliceSessionMasterKey)));
+
+    p256KeyPairDone(&bob);
+    p256KeyPairDone(&alice);
+}
+
+TEST_CASE("UDP transport derivation is separated from WebSocket material", "[crypto]")
+{
+    static const char wsInfo[] = "mx-iot-ws-v1";
+    static const char udpInfo[] = "mx-iot-udp-v1";
+    uint8_t sessionMasterKey[32];
+    uint8_t wsSalt[SHA256_SIZE];
+    uint8_t udpSalt[SHA256_SIZE];
+    uint8_t wsMaterial[2 * 32 + 2 * 12];
+    uint8_t udpMaterial[2 * 32 + 2 * 12];
+
+    fillPattern(sessionMasterKey, sizeof(sessionMasterKey), 0x51);
+    fillPattern(wsSalt, sizeof(wsSalt), 0x61);
+    fillPattern(udpSalt, sizeof(udpSalt), 0x71);
+
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sessionMasterKey, sizeof(sessionMasterKey), wsSalt, sizeof(wsSalt),
+                                                  (const uint8_t *)wsInfo, sizeof(wsInfo) - 1,
+                                                  wsMaterial, sizeof(wsMaterial)));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sessionMasterKey, sizeof(sessionMasterKey), udpSalt, sizeof(udpSalt),
+                                                  (const uint8_t *)udpInfo, sizeof(udpInfo) - 1,
+                                                  udpMaterial, sizeof(udpMaterial)));
+
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(wsMaterial, udpMaterial, sizeof(wsMaterial)));
 }
 
 TEST_CASE("ecdsa sign and verify succeed", "[crypto]")

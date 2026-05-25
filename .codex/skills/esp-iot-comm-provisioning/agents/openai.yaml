@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP IoT Comm Provisioning"
+  short_description: "Wi-Fi manager and captive portal onboarding work"
+  default_prompt: "Use this skill for provisioning flow changes, especially when SoftAP/STA transitions, captive portal request handling, hostname setup, or root-key onboarding are involved."

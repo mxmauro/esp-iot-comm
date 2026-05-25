@@ -31,5 +31,6 @@ TEST_CASE("iotCommDefaultServerConfig returns expected defaults", "[iot_comm]")
     IotCommServerConfig_t cfg = iotCommDefaultServerConfig();
 
     TEST_ASSERT_EQUAL_UINT16(80, cfg.listenPort);
+    TEST_ASSERT_EQUAL_UINT16(0, cfg.udpListenPort);
     TEST_ASSERT_EQUAL_UINT16(IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2, cfg.maxConnections);
 }

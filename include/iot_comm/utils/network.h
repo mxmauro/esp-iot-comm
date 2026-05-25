@@ -37,7 +37,11 @@ void parseIPv6(IPAddress_t *addr, const struct sockaddr_in6 *in);
 // Parses an IPv4 or IPv6 address string into the library representation.
 bool parseIP(IPAddress_t *addr, const char *s, size_t len = (size_t)-1);
 
+// Converts an IPv6 to IPv4 and returns true if conversion could be done or the address already was IPv4.
+bool toIPv4(IPAddress_t *addr);
+
 // Compares two IP addresses for exact equality.
+// NOTE: This function does NOT normalize embedded IPv4 addresses on IPv6 ones.
 bool ipAddressEqual(const IPAddress_t *addr1, const IPAddress_t *addr2);
 
 // Validates whether a string can be used as a single-label device hostname.
