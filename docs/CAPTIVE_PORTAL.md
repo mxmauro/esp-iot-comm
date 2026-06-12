@@ -39,8 +39,8 @@ Once your callback receives the provisioning config, the usual handoff looks lik
 
 ## UI Source Layout
 
-* The editable frontend sources live under `src/captive_portal/web/`.
-* The files under `src/captive_portal/web/dist/` are generated assets embedded by the component.
+* The editable frontend sources live under `src/captive_portal/web-src/`.
+* The files under `src/captive_portal/web-dist/` are generated assets embedded by the component.
 * When changing the portal UI, edit the sources and rebuild the embedded assets instead of patching `dist/` by hand.
 
 ## Related APIs

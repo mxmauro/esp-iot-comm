@@ -1,0 +1,3 @@
+interface:
+  display_name: "Esp Iot Comm Docs API"
+  short_description: "Sync public API changes with README and docs"

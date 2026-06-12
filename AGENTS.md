@@ -42,8 +42,8 @@
 - Keep Linux-simulator exclusions, component registration structure, embedded web assets, and dependency declarations consistent with the existing `CMakeLists.txt` and `idf_component.yml`.
 
 ## Captive portal web UI
-- The web UI sources live under `src/captive_portal/web/`. Preserve the existing Svelte, Vite, and ES module structure when touching that area.
-- Source files are the editable ones under `src/captive_portal/web/`; the files under `src/captive_portal/web/dist/` are build artifacts embedded by the component.
+- The web UI sources live under `src/captive_portal/web-src/`. Preserve the existing Svelte, Vite, and ES module structure when touching that area.
+- Source files are the editable ones under `src/captive_portal/web-src/`; the files under `src/captive_portal/web-dist/` are build artifacts embedded by the component.
 - If a task changes the captive portal UI behavior or assets, update the source files and regenerate the embedded `dist/` outputs instead of hand-editing the built files.
 - Keep frontend changes focused. Do not churn formatting across the web app when only a small behavioral change is needed.
 

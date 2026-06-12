@@ -1,0 +1,3 @@
+interface:
+  display_name: "Esp Iot Comm Packaging Release"
+  short_description: "Keep CMake embeds and component packaging aligned"
