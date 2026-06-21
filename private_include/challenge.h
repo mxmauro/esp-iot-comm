@@ -7,13 +7,17 @@
 
 #define CHALLENGE_COOKIE_SIZE 12
 #define CHALLENGE_NONCE_SIZE  16
+#define CHALLENGE_WS_TICKET_SIZE 16
 
 // -----------------------------------------------------------------------------
 
 typedef uint8_t ChallengeCookie_t[CHALLENGE_COOKIE_SIZE];
 typedef uint8_t ChallengeNonce_t[CHALLENGE_NONCE_SIZE];
+typedef uint8_t ChallengeWsTicket_t[CHALLENGE_WS_TICKET_SIZE];
 
 typedef struct Challenge_s {
+    ChallengeCookie_t token;
+    ChallengeWsTicket_t wsTicket;
     uint32_t userId;
     bool verified;
     ChallengeNonce_t serverNonce;
@@ -37,7 +41,8 @@ void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Chal
 void challengesRemove(const ChallengeCookie_t cookie);
 void challengesRemoveAll();
 
-Challenge_t* challengesFind(const ChallengeCookie_t cookie, const IPAddress_t *addr);
+Challenge_t* challengesFindByToken(const ChallengeCookie_t cookie, const IPAddress_t *addr);
+Challenge_t* challengesFindByWsTicket(const ChallengeWsTicket_t ticket, const IPAddress_t *addr);
 
 #ifdef __cplusplus
 }

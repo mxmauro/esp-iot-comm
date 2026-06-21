@@ -5,6 +5,7 @@ if(${target} STREQUAL "linux")
 endif()
 
 set(srcs "src/challenge.cpp"
+         "src/device_identity.cpp"
          "src/iot_comm.cpp"
          "src/rate_limit.cpp"
          "src/user.cpp"

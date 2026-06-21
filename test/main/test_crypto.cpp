@@ -190,6 +190,30 @@ TEST_CASE("p256 public and private key base64 roundtrip works", "[crypto]")
     p256KeyPairDone(&original);
 }
 
+TEST_CASE("p256DerivePublicKey rebuilds the public key from the private key", "[crypto]")
+{
+    P256KeyPair_t original;
+    P256KeyPair_t derived;
+    uint8_t originalPublicKey[P256_PUBLIC_KEY_SIZE];
+    uint8_t originalPrivateKey[P256_PRIVATE_KEY_SIZE];
+    uint8_t derivedPublicKey[P256_PUBLIC_KEY_SIZE];
+
+    p256KeyPairInit(&original);
+    p256KeyPairInit(&derived);
+
+    TEST_ASSERT_EQUAL(ESP_OK, ecdsaGeneratePair(&original));
+    TEST_ASSERT_EQUAL(ESP_OK, p256SavePublicKey(&original, originalPublicKey));
+    TEST_ASSERT_EQUAL(ESP_OK, p256SavePrivateKey(&original, originalPrivateKey));
+
+    TEST_ASSERT_EQUAL(ESP_OK, p256LoadPrivateKey(&derived, originalPrivateKey));
+    TEST_ASSERT_EQUAL(ESP_OK, p256DerivePublicKey(&derived));
+    TEST_ASSERT_EQUAL(ESP_OK, p256SavePublicKey(&derived, derivedPublicKey));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(originalPublicKey, derivedPublicKey, sizeof(originalPublicKey));
+
+    p256KeyPairDone(&derived);
+    p256KeyPairDone(&original);
+}
+
 TEST_CASE("ecdh shared secret matches on both sides", "[crypto]")
 {
     P256KeyPair_t alice;
@@ -303,6 +327,27 @@ TEST_CASE("UDP transport derivation is separated from WebSocket material", "[cry
                                                   udpMaterial, sizeof(udpMaterial)));
 
     TEST_ASSERT_NOT_EQUAL(0, memcmp(wsMaterial, udpMaterial, sizeof(wsMaterial)));
+}
+
+TEST_CASE("auth envelope derivation is separated from session material", "[crypto]")
+{
+    static const char sessionInfo[] = "mx-iot-session-master-v1";
+    static const char authInfo[] = "mx-iot-auth-v1";
+    uint8_t sharedSecret[P256_SHARED_SECRET_SIZE];
+    uint8_t salt[SHA256_SIZE];
+    uint8_t sessionMasterKey[32];
+    uint8_t authKey[32];
+
+    fillPattern(sharedSecret, sizeof(sharedSecret), 0x12);
+    fillPattern(salt, sizeof(salt), 0x34);
+
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), salt, sizeof(salt),
+                                                  (const uint8_t *)sessionInfo, sizeof(sessionInfo) - 1,
+                                                  sessionMasterKey, sizeof(sessionMasterKey)));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), salt, sizeof(salt),
+                                                  (const uint8_t *)authInfo, sizeof(authInfo) - 1,
+                                                  authKey, sizeof(authKey)));
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(sessionMasterKey, authKey, sizeof(authKey)));
 }
 
 TEST_CASE("ecdsa sign and verify succeed", "[crypto]")

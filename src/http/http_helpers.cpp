@@ -7,14 +7,53 @@ static bool getIpFromPeer(int sockfd, IPAddress_t *out);
 
 // -----------------------------------------------------------------------------
 
-esp_err_t httpSendDefaultCORS(httpd_req_t *req)
+esp_err_t httpGetCORSOrigin(httpd_req_t *req, char **originOut)
+{
+    size_t originLen;
+    char *origin;
+    esp_err_t err;
+
+    assert(req);
+    assert(originOut);
+
+    *originOut = nullptr;
+
+    originLen = httpd_req_get_hdr_value_len(req, "Origin");
+    if (originLen == 0) {
+        return ESP_OK;
+    }
+
+    origin = (char *)malloc(originLen + 1);
+    if (!origin) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = httpd_req_get_hdr_value_str(req, "Origin", origin, originLen + 1);
+    if (err != ESP_OK) {
+        memset(origin, 0, originLen + 1);
+        free(origin);
+        return err;
+    }
+
+    *originOut = origin;
+    return ESP_OK;
+}
+
+void httpFreeCORSOrigin(char *origin)
+{
+    if (origin) {
+        memset(origin, 0, strlen(origin));
+        free(origin);
+    }
+}
+
+esp_err_t httpSendDefaultCORS(httpd_req_t *req, const char *origin)
 {
     esp_err_t err;
 
     assert(req);
 
-    // NOTE: No need to save values until response is sent because they are constant values.
-    err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", (origin && *origin != 0) ? origin : "*");
     if (err == ESP_OK) {
         err = httpd_resp_set_hdr(req, "Vary", "Origin");
     }
@@ -24,7 +63,7 @@ esp_err_t httpSendDefaultCORS(httpd_req_t *req)
     return err;
 }
 
-esp_err_t httpSendPreflightResponse(httpd_req_t *req)
+esp_err_t httpSendPreflightResponse(httpd_req_t *req, const char *origin)
 {
     esp_err_t err;
 
@@ -32,12 +71,17 @@ esp_err_t httpSendPreflightResponse(httpd_req_t *req)
 
     err = httpd_resp_set_status(req, "204 No Content");
     if (err == ESP_OK) {
-        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", (origin && *origin != 0) ? origin : "*");
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_set_hdr(req, "Vary", "Origin");
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
         if (err == ESP_OK) {
-            err = httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+            err = httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
             if (err == ESP_OK) {
-                err = httpd_resp_set_hdr(req, "Access-Control-Allow-Headers",
-                                         "Content-Type, Authorization");
+                err = httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
                 if (err == ESP_OK) {
                     err = httpd_resp_send(req, nullptr, 0);
                 }

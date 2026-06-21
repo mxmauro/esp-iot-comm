@@ -13,8 +13,6 @@ static void setupTask(void *arg);
 static void iotCommEventHandler(IotCommEvent_t *event);
 static void wifiMgrEventHandler(WifiMgrEvent_t event, void *ctx);
 static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig_t *creds, void *ctx);
-static esp_err_t loadUsersFromStorage(void *dest, size_t destLen, void *ctx);
-static esp_err_t saveUsersToStorage(const void *data, size_t dataLen, void *ctx);
 
 // -----------------------------------------------------------------------------
 
@@ -33,8 +31,16 @@ static void setupTask(void *arg)
 
     iotCommConfig = iotCommDefaultConfig();
     iotCommConfig.handler = iotCommEventHandler;
-    iotCommConfig.storage.load = loadUsersFromStorage;
-    iotCommConfig.storage.save = saveUsersToStorage;
+    iotCommConfig.storage.load = [](IotCommStorageItemType_t itemType, void *dest, size_t destLen, void *ctx) ->esp_err_t
+    {
+        // We return not found because we always initialize as empty
+        return ESP_ERR_NOT_FOUND;
+    };
+    iotCommConfig.storage.save = [](IotCommStorageItemType_t itemType, const void *data, size_t dataLen, void *ctx) ->esp_err_t
+    {
+        // This demo does not store anything
+        return ESP_OK;
+    };
     ESP_ERROR_CHECK(iotCommInit(&iotCommConfig));
 
     memset(&wifiConfig, 0, sizeof(wifiConfig));
@@ -92,16 +98,4 @@ static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig
         err = wifiMgrStartSTA();
     }
     return err;
-}
-
-static esp_err_t loadUsersFromStorage(void *dest, size_t destLen, void *ctx)
-{
-    // We return not found because we always initialize as empty
-    return ESP_ERR_NOT_FOUND;
-}
-
-static esp_err_t saveUsersToStorage(const void *data, size_t dataLen, void *ctx)
-{
-    // This demo does not store anything
-    return ESP_OK;
 }

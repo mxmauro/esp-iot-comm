@@ -29,6 +29,7 @@
 // NOTE: Command in the 0x7F00-0x7FFF range are reserved for current and future use.
 //
 // CMD_CREATE_USER (0x7FF1)
+//          flags: bitmask byte. Bit 0 = MustChangeCredentialsOnNextLogin
 //           name: NUL-terminated string
 //     public key: raw 65-byte uncompressed ECDSA public key
 //
@@ -95,10 +96,16 @@ typedef void (*IotCommUserDataFreeFunc_t)(void *userData);
 // Provides the initial root user public key when no stored users are available.
 typedef esp_err_t (*IotCommGetDefaultRootUserPublicKeyCallback_t)(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void *ctx);
 
-// Loads the serialized user database from persistent storage.
-typedef esp_err_t (*IotCommLoadUsersFromStorageCallback_t)(void *dest, size_t destLen, void *ctx);
-// Saves the serialized user database to persistent storage.
-typedef esp_err_t (*IotCommSaveUsersToStorageCallback_t)(const void *data, size_t dataLen, void *ctx);
+// Identifies the library-managed state item being loaded or saved.
+typedef enum IotCommStorageItemType_e {
+    IotCommStorageItemTypeUsers = 1,
+    IotCommStorageItemTypeDeviceIdentityKeyPair = 2
+} IotCommStorageItemType_t;
+
+// Loads a serialized library state item from persistent storage.
+typedef esp_err_t (*IotCommLoadFromStorageCallback_t)(IotCommStorageItemType_t itemType, void *dest, size_t destLen, void *ctx);
+// Saves a serialized library state item to persistent storage.
+typedef esp_err_t (*IotCommSaveToStorageCallback_t)(IotCommStorageItemType_t itemType, const void *data, size_t dataLen, void *ctx);
 
 // Opaque handle used to identify an active client session.
 typedef void* IotCommSessionHandle_t;
@@ -134,13 +141,13 @@ typedef struct IotCommUsersDefaultRootKeyProvider_s {
     void                                         *ctx;
 } IotCommUsersDefaultRootKeyProvider_t;
 
-// Collects the callbacks used to persist and restore users.
-typedef struct IotCommUsersStorageCallbacks_s {
+// Collects the callbacks used to persist and restore users and others.
+typedef struct IotCommStorageCallbacks_s {
     // NOTE: If load returns an error different from ESP_ERR_NOT_FOUND, it
     //       will be treated as a fatal error.
-    IotCommLoadUsersFromStorageCallback_t load;
-    IotCommSaveUsersToStorageCallback_t   save;
-    void                                 *ctx;
+    IotCommLoadFromStorageCallback_t load;
+    IotCommSaveToStorageCallback_t   save;
+    void                             *ctx;
 } IotCommStorageCallbacks_t;
 
 // Configures request throttling for authentication and command traffic.
@@ -189,6 +196,9 @@ extern "C" {
 esp_err_t iotCommInit(IotCommConfig_t *config);
 // Releases resources owned by the IoT communication subsystem.
 void iotCommDeinit();
+
+// Returns the persisted device identity public key used to authenticate the server handshake.
+esp_err_t iotCommGetDeviceIdentityPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
 
 // Starts the IoT communication server with the given listener configuration.
 esp_err_t iotCommStartServer(IotCommServerConfig_t *config);

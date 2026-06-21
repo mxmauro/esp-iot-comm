@@ -74,6 +74,8 @@ esp_err_t p256SavePublicKey(P256KeyPair_t *pair, uint8_t publicKey[P256_PUBLIC_K
 esp_err_t p256LoadPrivateKey(P256KeyPair_t *pair, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE]);
 // Exports the private key from a key pair container in raw form.
 esp_err_t p256SavePrivateKey(P256KeyPair_t *pair, uint8_t privateKey[P256_PRIVATE_KEY_SIZE]);
+// Derives the public key from the loaded private key and stores it in the same pair.
+esp_err_t p256DerivePublicKey(P256KeyPair_t *pair);
 
 // Loads a base64-encoded public key into a key pair container.
 esp_err_t p256LoadPublicKeyB64(P256KeyPair_t *pair, const char *publicKey, size_t publicKeyLen, bool isUrl);

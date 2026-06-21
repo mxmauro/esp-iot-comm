@@ -28,7 +28,7 @@ typedef struct User_s {
 
 static User_t *users = nullptr; // User 0 is the administrator
 static size_t maxUsersCount = 0;
-static SaveUsersToStorageCallback_t saveUsers = nullptr;
+static IotCommSaveToStorageCallback_t saveUsers = nullptr;
 static void *saveUsersCtx = nullptr;
 
 // -----------------------------------------------------------------------------
@@ -37,7 +37,8 @@ static esp_err_t saveAllUsers();
 static User_t* findUserByName(const char *name, size_t nameLen);
 static User_t* findUserByID(uint32_t id);
 static bool isUserPublicKeySet(User_t* user);
-static void internalCreateUser(User_t *user, const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
+static void internalCreateUser(User_t *user, uint8_t flags, const char *name, size_t nameLen,
+                               const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
 static esp_err_t internalChangeUserCredentials(User_t *user, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE], bool force, bool isReset);
 static size_t getUserNameLength(const User_t *user);
 static uint8_t getMinuteMod64();
@@ -70,7 +71,7 @@ esp_err_t usersInit(UsersConfig_t *config)
     saveUsers = config->storage.save;
     saveUsersCtx = config->storage.ctx;
 
-    err = config->storage.load(users, usersDataLen, config->storage.ctx);
+    err = config->storage.load(IotCommStorageItemTypeUsers, users, usersDataLen, config->storage.ctx);
     if (err != ESP_OK) {
         uint8_t tempPublicKey[P256_PUBLIC_KEY_SIZE];
 
@@ -98,7 +99,7 @@ esp_err_t usersInit(UsersConfig_t *config)
         }
 
         // Create root user
-        internalCreateUser(&users[0], "root", 4, tempPublicKey);
+        internalCreateUser(&users[0], USER_CREATE_FLAG_MUST_CHANGE_CREDENTIALS_ON_NEXT_LOGIN, "root", 4, tempPublicKey);
 
         memset(tempPublicKey, 0, sizeof(tempPublicKey));
 
@@ -126,7 +127,7 @@ void usersDeinit()
     maxUsersCount = 0;
 }
 
-uint32_t userCreate(const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
+uint32_t userCreate(uint8_t flags, const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
     User_t *user;
     esp_err_t err;
@@ -154,7 +155,7 @@ uint32_t userCreate(const char *name, size_t nameLen, const uint8_t publicKey[P2
     }
 
     // Add new user
-    internalCreateUser(user, name, nameLen, publicKey);
+    internalCreateUser(user, flags, name, nameLen, publicKey);
 
     // Save users
     err = saveAllUsers();
@@ -341,7 +342,7 @@ static esp_err_t saveAllUsers()
 {
     esp_err_t err;
 
-    err = saveUsers(users, (1 + maxUsersCount) * sizeof(User_t), saveUsersCtx);
+    err = saveUsers(IotCommStorageItemTypeUsers, users, (1 + maxUsersCount) * sizeof(User_t), saveUsersCtx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to save users to storage. Error: %d.", err);
     }
@@ -384,7 +385,8 @@ static bool isUserPublicKeySet(User_t* user)
     return (val != 0) ? true : false;
 }
 
-static void internalCreateUser(User_t *user, const char *name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
+static void internalCreateUser(User_t *user, uint8_t flags, const char *name, size_t nameLen,
+                               const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
     uint64_t ui64;
     uint32_t ui32;
@@ -393,7 +395,7 @@ static void internalCreateUser(User_t *user, const char *name, size_t nameLen, c
     memcpy(user->name, name, nameLen);
     memcpy(user->publicKey, publicKey, P256_PUBLIC_KEY_SIZE);
     user->inUse = 1;
-    user->mustChangeCredentials = 1;
+    user->mustChangeCredentials = (flags & USER_CREATE_FLAG_MUST_CHANGE_CREDENTIALS_ON_NEXT_LOGIN) ? 1 : 0;
 
     ui32 = esp_random();
     ui64 = now_ms();

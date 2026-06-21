@@ -93,6 +93,7 @@ do_replacement:
     memcpy(&challenges[toReplace].clientIP, addr, sizeof(IPAddress_t));
 do_replacement_skip_ip:
     memcpy(challenges[toReplace].cookie, cookie, sizeof(ChallengeCookie_t));
+    memcpy(challenge->token, cookie, sizeof(challenge->token));
     memcpy(&challenges[toReplace].challenge, challenge, sizeof(Challenge_t));
     challenges[toReplace].createdAt = now;
 }
@@ -112,7 +113,7 @@ void challengesRemoveAll()
     memset(challenges, 0, maxChallengesCount * sizeof(SuperChallenge_t));
 }
 
-Challenge_t* challengesFind(const ChallengeCookie_t cookie, const IPAddress_t *addr)
+Challenge_t* challengesFindByToken(const ChallengeCookie_t cookie, const IPAddress_t *addr)
 {
     uint64_t now = now_ms();
 
@@ -120,6 +121,24 @@ Challenge_t* challengesFind(const ChallengeCookie_t cookie, const IPAddress_t *a
         if (
             challenges[i].createdAt != 0 &&
             constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t)) &&
+            ipAddressEqual(&challenges[i].clientIP, addr) &&
+            now - challenges[i].createdAt < windowSizeInMs
+        ) {
+            return &challenges[i].challenge;
+        }
+    }
+    return nullptr;
+}
+
+Challenge_t* challengesFindByWsTicket(const ChallengeWsTicket_t ticket, const IPAddress_t *addr)
+{
+    uint64_t now = now_ms();
+
+    for (size_t i = 0; i < maxChallengesCount; i++) {
+        if (
+            challenges[i].createdAt != 0 &&
+            challenges[i].challenge.verified &&
+            constantTimeCompare(challenges[i].challenge.wsTicket, ticket, sizeof(ChallengeWsTicket_t)) &&
             ipAddressEqual(&challenges[i].clientIP, addr) &&
             now - challenges[i].createdAt < windowSizeInMs
         ) {

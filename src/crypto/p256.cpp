@@ -144,6 +144,84 @@ esp_err_t p256SavePrivateKey(P256KeyPair_t *pair, uint8_t privateKey[P256_PRIVAT
     return ESP_OK;
 }
 
+esp_err_t p256DerivePublicKey(P256KeyPair_t *pair)
+{
+#if ESP_IDF_VERSION_MAJOR >= 6
+    psa_key_id_t keyId = PSA_KEY_ID_NULL;
+    size_t publicKeyLen = 0;
+    psa_status_t status;
+#else
+    mbedtls_mpi d;
+    mbedtls_ecp_point q;
+    size_t outLen = 0;
+    esp_err_t err;
+#endif
+
+    assert(pair);
+
+    DELAYED_P256_INIT();
+
+    if (!pair->hasPrivateKey) {
+        ESP_LOGE(TAG, "A private key is required to derive the public key.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+    status = importPrivateKey(&keyId, PSA_ALG_ECDSA_ANY, PSA_KEY_USAGE_EXPORT, pair);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to import the private key. Error: %d.", status);
+        return status;
+    }
+
+    status = psa_export_public_key(keyId, pair->publicKey, sizeof(pair->publicKey), &publicKeyLen);
+    psa_destroy_key(keyId);
+
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to derive the public key. Error: %d.", status);
+        memset(pair->publicKey, 0, sizeof(pair->publicKey));
+        pair->hasPublicKey = false;
+        return status;
+    }
+    if (publicKeyLen != P256_PUBLIC_KEY_SIZE) {
+        ESP_LOGE(TAG, "Unexpected public key size: %d bytes.", publicKeyLen);
+        memset(pair->publicKey, 0, sizeof(pair->publicKey));
+        pair->hasPublicKey = false;
+        return ESP_FAIL;
+    }
+#else
+    mbedtls_mpi_init(&d);
+    mbedtls_ecp_point_init(&q);
+
+    err = loadPrivateScalar(&d, pair->privateKey);
+    if (err == ESP_OK) {
+        err = mbedtls_ecp_mul(&ecpGroup, &q, &d, &ecpGroup.G, randomGen, nullptr);
+    }
+    if (err == ESP_OK) {
+        err = mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey,
+                                             P256_PUBLIC_KEY_SIZE);
+    }
+
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_point_free(&q);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to derive the public key. Error: %d.", err);
+        memset(pair->publicKey, 0, sizeof(pair->publicKey));
+        pair->hasPublicKey = false;
+        return err;
+    }
+    if (outLen != P256_PUBLIC_KEY_SIZE) {
+        ESP_LOGE(TAG, "Unexpected public key size: %d bytes.", outLen);
+        memset(pair->publicKey, 0, sizeof(pair->publicKey));
+        pair->hasPublicKey = false;
+        return ESP_FAIL;
+    }
+#endif
+
+    pair->hasPublicKey = true;
+    return ESP_OK;
+}
+
 esp_err_t p256LoadPublicKeyB64(P256KeyPair_t *pair, const char *publicKey, size_t publicKeyLen, bool isUrl)
 {
     uint8_t buffer[P256_PUBLIC_KEY_SIZE];
