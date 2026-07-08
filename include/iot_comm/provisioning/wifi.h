@@ -45,6 +45,7 @@ typedef struct WifiMgrConfig_s {
     WifiMgrEventHandler_t handler;
     void                  *handlerCtx;
     WifiMgrSoftApConfig_t softAP;
+    float                 maxWifiPower; // In dBm, between 8 and 20. 0 To use default setting.
 } WifiMgrConfig_t;
 
 // -----------------------------------------------------------------------------

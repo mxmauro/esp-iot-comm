@@ -56,6 +56,7 @@ static void *handlerCtx = nullptr;
 static bool connected = false;
 static bool staTransitionPending = false;
 static esp_timer_handle_t staTransitionTimer = nullptr;
+static float maxWifiPower = 0.0f;
 
 // -----------------------------------------------------------------------------
 
@@ -64,6 +65,7 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config);
 static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void *eventData);
 static void staTransitionTimerCallback(void *arg);
 static void performStaModeTransition();
+static esp_err_t setWifiTxPower(float power);
 static esp_err_t loadStoredHostnameOrDefault(char hostname[MAX_HOSTNAME_LEN + 1]);
 static esp_err_t saveStoredHostname(const char *hostname);
 static esp_err_t eraseStoredHostname();
@@ -234,6 +236,8 @@ esp_err_t wifiMgrStoreSTA(const char *ssid, const char *password)
     else {
         staConfig.sta.threshold.authmode = WIFI_AUTH_OPEN;
     }
+    staConfig.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;  // More thorough scanning
+    staConfig.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     staConfig.sta.pmf_cfg.capable = true;
     staConfig.sta.pmf_cfg.required = false;
 
@@ -333,10 +337,11 @@ static void wifiMgrDeinitNoLock()
 
         handler = nullptr;
         handlerCtx = nullptr;
-
-        connected = false;
-        provisioned = false;
     }
+
+    maxWifiPower = 0.0f;
+    connected = false;
+    provisioned = false;
 
     rundownProtInit(&rp);
 }
@@ -393,11 +398,16 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
     ESP_RETURN_ON_ERROR(esp_wifi_get_config(WIFI_IF_STA, &staConfig), TAG, "Failed to read the stored STA configuration");
     provisioned = staConfig.sta.ssid[0] != 0;
 
+    maxWifiPower = config->maxWifiPower;
+
     // If provisioned, start STA mode
     if (provisioned) {
         ESP_LOGI(TAG, "Stored credentials were found; starting STA mode.");
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Failed to set STA mode");
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start the interface");
+
+        // Set the maximum transmit power
+        ESP_RETURN_ON_ERROR(setWifiTxPower(maxWifiPower), TAG, "Failed to set TX power");
     }
     else {
         wifi_config_t apConfig;
@@ -418,13 +428,20 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t *config)
             apConfig.ap.authmode = WIFI_AUTH_OPEN;
         }
         apConfig.ap.channel = config->softAP.channel ? config->softAP.channel : 1;
-        apConfig.ap.max_connection = 4;
-        apConfig.ap.beacon_interval = 100;
+        apConfig.ap.max_connection = 8;
+        apConfig.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+        apConfig.ap.ftm_responder = false;
+        apConfig.ap.pmf_cfg.capable = true;
+        apConfig.ap.pmf_cfg.required  = false;
+        apConfig.ap.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
         // Start Wi-Fi in AP mode
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "Failed to set AP+STA mode");
         ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &apConfig), TAG, "Failed to configure AP mode");
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start the interface");
+
+        // Set the maximum transmit power
+        ESP_RETURN_ON_ERROR(setWifiTxPower(maxWifiPower), TAG, "Failed to set TX power");
 
         // Setup DNS and DHCP for captive portal
         ESP_RETURN_ON_ERROR(captivePortalSetupDhcpUrl(), TAG, "Failed to configure the DHCP captive portal URI");
@@ -491,11 +508,11 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
 
             case WIFI_EVENT_STA_DISCONNECTED:
                 {
+                    AutoRundownProtection rpLock(rp);
                     wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)eventData;
 
-                    ESP_LOGI(TAG, "Disconnected; reconnecting to the configured access point.");
-
-                    AutoRundownProtection rpLock(rp);
+                    ESP_LOGI(TAG, "Disconnected (reason=%u, rssi=%d); reconnecting to the configured access point.", event->reason,
+                             event->rssi);
 
                     if (rpLock.acquired() && provisioned) {
                         // Raise disconnected state or notify if authentication failed
@@ -504,7 +521,7 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
                             handler(WifiMgrEventDisconnected, handlerCtx);
                         }
                         else {
-                            if (event && event->reason == WIFI_REASON_AUTH_FAIL) {
+                            if (event->reason == WIFI_REASON_AUTH_FAIL) {
                                 handler(WifiMgrEventAuthenticationFailed, handlerCtx);
                             }
                         }
@@ -532,8 +549,6 @@ static void onEvent(void *arg, esp_event_base_t eventBase, int32_t eventId, void
 
                     ESP_LOGI(TAG, "Connected; acquired IPv4 address " IPSTR ".", IP2STR(&event->ip_info.ip));
                     if (rpLock.acquired()) {
-
-
                         // Raise connected state
                         if (!connected) {
                             connected = true;
@@ -611,6 +626,32 @@ static void performStaModeTransition()
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start STA mode. Error: %d.", err);
     }
+
+    err = setWifiTxPower(maxWifiPower);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set TX power. Error: %d.", err);
+    }
+}
+
+static esp_err_t setWifiTxPower(float power)
+{
+    int8_t maxTxPower;
+
+    if (power < 0.0001) {
+        return ESP_OK;
+    }
+
+    // Set the maximum transmit power (34 * 0.25 dBm = 8.5 dBm)
+    if (power < 8.0f) {
+        maxTxPower = 32;
+    }
+    else if (power > 20.0f) {
+        maxTxPower = 80;
+    }
+    else {
+        maxTxPower = (int8_t)(power * 4.0f + 0.0001f);
+    }
+    return esp_wifi_set_max_tx_power(maxTxPower);
 }
 
 static esp_err_t loadStoredHostnameOrDefault(char hostname[MAX_HOSTNAME_LEN + 1])

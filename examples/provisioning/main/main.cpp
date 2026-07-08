@@ -1,4 +1,5 @@
 #include <esp_err.h>
+#include <esp_mac.h>
 #include <iot_comm/iot_comm.h>
 #include <iot_comm/captive_portal/captive_portal.h>
 #include <iot_comm/provisioning/wifi.h>
@@ -28,6 +29,8 @@ static void setupTask(void *arg)
 {
     IotCommConfig_t iotCommConfig;
     WifiMgrConfig_t wifiConfig;
+    char ssid[32];
+    uint8_t mac[6];
 
     iotCommConfig = iotCommDefaultConfig();
     iotCommConfig.handler = iotCommEventHandler;
@@ -43,9 +46,13 @@ static void setupTask(void *arg)
     };
     ESP_ERROR_CHECK(iotCommInit(&iotCommConfig));
 
+    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
+    snprintf(ssid, sizeof(ssid), "iotcomm-network-%02X%02X", mac[4], mac[5]);
+
     memset(&wifiConfig, 0, sizeof(wifiConfig));
     wifiConfig.handler = wifiMgrEventHandler;
-    wifiConfig.softAP.ssid = "iotcomm-network";
+    wifiConfig.maxWifiPower = 8.5f; // To get rid of the ESP32-C3 bad "antenna" design.
+    wifiConfig.softAP.ssid = ssid;
     wifiConfig.softAP.captivePortal.init = [](void *) -> esp_err_t
     {
         CaptivePortalConfig_t capPortalConfig = {};
