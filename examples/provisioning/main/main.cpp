@@ -1,4 +1,5 @@
 #include <esp_err.h>
+#include <esp_log.h>
 #include <esp_mac.h>
 #include <iot_comm/iot_comm.h>
 #include <iot_comm/captive_portal/captive_portal.h>
@@ -6,6 +7,8 @@
 #include <mdns.h>
 #include <rundown_protection.h>
 #include <run_once.h>
+
+static const char *TAG = "MAIN";
 
 // -----------------------------------------------------------------------------
 
@@ -82,9 +85,30 @@ static void iotCommEventHandler(IotCommEvent_t *)
 
 }
 
-static void wifiMgrEventHandler(WifiMgrEvent_t, void *)
+static void wifiMgrEventHandler(WifiMgrEvent_t event, void *)
 {
+    switch (event) {
+        case WifiMgrEventConnected:
+            {
+                IotCommServerConfig_t iotCommServerConfig;
+                esp_err_t err;
 
+                iotCommServerConfig = iotCommDefaultServerConfig();
+                iotCommServerConfig.udpListenPort = 32888;
+                err = iotCommStartServer(&iotCommServerConfig);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Unable to start Iot-Comm server. Err: %d.", err);
+                }
+            }
+            break;
+
+        case WifiMgrEventDisconnected:
+            iotCommStopServer();
+            break;
+
+        case WifiMgrEventAuthenticationFailed:
+            break;
+    }
 }
 
 static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig_t *creds, void *)
