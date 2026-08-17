@@ -7,8 +7,13 @@
 #include <mdns.h>
 #include <rundown_protection.h>
 #include <run_once.h>
+#include <storage/nvs.h>
 
 static const char *TAG = "MAIN";
+
+// -----------------------------------------------------------------------------
+
+static NVSStorage storage;
 
 // -----------------------------------------------------------------------------
 
@@ -17,6 +22,9 @@ static void setupTask(void *arg);
 static void iotCommEventHandler(IotCommEvent_t *event);
 static void wifiMgrEventHandler(WifiMgrEvent_t event, void *ctx);
 static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig_t *creds, void *ctx);
+
+static esp_err_t loadFromStorage(IotCommStorageItemType_t itemType, void *dest, size_t destLen, void *ctx);
+static esp_err_t saveToStorage(IotCommStorageItemType_t itemType, const void *data, size_t dataLen, void *ctx);
 
 // -----------------------------------------------------------------------------
 
@@ -37,16 +45,8 @@ static void setupTask(void *arg)
 
     iotCommConfig = iotCommDefaultConfig();
     iotCommConfig.handler = iotCommEventHandler;
-    iotCommConfig.storage.load = [](IotCommStorageItemType_t itemType, void *dest, size_t destLen, void *ctx) ->esp_err_t
-    {
-        // We return not found because we always initialize as empty
-        return ESP_ERR_NOT_FOUND;
-    };
-    iotCommConfig.storage.save = [](IotCommStorageItemType_t itemType, const void *data, size_t dataLen, void *ctx) ->esp_err_t
-    {
-        // This demo does not store anything
-        return ESP_OK;
-    };
+    iotCommConfig.storage.load = loadFromStorage;
+    iotCommConfig.storage.save = saveToStorage;
     ESP_ERROR_CHECK(iotCommInit(&iotCommConfig));
 
     ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
@@ -129,4 +129,56 @@ static esp_err_t captivePortalCredentialsHandler(CaptivePortalProvisioningConfig
         err = wifiMgrStartSTA();
     }
     return err;
+}
+
+static esp_err_t loadFromStorage(IotCommStorageItemType_t itemType, void *dest, size_t destLen, void *)
+{
+    lightstd::vector<uint8_t> data;
+    esp_err_t err;
+
+    switch (itemType) {
+        case IotCommStorageItemTypeUsers:
+            err = storage.readBlob("users", data);
+            break;
+
+        case IotCommStorageItemTypeDeviceIdentityKeyPair:
+            err = storage.readBlob("deviceID", data);
+            break;
+
+        default:
+            return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (data.size() != destLen) {
+        return ESP_FAIL;
+    }
+
+    memcpy(dest, data.data(), destLen);
+    return ESP_OK;
+}
+
+static esp_err_t saveToStorage(IotCommStorageItemType_t itemType, const void *data, size_t dataLen, void *)
+{
+    esp_err_t err;
+
+    switch (itemType) {
+        case IotCommStorageItemTypeUsers:
+            err = storage.writeBlob("users", data, dataLen);
+            if (err != ESP_OK) {
+                return err;
+            }
+            return storage.commit();
+
+        case IotCommStorageItemTypeDeviceIdentityKeyPair:
+            err = storage.writeBlob("deviceID", data, dataLen);
+            if (err != ESP_OK) {
+                return err;
+            }
+            return storage.commit();
+
+        default:
+            return ESP_FAIL;
+    }
 }
