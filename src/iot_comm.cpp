@@ -1519,7 +1519,8 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
 
     // Decrypt message
     err = aesDecrypt(&commandCtx.session->clientAesCtx, commandCtx.session->ciphertextIn.buffer + sizeof(WebSocketPacketHeader_t),
-                     dataAndTagLen, iv, sizeof(iv), nullptr, 0, commandCtx.session->plaintextIn.buffer);
+                     dataAndTagLen, iv, sizeof(iv), (const uint8_t *)hdr, sizeof(WebSocketPacketHeader_t),
+                     commandCtx.session->plaintextIn.buffer);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Failed to decrypt the WebSocket payload. Error: %d.", err);
         if (err == MBEDTLS_ERR_GCM_AUTH_FAILED) {
@@ -2189,8 +2190,8 @@ on_error:
     }
 
     // Encrypt message
-    err = aesEncrypt(&commandCtx->session->serverAesCtx, plaintextOut, plaintextOutLen, iv, SESSION_IV_LEN,
-                     nullptr, 0, ciphertextOut->buffer + sizeof(WebSocketPacketHeader_t));
+    err = aesEncrypt(&commandCtx->session->serverAesCtx, plaintextOut, plaintextOutLen, iv, SESSION_IV_LEN, (const uint8_t *)hdr,
+                     sizeof(WebSocketPacketHeader_t), ciphertextOut->buffer + sizeof(WebSocketPacketHeader_t));
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Failed to encrypt the WebSocket payload. Error: %d.", err);
         goto on_error;
@@ -2684,7 +2685,8 @@ static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, 
     aesInit(&aesCtx);
     err = aesSetKey(&aesCtx, udpClientAesKey, sizeof(udpClientAesKey));
     if (err == ESP_OK) {
-        err = aesDecrypt(&aesCtx, packet + sizeof(WebSocketPacketHeader_t), ciphertextLen, iv, sizeof(iv), nullptr, 0, plaintext);
+        err = aesDecrypt(&aesCtx, packet + sizeof(WebSocketPacketHeader_t), ciphertextLen, iv, sizeof(iv), (const uint8_t *)hdr,
+                         sizeof(WebSocketPacketHeader_t), plaintext);
     }
     aesDone(&aesCtx);
     if (err != ESP_OK) {
