@@ -16,6 +16,12 @@
     #error This library requires CONFIG_MBEDTLS_AES_C and CONFIG_MBEDTLS_GCM_C to be enabled
 #endif
 
+#if ESP_IDF_VERSION_MAJOR >= 6
+    #define ESP_ERR_GCM_AUTH_FAILED PSA_ERROR_INVALID_SIGNATURE
+#else
+    #define ESP_ERR_GCM_AUTH_FAILED MBEDTLS_ERR_GCM_AUTH_FAILED
+#endif
+
 // -----------------------------------------------------------------------------
 
 typedef struct AesContext_s {
@@ -42,13 +48,13 @@ void aesDone(AesContext_t *ctx);
 // Loads the encryption key into an AES-GCM context.
 esp_err_t aesSetKey(AesContext_t *ctx, const uint8_t *key, size_t keyLen);
 
-// Encrypts a buffer with AES-GCM and appends the authentication tag.
-// Size of ciphertextOut must be plaintextLen plus 16 bytes for tag
+// Encrypts a buffer with AES-GCM and appends the authentication tag. plaintext may be null when plaintextLen is zero.
+// Size of ciphertextOut must be plaintextLen plus 16 bytes for tag.
 esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plaintextLen, const uint8_t *iv, size_t ivLen,
                       const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut);
 // Decrypts and authenticates a buffer produced by AES-GCM.
 // Size of plaintextOut will be ciphertextLen minus 16 bytes because ciphertext must include
-// the tag at the end
+// the tag at the end. plaintextOut may be null when ciphertextLen is 16 bytes.
 esp_err_t aesDecrypt(AesContext_t *ctx, const uint8_t *ciphertext, size_t ciphertextLen, const uint8_t *iv, size_t ivLen,
                       const uint8_t *aad, size_t aadLen, uint8_t *plaintextOut);
 

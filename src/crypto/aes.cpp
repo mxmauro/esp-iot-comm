@@ -86,6 +86,7 @@ esp_err_t aesSetKey(AesContext_t *ctx, const uint8_t *key, size_t keyLen)
 esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plaintextLen, const uint8_t *iv, size_t ivLen,
                      const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut)
 {
+    uint8_t emptyPlaintext;
 #if ESP_IDF_VERSION_MAJOR >= 6
     size_t ciphertextLen = 0;
     psa_status_t status;
@@ -98,6 +99,12 @@ esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plainte
 
     if ((!ctx->initialized) || (!ctx->hasKey)) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (((!plaintext) && plaintextLen != 0) || (!ciphertextOut)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!plaintext) {
+        plaintext = &emptyPlaintext;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
@@ -120,6 +127,7 @@ esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plainte
 esp_err_t aesDecrypt(AesContext_t *ctx, const uint8_t *ciphertext, size_t ciphertextLen, const uint8_t *iv, size_t ivLen,
                      const uint8_t *aad, size_t aadLen, uint8_t *plaintextOut)
 {
+    uint8_t emptyPlaintext;
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_status_t status;
     size_t plaintextLen;
@@ -133,11 +141,17 @@ esp_err_t aesDecrypt(AesContext_t *ctx, const uint8_t *ciphertext, size_t cipher
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (ciphertextLen < GCM_TAG_LEN) {
+    if ((!ciphertext) || ciphertextLen < GCM_TAG_LEN) {
         return ESP_ERR_INVALID_ARG;
     }
 
     ciphertextLen -= GCM_TAG_LEN;
+    if ((!plaintextOut) && ciphertextLen != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!plaintextOut) {
+        plaintextOut = &emptyPlaintext;
+    }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = psa_aead_decrypt(ctx->keyId, PSA_ALG_GCM, iv, ivLen, aad, aadLen, ciphertext, ciphertextLen + GCM_TAG_LEN, plaintextOut,

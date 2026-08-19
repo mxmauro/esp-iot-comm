@@ -154,6 +154,28 @@ TEST_CASE("aesEncrypt and aesDecrypt roundtrip and detect tampering", "[crypto]"
     aesDone(&ctx);
 }
 
+TEST_CASE("aesEncrypt and aesDecrypt authenticate empty plaintext", "[crypto]")
+{
+    AesContext_t ctx;
+    uint8_t key[32];
+    uint8_t iv[12];
+    uint8_t aad[20];
+    uint8_t ciphertext[16];
+
+    fillPattern(key, sizeof(key), 0x21);
+    fillPattern(iv, sizeof(iv), 0x31);
+    fillPattern(aad, sizeof(aad), 0x41);
+
+    aesInit(&ctx);
+    TEST_ASSERT_EQUAL(ESP_OK, aesSetKey(&ctx, key, sizeof(key)));
+    TEST_ASSERT_EQUAL(ESP_OK, aesEncrypt(&ctx, nullptr, 0, iv, sizeof(iv), aad, sizeof(aad), ciphertext));
+    TEST_ASSERT_EQUAL(ESP_OK, aesDecrypt(&ctx, ciphertext, sizeof(ciphertext), iv, sizeof(iv), aad, sizeof(aad), nullptr));
+
+    ciphertext[sizeof(ciphertext) - 1] ^= 0x80;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, aesDecrypt(&ctx, ciphertext, sizeof(ciphertext), iv, sizeof(iv), aad, sizeof(aad), nullptr));
+    aesDone(&ctx);
+}
+
 TEST_CASE("p256 public and private key base64 roundtrip works", "[crypto]")
 {
     P256KeyPair_t original;

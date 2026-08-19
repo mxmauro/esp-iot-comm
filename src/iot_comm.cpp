@@ -60,6 +60,9 @@ static const char* TAG = "IotComm";
 #define SESSION_IV_LEN     12
 #define SESSION_AES_KEY_LEN    32
 
+#define PACKET_FLAG_REPLY              0x01
+#define PACKET_REPLY_COUNTER_LEN       8
+
 #define MIN_WS_PACKET_SIZE 1024
 
 #define MAX_OUTPUT_FRAME_SIZE 4096
@@ -94,13 +97,13 @@ typedef struct SessionInfo_s {
     IotCommUserDataFreeFunc_t userDataFreeFn;
     IPAddress_t addr;
     uint32_t userId;
-    uint32_t nextRxCounter;
-    uint32_t nextTxCounter;
+    uint64_t nextRxCounter;
+    uint64_t nextTxCounter;
     ChallengeNonce_t nonce;
     ChallengeNonce_t clientUdpNonce;
     ChallengeNonce_t serverUdpNonce;
     uint32_t udpConnectionId;
-    uint32_t udpNextRxCounter;
+    uint64_t udpNextRxCounter;
     uint8_t udpClientAesKey[AES_KEY_LEN];
     uint8_t udpClientBaseIV[SESSION_IV_LEN];
     uint8_t sessionMasterKey[SESSION_AES_KEY_LEN];
@@ -122,15 +125,22 @@ typedef struct SessionInfo_s {
     GrowableBuffer_t ciphertextOut;
 } SessionInfo_t;
 
-// v(1) | cmd(2) | filler(1) | replyCounter(4) | counter(4) | filler(4)
-typedef struct __attribute__((packed)) WebSocketPacketHeader_s {
-    uint8_t  v;
-    uint8_t  cmd[2];
-    uint8_t  filler1;
-    uint8_t  replyCounter[4];
-    uint8_t  counter[4];
-    uint32_t filler2;
-} WebSocketPacketHeader_t;
+// v(1) | cmd(2) | flags(1) | counter(8)
+typedef struct __attribute__((packed)) PacketHeader_s {
+    uint8_t v;
+    uint8_t cmd[2];
+    uint8_t flags;
+    uint8_t counter[8];
+} PacketHeader_t;
+
+// udpConnectionId(4) | PacketHeader_t
+typedef struct __attribute__((packed)) UdpPacketHeader_s {
+    uint8_t        udpConnectionId[4];
+    PacketHeader_t packetHeader;
+} UdpPacketHeader_t;
+
+static_assert(sizeof(PacketHeader_t) == 12, "Unexpected common packet header size.");
+static_assert(sizeof(UdpPacketHeader_t) == 16, "Unexpected UDP packet header size.");
 
 typedef struct CommandContext_s {
     httpd_handle_t serverHandle;
@@ -139,7 +149,7 @@ typedef struct CommandContext_s {
     SessionInfo_t *session;
     uint16_t cmd;
     binary_reader_t br;
-    uint32_t rxCounter;
+    uint64_t rxCounter;
 } CommandContext_t;
 
 typedef struct OnTheFlyEvent_s {
@@ -269,11 +279,14 @@ static esp_err_t handleCustomCommand(CommandContext_t *commandCtx);
 static bool handleSessionStart(SessionInfo_t *session, httpd_req_t *req, esp_err_t *closeErr);
 static void handleSessionEnd(SessionInfo_t *session);
 
-static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, uint32_t replyCounter,
-                                   bool closeOnError);
-static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, uint32_t replyCounter,
-                                   bool closeOnError);
+static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, bool closeOnError);
+static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, bool closeOnError);
 
+static esp_err_t encryptAndSend(SessionInfo_t *session, httpd_handle_t serverHandle, uint16_t cmd, const uint8_t *plaintextOut,
+                                size_t plaintextOutLen, const uint64_t *replyCounter, bool closeOnError);
+
+static esp_err_t closeWsWithSession(SessionInfo_t *session, httpd_handle_t serverHandle, uint16_t code, const char *reason);
+static esp_err_t closeWsWithSessionAndError(SessionInfo_t *session, httpd_handle_t serverHandle, const char *zone, esp_err_t err);
 static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason);
 static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t *commandCtx, const char *zone, esp_err_t err);
 
@@ -644,7 +657,7 @@ esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t *reply, size
         }
 
         // Send the reply
-        otfe->savedErr = buildAndSendReply(otfe->commandCtx, reply, replyLen, otfe->commandCtx->rxCounter, false);
+        otfe->savedErr = buildAndSendReply(otfe->commandCtx, reply, replyLen, false);
         otfe->replySent = true;
         if (otfe->savedErr != ESP_OK) {
             otfe->closeSent = true;
@@ -681,7 +694,7 @@ esp_err_t iotCommEventReplyWithError(IotCommSessionHandle_t h, uint32_t code, co
         }
 
         // Send the reply
-        otfe->savedErr = buildAndSendErrorReply(otfe->commandCtx, code, message, otfe->commandCtx->rxCounter, false);
+        otfe->savedErr = buildAndSendErrorReply(otfe->commandCtx, code, message, false);
         otfe->replySent = true;
         if (otfe->savedErr != ESP_OK) {
             otfe->closeSent = true;
@@ -841,7 +854,7 @@ static esp_err_t serveWsInit(httpd_req_t *req)
     }
 
     ctx->json = cJSON_ParseWithLength((const char*)ctx->reqBody.buffer, ctx->reqBody.used);
-    if (!ctx->json) {
+    if (!(ctx->json && cJSON_IsObject(ctx->json))) {
 error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
@@ -996,7 +1009,7 @@ static esp_err_t serveWsAuth(httpd_req_t *req)
     }
 
     ctx->json = cJSON_ParseWithLength((const char*)ctx->reqBody.buffer, ctx->reqBody.used);
-    if (!ctx->json) {
+    if (!(ctx->json && cJSON_IsObject(ctx->json))) {
 error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
@@ -1024,7 +1037,8 @@ error_invalid_data:
     ) {
         goto error_invalid_data;
     }
-    if (ctx->challengeCookieLen != CHALLENGE_COOKIE_SIZE || ctx->authIvLen != AUTH_ENVELOPE_IV_LEN || ctx->encryptedAuthLen < TAG_LEN) {
+    if (ctx->challengeCookieLen != CHALLENGE_COOKIE_SIZE || ctx->authIvLen != AUTH_ENVELOPE_IV_LEN || ctx->encryptedAuthLen < 2 + TAG_LEN) {
+        // We expect at least 2 bytes of plaintext because a JSON object must be at least 2 bytes (e.g., "{}").
         goto error_invalid_data;
     }
 
@@ -1057,22 +1071,22 @@ error_not_auth:
     }
 
     ctx->plaintextLen = ctx->encryptedAuthLen - TAG_LEN;
-    ctx->plaintext = (char *)gbReserve(&ctx->plaintextBody, ctx->plaintextLen + 1);
+    ctx->plaintext = (char *)gbReserve(&ctx->plaintextBody, ctx->plaintextLen);
     if (!ctx->plaintext) {
         err = ESP_ERR_NO_MEM;
         goto done;
     }
+
     err = aesDecrypt(&ctx->aesCtx, ctx->encryptedAuth, ctx->encryptedAuthLen, ctx->authIv, sizeof(ctx->authIv), nullptr, 0,
                      (uint8_t *)ctx->plaintext);
     if (err != ESP_OK) {
         rateLimitIncrementFailedAuth(&ctx->remoteAddr);
         goto error_not_auth;
     }
-    ctx->plaintext[ctx->plaintextLen] = 0;
     ctx->plaintextBody.used = ctx->plaintextLen;
 
-    ctx->innerJson = cJSON_Parse((const char *)ctx->plaintextBody.buffer);
-    if (!ctx->innerJson) {
+    ctx->innerJson = cJSON_ParseWithLength((const char *)ctx->plaintextBody.buffer, ctx->plaintextBody.used);
+    if (!(ctx->innerJson && cJSON_IsObject(ctx->innerJson))) {
         goto error_invalid_data;
     }
 
@@ -1441,7 +1455,7 @@ static esp_err_t serveWs(httpd_req_t *req)
 static esp_err_t serveWsPacket(httpd_req_t *req)
 {
     uint8_t iv[SESSION_IV_LEN];
-    WebSocketPacketHeader_t *hdr;
+    PacketHeader_t *hdr;
     size_t dataAndTagLen;
     CommandContext_t commandCtx;
     bool messageComplete;
@@ -1484,49 +1498,52 @@ static esp_err_t serveWsPacket(httpd_req_t *req)
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_UNSUPPORTED_DATA, nullptr);
     }
 
-    // Check message size (the payload must be, at least, 1 byte plus the TAG)
-    if (commandCtx.session->ciphertextIn.used <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
+    // Check message size (the payload may be empty, but the tag is required)
+    if (commandCtx.session->ciphertextIn.used < sizeof(PacketHeader_t) + TAG_LEN) {
         ESP_LOGD(TAG, "Received a WebSocket packet that is too short.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Extract header and validate version and RX counter (a.k.a. nonce)
-    hdr = (WebSocketPacketHeader_t *)commandCtx.session->ciphertextIn.buffer;
+    hdr = (PacketHeader_t *)commandCtx.session->ciphertextIn.buffer;
     if (hdr->v != VERSION) {
         ESP_LOGD(TAG, "Received a WebSocket packet with an unsupported protocol version.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
-    commandCtx.rxCounter = be32dec(hdr->counter);
-    if (commandCtx.session->nextRxCounter != commandCtx.rxCounter) {
+    if (hdr->flags != 0) {
+        ESP_LOGD(TAG, "Received a WebSocket packet with an invalid combination of flags.");
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
+    }
+    commandCtx.rxCounter = be64dec(hdr->counter);
+    if (commandCtx.rxCounter == UINT64_MAX || commandCtx.session->nextRxCounter != commandCtx.rxCounter) {
         ESP_LOGD(TAG, "Received a WebSocket packet with an unexpected counter value.");
         return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
     commandCtx.session->nextRxCounter += 1;
     commandCtx.cmd = be16dec(hdr->cmd);
-    dataAndTagLen = commandCtx.session->ciphertextIn.used - sizeof(WebSocketPacketHeader_t);
+    dataAndTagLen = commandCtx.session->ciphertextIn.used - sizeof(PacketHeader_t);
 
     // Build IV
     memcpy(iv, commandCtx.session->clientBaseIV, SESSION_IV_LEN);
-    for (size_t i = 0; i < 4; i++) {
+    for (size_t i = 0; i < 8; i++) {
         iv[SESSION_IV_LEN-i-1] ^= (uint8_t)((commandCtx.rxCounter >> (i << 3)) & 0xFF);
     }
 
     // Prepare output for decrypted message
     gbReset(&commandCtx.session->plaintextIn, false);
-    if (!gbEnsureSize(&commandCtx.session->plaintextIn, dataAndTagLen - TAG_LEN)) {
-        return closeWsWithCmdCtxAndError(&commandCtx, "read", ESP_ERR_NO_MEM);
+    if (dataAndTagLen - TAG_LEN > 0) {
+        if (!gbEnsureSize(&commandCtx.session->plaintextIn, dataAndTagLen - TAG_LEN)) {
+            return closeWsWithCmdCtxAndError(&commandCtx, "read", ESP_ERR_NO_MEM);
+        }
     }
 
     // Decrypt message
-    err = aesDecrypt(&commandCtx.session->clientAesCtx, commandCtx.session->ciphertextIn.buffer + sizeof(WebSocketPacketHeader_t),
-                     dataAndTagLen, iv, sizeof(iv), (const uint8_t *)hdr, sizeof(WebSocketPacketHeader_t),
+    err = aesDecrypt(&commandCtx.session->clientAesCtx, commandCtx.session->ciphertextIn.buffer + sizeof(PacketHeader_t),
+                     dataAndTagLen, iv, sizeof(iv), (const uint8_t *)hdr, sizeof(PacketHeader_t),
                      commandCtx.session->plaintextIn.buffer);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "Failed to decrypt the WebSocket payload. Error: %d.", err);
-        if (err == MBEDTLS_ERR_GCM_AUTH_FAILED) {
-            return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
-        }
-        return closeWsWithCmdCtxAndError(&commandCtx, "decode", err);
+        return closeWsWithCmdCtx(&commandCtx, WS_CLOSE_INVALID_PAYLOAD, nullptr);
     }
 
     // Cleanup incoming message internals
@@ -1610,7 +1627,7 @@ static esp_err_t handleCreateUser(CommandContext_t *commandCtx)
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "CREATE USER command: insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", true);
     }
 
     // Get flags
@@ -1620,7 +1637,7 @@ static esp_err_t handleCreateUser(CommandContext_t *commandCtx)
     }
     if ((flags & (~USER_CREATE_FLAG_MUST_CHANGE_CREDENTIALS_ON_NEXT_LOGIN)) != 0) {
         ESP_LOGD(TAG, "CREATE USER command: unsupported flags.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_ARG, "Unsupported user creation flags", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_ARG, "Unsupported user creation flags", true);
     }
 
     // Get user name
@@ -1639,12 +1656,12 @@ static esp_err_t handleCreateUser(CommandContext_t *commandCtx)
     // Check if the user already exists
     if (userCreate(flags, name, nameLen, publicKeyBuf) == 0) {
         ESP_LOGD(TAG, "CREATE USER command: failed to create the user.");
-        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to create new user", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to create new user", true);
     }
 
     // Done
     ESP_LOGD(TAG, "CREATE USER command: user created successfully.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
 }
 
 static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
@@ -1656,7 +1673,7 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "DELETE USER command: insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", true);
     }
 
     // Get user name
@@ -1669,13 +1686,13 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
     targetUserId = userGetID(name, nameLen);
     if (targetUserId == 0 || userIsAdmin(targetUserId, &isAdmin) != ESP_OK) {
         ESP_LOGD(TAG, "DELETE USER command: user not found.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", true);
     }
 
     // Check if the user is admin
     if (isAdmin) {
         ESP_LOGD(TAG, "DELETE USER command: cannot delete an administrator.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot delete admin user", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot delete admin user", true);
     }
 
     // Delete it
@@ -1699,7 +1716,7 @@ static esp_err_t handleDeleteUser(CommandContext_t *commandCtx)
 
     // Done
     ESP_LOGD(TAG, "DELETE USER command: user deleted successfully.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
 }
 
 static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
@@ -1713,7 +1730,7 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", true);
     }
 
     // Get user name
@@ -1733,25 +1750,25 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
     targetUserId = userGetID(name, nameLen);
     if (targetUserId == 0) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: user not found.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_FOUND, "User not found", true);
     }
 
     // Check if the user is the same than us
     if (commandCtx->session->userId == targetUserId) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: cannot reset the current user's credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset own credentials", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset own credentials", true);
     }
 
     // Check if the target user is an admin
     if (userIsAdmin(targetUserId, &targetIsAdmin) != ESP_OK || targetIsAdmin) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: the target user's credentials cannot be reset.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset user credentials", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Cannot reset user credentials", true);
     }
 
     // Change the user public key
     if (userChangeCredentials(targetUserId, commandCtx->session->userId, publicKeyBuf) != ESP_OK) {
         ESP_LOGD(TAG, "RESET USER CREDENTIALS command: failed to reset the user's credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to reset user credentials", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to reset user credentials", true);
     }
 
     // Delete active target user sessions
@@ -1772,7 +1789,7 @@ static esp_err_t handleResetUserCredentials(CommandContext_t *commandCtx)
 
     // Done
     ESP_LOGD(TAG, "RESET USER CREDENTIALS command: credentials reset successfully.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
 }
 
 static esp_err_t handleChangeUserCredentials(CommandContext_t *commandCtx)
@@ -1819,7 +1836,7 @@ error_validation_failed:
         ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: credential validation failed.");
         if (commandCtx->session->credentialsChangeAttempts < 2) {
             commandCtx->session->credentialsChangeAttempts += 1;
-            return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Validation failed", commandCtx->rxCounter, true);
+            return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Validation failed", true);
         }
         return closeWsWithCmdCtx(commandCtx, WS_CLOSE_POLICY_VIOLATION, nullptr);
     }
@@ -1836,14 +1853,14 @@ error_validation_failed:
     // Change the user public key
     if (userChangeCredentials(commandCtx->session->userId, commandCtx->session->userId, publicKeyBuf) != ESP_OK) {
         ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: failed to update the user's credentials.");
-        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to change user credentials", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to change user credentials", true);
     }
 
     commandCtx->session->mustChangeCredentials = 0;
 
     // Done
     ESP_LOGD(TAG, "CHANGE USER CREDENTIALS command: credentials updated successfully.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
 }
 
 static esp_err_t handleOtaBegin(CommandContext_t *commandCtx)
@@ -1853,11 +1870,11 @@ static esp_err_t handleOtaBegin(CommandContext_t *commandCtx)
 
     if (commandCtx->session->isAdmin == 0) {
         ESP_LOGD(TAG, "OTA BEGIN command: insufficient privileges.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_ALLOWED, "Insufficient privileges", true);
     }
     if (commandCtx->session->flags & SESSION_FLAG_OTA_UPDATE) {
         ESP_LOGD(TAG, "OTA BEGIN command: an update is already active for this session.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "Update already active", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "Update already active", true);
     }
 
     // Get the image size
@@ -1870,13 +1887,13 @@ static esp_err_t handleOtaBegin(CommandContext_t *commandCtx)
     err = otaBegin(imageSize);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "OTA BEGIN command: failed to start the update.");
-        return buildAndSendErrorReply(commandCtx, err, "Failed to start update", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, err, "Failed to start update", true);
     }
 
     // Done
     commandCtx->session->flags |= SESSION_FLAG_OTA_UPDATE;
     ESP_LOGD(TAG, "OTA BEGIN command: update started successfully.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
 }
 
 static esp_err_t handleOtaWrite(CommandContext_t *commandCtx)
@@ -1886,7 +1903,7 @@ static esp_err_t handleOtaWrite(CommandContext_t *commandCtx)
 
     if (!(commandCtx->session->flags & SESSION_FLAG_OTA_UPDATE)) {
         ESP_LOGD(TAG, "OTA WRITE command: no update is active for this session.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "No update active", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "No update active", true);
     }
 
     // Get the chunk size
@@ -1902,12 +1919,12 @@ static esp_err_t handleOtaWrite(CommandContext_t *commandCtx)
     }
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "OTA WRITE command: failed to write the image data.");
-        return buildAndSendErrorReply(commandCtx, err, "Failed to write image data", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, err, "Failed to write image data", true);
     }
 
     // Done
     ESP_LOGD(TAG, "OTA WRITE command: update completed successfully; rebooting in 5 seconds...");
-    err = buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    err = buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
     restartErr = taskCreate(&otaRestartTask, otaRestartTaskMain, "iotcomm-restart", 2048, nullptr, 5, tskNO_AFFINITY);
     if (restartErr != ESP_OK) {
         esp_restart();
@@ -1923,7 +1940,7 @@ static esp_err_t handleOtaCancel(CommandContext_t *commandCtx)
     }
     if (!(commandCtx->session->flags & SESSION_FLAG_OTA_UPDATE)) {
         ESP_LOGD(TAG, "OTA CANCEL command: no update is active for this session.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "No update active", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_INVALID_STATE, "No update active", true);
     }
 
     // Cancel current update operation
@@ -1932,7 +1949,7 @@ static esp_err_t handleOtaCancel(CommandContext_t *commandCtx)
 
     // Done
     ESP_LOGD(TAG, "OTA CANCEL command: update canceled.");
-    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, commandCtx->rxCounter, true);
+    return buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
 }
 
 static esp_err_t handleUdpOpen(CommandContext_t *commandCtx)
@@ -1956,7 +1973,7 @@ static esp_err_t handleUdpOpen(CommandContext_t *commandCtx)
     }
     if (commandCtx->serverCtx->udpListenPort == 0) {
         ESP_LOGD(TAG, "UDP OPEN command: UDP support is disabled.");
-        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_SUPPORTED, "UDP disabled", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, ESP_ERR_NOT_SUPPORTED, "UDP disabled", true);
     }
 
     memset(serverUdpNonce, 0, sizeof(serverUdpNonce));
@@ -1974,7 +1991,7 @@ on_error:
         memset(udpSalt, 0, sizeof(udpSalt));
         memset(derivedKey, 0, sizeof(derivedKey));
         memset(udpConnectionIdBuf, 0, sizeof(udpConnectionIdBuf));
-        return buildAndSendErrorReply(commandCtx, err, "Failed to open UDP session", commandCtx->rxCounter, true);
+        return buildAndSendErrorReply(commandCtx, err, "Failed to open UDP session", true);
     }
     do {
         if (randomize((uint8_t *)&udpConnectionId, sizeof(udpConnectionId)) != ESP_OK) {
@@ -2037,7 +2054,7 @@ on_error:
     memset(udpSalt, 0, sizeof(udpSalt));
     memset(derivedKey, 0, sizeof(derivedKey));
     memset(udpConnectionIdBuf, 0, sizeof(udpConnectionIdBuf));
-    err = buildAndSendReply(commandCtx, reply, bw.written, commandCtx->rxCounter, true);
+    err = buildAndSendReply(commandCtx, reply, bw.written, true);
     if (err == ESP_OK) {
         rwMutexLockWrite(&commandCtx->serverCtx->sessions.mtx);
         memcpy(commandCtx->session->clientUdpNonce, clientUdpNonce, sizeof(commandCtx->session->clientUdpNonce));
@@ -2143,98 +2160,13 @@ static void handleSessionEnd(SessionInfo_t *session)
     handler(&event);
 }
 
-static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, uint32_t replyCounter,
-                                   bool closeOnError)
+static esp_err_t buildAndSendReply(CommandContext_t *commandCtx, const uint8_t *plaintextOut, size_t plaintextOutLen, bool closeOnError)
 {
-    GrowableBuffer_t *ciphertextOut = &commandCtx->session->ciphertextOut;
-    WebSocketPacketHeader_t *hdr;
-    uint32_t nextTxCounter;
-    httpd_ws_frame_t frame;
-    uint8_t iv[SESSION_IV_LEN];
-    size_t toSendSize;
-    uint8_t *toSendPtr;
-    httpd_ws_type_t toSendFrameType;
-    esp_err_t err;
-
-    if (commandCtx->serverHandle == nullptr) {
-        return ESP_OK;
-    }
-
-    // The plain text must not be empty
-    if (plaintextOutLen == 0) {
-        return ESP_FAIL;
-    }
-
-    // Prepare output for encrypted message
-    gbReset(ciphertextOut, false);
-    if (!gbEnsureSize(ciphertextOut, sizeof(WebSocketPacketHeader_t) + plaintextOutLen + TAG_LEN)) {
-        err = ESP_ERR_NO_MEM;
-on_error:
-        return (closeOnError) ? closeWsWithCmdCtxAndError(commandCtx, "reply", err) : err;
-    }
-
-    // Header
-    hdr = (WebSocketPacketHeader_t *)ciphertextOut->buffer;
-    hdr->v = VERSION;
-    be16enc(hdr->cmd, commandCtx->cmd);
-    hdr->filler1 = 0;
-    be32enc(hdr->replyCounter, replyCounter);
-    be32enc(hdr->counter, commandCtx->session->nextTxCounter);
-    hdr->filler2 = 0;
-
-    // Build IV
-    memcpy(iv, commandCtx->session->serverBaseIV, SESSION_IV_LEN);
-    nextTxCounter = commandCtx->session->nextTxCounter;
-    for (size_t i = 0; i < 4; i++) {
-        iv[SESSION_IV_LEN-i-1] ^= (uint8_t)((nextTxCounter >> (i << 3)) & 0xFF);
-    }
-
-    // Encrypt message
-    err = aesEncrypt(&commandCtx->session->serverAesCtx, plaintextOut, plaintextOutLen, iv, SESSION_IV_LEN, (const uint8_t *)hdr,
-                     sizeof(WebSocketPacketHeader_t), ciphertextOut->buffer + sizeof(WebSocketPacketHeader_t));
-    if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Failed to encrypt the WebSocket payload. Error: %d.", err);
-        goto on_error;
-    }
-
-    // Send it
-    toSendSize = sizeof(WebSocketPacketHeader_t) + plaintextOutLen + TAG_LEN;
-    toSendPtr = ciphertextOut->buffer;
-    toSendFrameType = HTTPD_WS_TYPE_BINARY;
-    while (toSendSize > 0) {
-        // Build frame
-        memset(&frame, 0, sizeof(frame));
-        frame.type = toSendFrameType;
-        if (toSendSize <= MAX_OUTPUT_FRAME_SIZE) {
-            frame.len = toSendSize;
-            frame.final = false;
-        }
-        else {
-            frame.len = MAX_OUTPUT_FRAME_SIZE;
-            frame.final = true;
-        }
-        frame.payload = toSendPtr;
-
-        toSendPtr += frame.len;
-        toSendSize -= frame.len;
-        toSendFrameType = HTTPD_WS_TYPE_CONTINUE;
-
-        err = httpd_ws_send_frame_async(commandCtx->serverHandle, commandCtx->sockfd, &frame);
-        if (err != ESP_OK) {
-            ESP_LOGD(TAG, "Failed to send the WebSocket frame. Error: %d.", err);
-            goto on_error;
-        }
-    }
-
-    // Increment TX counter
-    commandCtx->session->nextTxCounter += 1;
-
-    // Done
-    return ESP_OK;
+    return encryptAndSend(commandCtx->session, commandCtx->serverHandle, commandCtx->cmd, plaintextOut, plaintextOutLen,
+                          &commandCtx->rxCounter, closeOnError);
 }
 
-static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, uint32_t replyCounter,
-                                        bool closeOnError)
+static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t code, const char *message, bool closeOnError)
 {
     uint8_t buf[4 + 128 + 1];
     size_t bufUsed;
@@ -2253,7 +2185,118 @@ static esp_err_t buildAndSendErrorReply(CommandContext_t *commandCtx, uint32_t c
     }
 
     // Send reply
-    return buildAndSendReply(commandCtx, buf, bufUsed, replyCounter, closeOnError);
+    return encryptAndSend(commandCtx->session, commandCtx->serverHandle, commandCtx->cmd, buf, bufUsed, &commandCtx->rxCounter,
+                          closeOnError);
+}
+
+static esp_err_t encryptAndSend(SessionInfo_t *session, httpd_handle_t serverHandle, uint16_t cmd, const uint8_t *plaintextOut,
+                                size_t plaintextOutLen, const uint64_t *replyCounter, bool closeOnError)
+{
+    GrowableBuffer_t *ciphertextOut = &session->ciphertextOut;
+    PacketHeader_t *hdr;
+    uint64_t nextTxCounter;
+    httpd_ws_frame_t frame;
+    uint8_t iv[SESSION_IV_LEN];
+    size_t toSendSize, hdrSize;
+    bool fragmented;
+    uint8_t *toSendPtr;
+    httpd_ws_type_t toSendFrameType;
+    esp_err_t err;
+
+    if (!serverHandle) {
+        return ESP_OK;
+    }
+    if (session->nextTxCounter == UINT64_MAX) {
+        return closeWsWithSession(session, serverHandle, WS_CLOSE_INVALID_PAYLOAD, "Counter exhausted.");
+    }
+
+    // Prepare output for encrypted message
+    gbReset(ciphertextOut, false);
+    hdrSize = sizeof(PacketHeader_t);
+    if (replyCounter) {
+        hdrSize += PACKET_REPLY_COUNTER_LEN;
+    }
+    if (!gbEnsureSize(ciphertextOut, hdrSize + plaintextOutLen + TAG_LEN)) {
+        err = ESP_ERR_NO_MEM;
+on_error:
+        return (closeOnError) ? closeWsWithSessionAndError(session, serverHandle, "reply", err) : err;
+    }
+
+    // Header
+    hdr = (PacketHeader_t *)ciphertextOut->buffer;
+    hdr->v = VERSION;
+    be16enc(hdr->cmd, cmd);
+    hdr->flags = (replyCounter) ? PACKET_FLAG_REPLY : 0;
+    be64enc(hdr->counter, session->nextTxCounter);
+    if (replyCounter) {
+        be64enc(ciphertextOut->buffer + sizeof(PacketHeader_t), *replyCounter);
+    }
+
+    // Build IV
+    memcpy(iv, session->serverBaseIV, SESSION_IV_LEN);
+    nextTxCounter = session->nextTxCounter;
+    for (size_t i = 0; i < 8; i++) {
+        iv[SESSION_IV_LEN-i-1] ^= (uint8_t)((nextTxCounter >> (i << 3)) & 0xFF);
+    }
+
+    // Encrypt message
+    err = aesEncrypt(&session->serverAesCtx, plaintextOut, plaintextOutLen, iv, SESSION_IV_LEN, (const uint8_t *)hdr, hdrSize,
+                     ciphertextOut->buffer + hdrSize);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "Failed to encrypt the WebSocket payload. Error: %d.", err);
+        goto on_error;
+    }
+
+    // Send it
+    toSendSize = hdrSize + plaintextOutLen + TAG_LEN;
+    toSendPtr = ciphertextOut->buffer;
+    toSendFrameType = HTTPD_WS_TYPE_BINARY;
+    fragmented = toSendSize > MAX_OUTPUT_FRAME_SIZE;
+    while (toSendSize > 0) {
+        // Build frame
+        memset(&frame, 0, sizeof(frame));
+        frame.type = toSendFrameType;
+        frame.fragmented = fragmented;
+        if (toSendSize <= MAX_OUTPUT_FRAME_SIZE) {
+            frame.len = toSendSize;
+            frame.final = true;
+        }
+        else {
+            frame.len = MAX_OUTPUT_FRAME_SIZE;
+            frame.final = false;
+        }
+        frame.payload = toSendPtr;
+
+        toSendPtr += frame.len;
+        toSendSize -= frame.len;
+        toSendFrameType = HTTPD_WS_TYPE_CONTINUE;
+
+        err = httpd_ws_send_frame_async(serverHandle, session->sockfd, &frame);
+        if (err != ESP_OK) {
+            ESP_LOGD(TAG, "Failed to send the WebSocket frame. Error: %d.", err);
+            goto on_error;
+        }
+    }
+
+    // Increment TX counter
+    session->nextTxCounter += 1;
+
+    // Done
+    return ESP_OK;
+}
+
+static esp_err_t closeWsWithSession(SessionInfo_t *session, httpd_handle_t serverHandle, uint16_t code, const char *reason)
+{
+    session->isClosed = 1;
+    return closeWs(serverHandle, session->sockfd, code, reason) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t closeWsWithSessionAndError(SessionInfo_t *session, httpd_handle_t serverHandle, const char *zone, esp_err_t err)
+{
+    char reason[64];
+
+    snprintf(reason, sizeof(reason), "%s:%d", zone, err);
+    return closeWsWithSession(session, serverHandle, WS_CLOSE_INTERNAL_ERROR, reason);
 }
 
 static esp_err_t closeWsWithCmdCtx(CommandContext_t *commandCtx, uint16_t code, const char *reason)
@@ -2609,11 +2652,11 @@ static void udpServerTaskMain(Task_t *task, void *arg)
 
 static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, size_t packetLen, const IPAddress_t *remoteAddr)
 {
-    const WebSocketPacketHeader_t *hdr;
+    const UdpPacketHeader_t *hdr;
     SessionInfo_t *session = nullptr;
     uint32_t udpConnectionId;
-    uint32_t rxCounter;
-    uint32_t expectedRxCounter = 0;
+    uint64_t rxCounter;
+    uint64_t expectedRxCounter = 0;
     uint8_t udpClientAesKey[AES_KEY_LEN];
     uint8_t udpClientBaseIV[SESSION_IV_LEN];
     uint8_t iv[SESSION_IV_LEN];
@@ -2624,30 +2667,25 @@ static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, 
     CommandContext_t commandCtx;
     esp_err_t err;
 
-    if (packetLen <= sizeof(WebSocketPacketHeader_t) + TAG_LEN) {
+    if (packetLen < sizeof(UdpPacketHeader_t) + TAG_LEN) {
         return;
     }
 
-    hdr = (const WebSocketPacketHeader_t *)packet;
-    if (hdr->v != VERSION) {
+    hdr = (const UdpPacketHeader_t *)packet;
+    if (hdr->packetHeader.v != VERSION || hdr->packetHeader.flags != 0) {
         return;
     }
 
-    udpConnectionId = be32dec(hdr->replyCounter);
-    rxCounter = be32dec(hdr->counter);
-    ciphertextLen = packetLen - sizeof(WebSocketPacketHeader_t);
+    udpConnectionId = be32dec(hdr->udpConnectionId);
+    rxCounter = be64dec(hdr->packetHeader.counter);
+    if (rxCounter == UINT64_MAX) {
+        return;
+    }
+    ciphertextLen = packetLen - sizeof(UdpPacketHeader_t);
     plaintextLen = ciphertextLen - TAG_LEN;
-
-    ESP_LOGD(TAG, "Received %d bytes. conn:%u ipv6:%d %u.%u.%u.%u", packetLen, udpConnectionId,
-        remoteAddr->isIPv6 ? 1 : 0, remoteAddr->ip[0], remoteAddr->ip[1], remoteAddr->ip[2], remoteAddr->ip[3]);
-
 
     rwMutexLockRead(&serverCtx->sessions.mtx);
     for (SessionInfo_t *candidate = serverCtx->sessions.first; candidate; candidate = candidate->next) {
-
-        ESP_LOGD(TAG, "Candidate[%d]. conn:%u ipv6:%d %u.%u.%u.%u", candidate->isClosed, candidate->udpConnectionId,
-            candidate->addr.isIPv6 ? 1 : 0, candidate->addr.ip[0], candidate->addr.ip[1], candidate->addr.ip[2], candidate->addr.ip[3]);
-
         if (candidate->isClosed == 0 && candidate->udpConnectionId == udpConnectionId && ipAddressEqual(&candidate->addr, remoteAddr)) {
             session = candidate;
             incrementSessionRefCount(session);
@@ -2660,57 +2698,48 @@ static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, 
     }
     rwMutexUnlockRead(&serverCtx->sessions.mtx);
 
-    if ((!session) || rxCounter < expectedRxCounter) {
-
-        ESP_LOGD(TAG, "Error 1 %u %u.", rxCounter, expectedRxCounter);
-        if (session) {
-            __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
-            decrementSessionRefCount(session);
-        }
+    if (!session) {
         return;
     }
 
-    plaintext = (uint8_t *)malloc(plaintextLen);
-    if (!plaintext) {
-        __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
-        decrementSessionRefCount(session);
-        return;
+    if (rxCounter < expectedRxCounter) {
+        goto done;
+    }
+
+    if (plaintextLen > 0) {
+        plaintext = (uint8_t *)malloc(plaintextLen);
+        if (!plaintext) {
+            goto done;
+        }
     }
 
     memcpy(iv, udpClientBaseIV, sizeof(iv));
-    for (size_t i = 0; i < 4; i++) {
+    for (size_t i = 0; i < 8; i++) {
         iv[SESSION_IV_LEN - i - 1] ^= (uint8_t)((rxCounter >> (i << 3)) & 0xFF);
     }
 
     aesInit(&aesCtx);
     err = aesSetKey(&aesCtx, udpClientAesKey, sizeof(udpClientAesKey));
     if (err == ESP_OK) {
-        err = aesDecrypt(&aesCtx, packet + sizeof(WebSocketPacketHeader_t), ciphertextLen, iv, sizeof(iv), (const uint8_t *)hdr,
-                         sizeof(WebSocketPacketHeader_t), plaintext);
+        err = aesDecrypt(&aesCtx, packet + sizeof(UdpPacketHeader_t), ciphertextLen, iv, sizeof(iv), (const uint8_t *)hdr,
+                         sizeof(UdpPacketHeader_t), plaintext);
     }
     aesDone(&aesCtx);
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Error 2 %d.", err);
-
-        free(plaintext);
-        __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
-        decrementSessionRefCount(session);
-        return;
+        goto done;
     }
-
-    ESP_LOGD(TAG, "no Error.");
 
     memset(&commandCtx, 0, sizeof(commandCtx));
     commandCtx.serverCtx = serverCtx;
     commandCtx.sockfd = udpServerSocket;
     commandCtx.session = session;
-    commandCtx.cmd = be16dec(hdr->cmd);
+    commandCtx.cmd = be16dec(hdr->packetHeader.cmd);
     commandCtx.br = br_init(plaintext, plaintextLen);
     commandCtx.rxCounter = rxCounter;
     dispatchCommand(&commandCtx);
 
     if (session->udpConnectionId == udpConnectionId && session->udpNextRxCounter <= rxCounter) {
-        if (rxCounter == UINT32_MAX) {
+        if (rxCounter == UINT64_MAX - 1) {
             session->udpConnectionId = 0;
             session->udpNextRxCounter = 0;
             memset(session->clientUdpNonce, 0, sizeof(session->clientUdpNonce));
@@ -2723,7 +2752,10 @@ static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, 
         }
     }
 
-    free(plaintext);
+done:
+    if (plaintext) {
+        free(plaintext);
+    }
     __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
     decrementSessionRefCount(session);
 }

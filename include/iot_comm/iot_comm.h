@@ -59,8 +59,8 @@
 //         UDP connection id: 4-byte big-endian opaque identifier
 //           server UDP nonce: raw 16-byte nonce
 //
-// UDP data packets reuse the encrypted binary packet header layout:
-//     version(1) | cmd(2) | reserved(1) | udpConnectionId(4) | counter(4) | reserved(4)
+// UDP data packets use this encrypted binary packet header layout:
+//     udpConnectionId(4) | version(1) | cmd(2) | flags(1) | counter(8)
 //
 
 // Websocket close codes
