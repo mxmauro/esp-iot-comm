@@ -831,7 +831,7 @@ static esp_err_t captivePortalSetupDns()
 
     err = taskCreate(&cpDnsTask, cpDnsServerTask, "cp_dns_server", 4096, nullptr, 4, tskNO_AFFINITY);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start the DNS server.");
+        ESP_LOGE(TAG, "Failed to start the DNS server. Error: %d.", err);
         close(cpDnsSocket);
         cpDnsSocket = -1;
         return err;

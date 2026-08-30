@@ -222,13 +222,13 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     }
 
     // Change user credentials
-    if (requestingUserId == userId) {
-        // Normal user request (or admin changing own credentials)
-        forceAndReset = false;
-    }
-    else if (requestingUserId == users[0].id) {
+    if (requestingUserId == users[0].id) {
         // Admin request
         forceAndReset = true;
+    }
+    else if (requestingUserId == userId) {
+        // Normal user request (or admin changing own credentials)
+        forceAndReset = false;
     }
     else {
         ESP_LOGE(TAG, "Only the root administrator can change another user's credentials.");
@@ -248,7 +248,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     // Update credentials
     err = internalChangeUserCredentials(user, publicKey, forceAndReset, forceAndReset);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to update the user's credentials.");
+        ESP_LOGE(TAG, "Failed to update the user's credentials. Error: %d.", err);
         memcpy(user, &origUser, sizeof(User_t));
         memset(&origUser, 0, sizeof(User_t));
         return err;
@@ -419,6 +419,7 @@ static esp_err_t internalChangeUserCredentials(User_t *user, const uint8_t publi
         // NOTE: 6 bits are used so every 64 minutes it exists the possibility of a wrong check
         if (user->lastCredentialsChangeMin == minMod64) {
             // If we are changing, disallow both double change and reset/change
+            ESP_LOGW(TAG, "Credential change request was rejected by the throttling policy.");
             return X_ESP_ERR_CANCELLED;
         }
     }

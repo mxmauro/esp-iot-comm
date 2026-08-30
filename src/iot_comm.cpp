@@ -2577,7 +2577,7 @@ static esp_err_t startUdpServer(ServerContext_t *serverCtx)
 
     err = taskCreate(&udpServerTask, udpServerTaskMain, "iotcomm-udp", 6144, serverCtx, 4, tskNO_AFFINITY);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start the UDP server task.");
+        ESP_LOGE(TAG, "Failed to start the UDP server task. Error: %d.", err);
         close(udpServerSocket);
         udpServerSocket = -1;
         return err;
