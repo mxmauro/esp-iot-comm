@@ -67,6 +67,8 @@ static const char* TAG = "IotComm";
 
 #define MAX_OUTPUT_FRAME_SIZE 4096
 
+#define GB_STR_AND_SIZE(str) (str), (sizeof(str) - 1)
+
 // -----------------------------------------------------------------------------
 
 typedef enum IncomingBufferType_e {
@@ -309,6 +311,8 @@ static void udpServerTaskMain(Task_t *task, void *arg);
 static void processUdpPacket(ServerContext_t *serverCtx, const uint8_t *packet, size_t packetLen, const IPAddress_t *remoteAddr);
 
 static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen, bool isUrl);
+static bool extGbAddBool(GrowableBuffer_t *buf, bool value);
+static bool extGbAddSizeT(GrowableBuffer_t *buf, size_t value);
 
 static esp_err_t sha256Build(uint8_t hash[SHA256_SIZE], const uint8_t *const *parts, const size_t *partLens, size_t partsCount);
 
@@ -802,8 +806,14 @@ static esp_err_t serveWsInit(httpd_req_t *req)
     AutoRundownProtection rpLock(rp);
     esp_err_t err;
     ServeWsInitContext_t *ctx;
+    ServerContext_t *serverCtx;
 
     if (!rpLock.acquired()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    serverCtx = (ServerContext_t *)httpd_get_global_user_ctx(req->handle);
+    if (!serverCtx) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -909,17 +919,19 @@ error_invalid_data:
     challengesAdd(ctx->challengeCookie, &ctx->remoteAddr, &ctx->challenge);
 
     if (
-        (!gbAdd(&ctx->respBody, "{\"token\":\"", 10)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("{\"token\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->challengeCookie, sizeof(ctx->challengeCookie), false)) ||
-        (!gbAdd(&ctx->respBody, "\",\"serverNonce\":\"", 17)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\",\"serverNonce\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->challenge.serverNonce, sizeof(ctx->challenge.serverNonce), false)) ||
-        (!gbAdd(&ctx->respBody, "\",\"serverPublicKey\":\"", 21)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\",\"serverPublicKey\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->challenge.ecdhServerPublicKey, sizeof(ctx->challenge.ecdhServerPublicKey), false)) ||
-        (!gbAdd(&ctx->respBody, "\",\"devicePublicKey\":\"", 21)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\",\"devicePublicKey\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->devicePublicKey, sizeof(ctx->devicePublicKey), false)) ||
-        (!gbAdd(&ctx->respBody, "\",\"deviceSignature\":\"", 21)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\",\"deviceSignature\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->deviceSignature, sizeof(ctx->deviceSignature), false)) ||
-        (!gbAdd(&ctx->respBody, "\"}", 2))
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\",\"maxPacketSize\":"))) ||
+        (!extGbAddSizeT(&ctx->respBody, serverCtx->maxPacketSize)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("}")))
     ) {
         err = ESP_ERR_NO_MEM;
         goto done;
@@ -1140,28 +1152,30 @@ error_not_auth:
         goto done;
     }
 
-    if (!(gbAdd(&ctx->respBody, "{\"mustChangeCredentials\":", 25))) {
+    err = userMustChangeCredentials(ctx->challenge->userId, &ctx->b);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    if (!(gbAdd(&ctx->respBody, GB_STR_AND_SIZE("{\"mustChangeCredentials\":")) && extGbAddBool(&ctx->respBody, ctx->b))) {
 error_no_mem:
         err = ESP_ERR_NO_MEM;
         goto done;
     }
-    userMustChangeCredentials(ctx->challenge->userId, &ctx->b);
-    if (ctx->b) {
-        if (!gbAdd(&ctx->respBody, "true", 4)) {
-            goto error_no_mem;
-        }
+
+    err = userIsAdmin(ctx->challenge->userId, &ctx->b);
+    if (err != ESP_OK) {
+        goto done;
     }
-    else {
-        if (!gbAdd(&ctx->respBody, "false", 5)) {
-            goto error_no_mem;
-        }
+    if (!(gbAdd(&ctx->respBody, GB_STR_AND_SIZE(",\"isAdmin\":")) && extGbAddBool(&ctx->respBody, ctx->b))) {
+        goto error_no_mem;
     }
+
     if (
-        (!gbAdd(&ctx->respBody, ",\"wsNonce\":\"", 12)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE(",\"wsNonce\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->challenge->wsNonce, sizeof(ctx->challenge->wsNonce), false)) ||
-        (!gbAdd(&ctx->respBody, "\",\"wsTicket\":\"", 14)) ||
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\",\"wsTicket\":\""))) ||
         (!extGbAddB64(&ctx->respBody, ctx->challenge->wsTicket, sizeof(ctx->challenge->wsTicket), true)) ||
-        (!gbAdd(&ctx->respBody, "\"}", 2))
+        (!gbAdd(&ctx->respBody, GB_STR_AND_SIZE("\"}")))
     ) {
         goto error_no_mem;
     }
@@ -1922,13 +1936,25 @@ static esp_err_t handleOtaWrite(CommandContext_t *commandCtx)
         return buildAndSendErrorReply(commandCtx, err, "Failed to write image data", true);
     }
 
-    // Done
-    ESP_LOGD(TAG, "OTA WRITE command: update completed successfully; rebooting in 5 seconds...");
-    err = buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
-    restartErr = taskCreate(&otaRestartTask, otaRestartTaskMain, "iotcomm-restart", 2048, nullptr, 5, tskNO_AFFINITY);
-    if (restartErr != ESP_OK) {
-        esp_restart();
+    // Reply
+    if (completed) {
+        ESP_LOGD(TAG, "OTA WRITE command: update completed successfully; rebooting in 5 seconds...");
     }
+    else {
+        ESP_LOGD(TAG, "OTA WRITE command: chunk written successfully.");
+    }
+
+    err = buildAndSendErrorReply(commandCtx, ESP_OK, nullptr, true);
+
+    // If completed, schedule a reboot after 5 seconds. If the task creation fails, reboot immediately.
+    if (completed) {
+        restartErr = taskCreate(&otaRestartTask, otaRestartTaskMain, "iotcomm-restart", 2048, nullptr, 5, tskNO_AFFINITY);
+        if (restartErr != ESP_OK) {
+            esp_restart();
+        }
+    }
+
+    // Done
     return err;
 }
 
@@ -2777,6 +2803,20 @@ static bool extGbAddB64(GrowableBuffer_t *buf, const uint8_t *src, size_t srcLen
         gbDel(buf, buf->used - (maxLen - usedLen), maxLen - usedLen);
     }
     return true;
+}
+
+static bool extGbAddBool(GrowableBuffer_t *buf, bool value)
+{
+    return gbAdd(buf, value ? "true" : "false", value ? 4 : 5);
+}
+
+static bool extGbAddSizeT(GrowableBuffer_t *buf, size_t value)
+{
+    char text[3 * sizeof(value) + 1];
+    int textLen;
+
+    textLen = snprintf(text, sizeof(text), "%zu", value);
+    return textLen > 0 && (size_t)textLen < sizeof(text) && gbAdd(buf, text, (size_t)textLen);
 }
 
 static esp_err_t sha256Build(uint8_t hash[SHA256_SIZE], const uint8_t *const *parts, const size_t *partLens, size_t partsCount)

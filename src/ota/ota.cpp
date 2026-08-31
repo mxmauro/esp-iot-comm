@@ -74,7 +74,7 @@ esp_err_t otaWrite(const uint8_t *data, size_t len, bool *completed)
     }
 
     if (len > imageSize - writtenSize) {
-        ESP_LOGE(TAG, "The write would exceed the expected image size. Written=" PRIuPTR " / Expected=" PRIuPTR " / To write=" PRIuPTR ".",
+        ESP_LOGE(TAG, "The write would exceed the expected image size. Written=%" PRIuPTR " / Expected=%" PRIuPTR " / To write=%" PRIuPTR ".",
                  writtenSize, imageSize, len);
         otaCancel();
         return ESP_FAIL;
@@ -82,7 +82,7 @@ esp_err_t otaWrite(const uint8_t *data, size_t len, bool *completed)
 
     err = esp_ota_write(handle, data, len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write " PRIuPTR " bytes at offset " PRIuPTR ". Error: %d.", len, writtenSize, err);
+        ESP_LOGE(TAG, "Failed to write %" PRIuPTR " bytes at offset %" PRIuPTR ". Error: %d.", len, writtenSize, err);
         otaCancel();
         return err;
     }
@@ -90,7 +90,7 @@ esp_err_t otaWrite(const uint8_t *data, size_t len, bool *completed)
     writtenSize += len;
     if (writtenSize < imageSize) {
         // Done
-        ESP_LOGI(TAG, "Written " PRIuPTR " of " PRIuPTR " bytes.", writtenSize, imageSize);
+        ESP_LOGI(TAG, "Written %" PRIuPTR " of %" PRIuPTR " bytes.", writtenSize, imageSize);
         return ESP_OK;
     }
 

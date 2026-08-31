@@ -58,6 +58,10 @@ The authenticated WebSocket path is a three-step flow:
 * `serverPublicKey`
 * `devicePublicKey`
 * `deviceSignature`
+* `maxPacketSize`
+
+`maxPacketSize` is the effective maximum encrypted packet size accepted by the server. It applies to complete WebSocket messages and UDP
+datagrams; application payloads must leave room for the protocol header and authentication tag.
 
 The device identity is the server identity for this handshake. Clients that pin or verify the device should verify `deviceSignature`
 against `devicePublicKey` over:
@@ -87,8 +91,11 @@ The user signature inside the decrypted payload must verify:
 The `/ws/auth` response returns:
 
 * `mustChangeCredentials`
+* `isAdmin`
 * `wsNonce`
 * `wsTicket`
+
+`isAdmin` is `true` when the authenticated user is the root administrator.
 
 `wsNonce` is still required after authentication because transport-key derivation is unchanged.
 
