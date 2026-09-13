@@ -3,6 +3,8 @@
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hkdf.h"
 #include "iot_comm/crypto/p256.h"
+#include "iot_comm/crypto/sha.h"
+#include "iot_comm/crypto/utils.h"
 #include "http_helpers.h"
 #include <cJSON.h>
 #include <convert.h>
@@ -11,23 +13,23 @@
 #include <growable_buffer.h>
 #include <mutex.h>
 
-#define MAX_BODY_SIZE 10240
+#define MAX_BODY_SIZE  10240
 #define MAX_QUERY_SIZE 1024
 
-#define NONCE_SIZE 12
-#define IV_SIZE 12
-#define AES_KEY_SIZE 32
+#define NONCE_SIZE       12
+#define IV_SIZE          12
+#define AES_KEY_SIZE     32
 #define AES_GCM_TAG_SIZE 16
 
 #define TAG "CaptivePortal"
 
 // -----------------------------------------------------------------------------
 
-typedef esp_err_t (*reqGetHandler)(httpd_req_t *req);
-typedef esp_err_t (*reqPostHandler)(httpd_req_t *req);
+typedef esp_err_t (*reqGetHandler)(httpd_req_t* req);
+typedef esp_err_t (*reqPostHandler)(httpd_req_t* req);
 
 typedef struct handlerInfo_s {
-    const char     *uri;
+    const char*    uri;
     reqGetHandler  get;
     reqPostHandler post;
 } handlerInfo_t;
@@ -36,63 +38,82 @@ typedef struct handlerInfo_s {
 
 static const char hkdfInfo[] = "iot-comm/provisioning/v1";
 
-extern const uint8_t webui_index_html_start[]     asm("_binary_index_html_start");
-extern const uint8_t webui_index_html_end[]       asm("_binary_index_html_end");
-extern const uint8_t webui_assets_app_js_start[]  asm("_binary_app_js_start");
-extern const uint8_t webui_assets_app_js_end[]    asm("_binary_app_js_end");
-extern const uint8_t webui_assets_app_css_start[] asm("_binary_app_css_start");
-extern const uint8_t webui_assets_app_css_end[]   asm("_binary_app_css_end");
+extern const uint8_t webui_index_html_gz_start[] asm("_binary_index_html_gz_start");
+extern const uint8_t webui_index_html_gz_end[] asm("_binary_index_html_gz_end");
+extern const uint8_t webui_assets_app_js_gz_start[] asm("_binary_app_js_gz_start");
+extern const uint8_t webui_assets_app_js_gz_end[] asm("_binary_app_js_gz_end");
+extern const uint8_t webui_assets_app_css_gz_start[] asm("_binary_app_css_gz_start");
+extern const uint8_t webui_assets_app_css_gz_end[] asm("_binary_app_css_gz_end");
 
 // -----------------------------------------------------------------------------
 
 static RWMutex rwNtx;
 static CaptivePortalProvisioningConfigHandler_t handler = nullptr;
-static void *handlerCtx = nullptr;
+static void* handlerCtx = nullptr;
+static CaptivePortalRootAuthorizationHandler_t rootAuthorization = nullptr;
+static void* rootAuthorizationCtx = nullptr;
 static uint8_t serverEcdhPrivateKey[P256_PRIVATE_KEY_SIZE] = {0};
 static char serverEcdhPublicKeyB64[P256_MAX_B64_PUBLIC_KEY_SIZE] = {0};
 static bool setupRootUser = true;
 static bool setupDeviceHostname = true;
+static bool requestWifiCredentials = false;
+static bool requireRootAuthorization = false;
+static uint8_t rootAuthorizationChallenge[SHA256_SIZE] = {0};
+static char rootAuthorizationChallengeB64[P256_MAX_B64_PRIVATE_KEY_SIZE] = {0};
+static bool rootAuthorizationChallengeValid = false;
 
 // -----------------------------------------------------------------------------
 
 static void capPortalDeinitNoLock();
 
-static esp_err_t handleRoot(httpd_req_t *req);
-static esp_err_t handleAppJs(httpd_req_t *req);
-static esp_err_t handleAppCss(httpd_req_t *req);
-static esp_err_t handleInitParams(httpd_req_t *req);
-static esp_err_t handleScanNetworks(httpd_req_t *req);
-static esp_err_t handleServerKey(httpd_req_t *req);
-static esp_err_t handleProvision(httpd_req_t *req);
+static esp_err_t handleRoot(httpd_req_t* req);
+static esp_err_t handleAppJs(httpd_req_t* req);
+static esp_err_t handleAppCss(httpd_req_t* req);
+static esp_err_t handleInitParams(httpd_req_t* req);
+static esp_err_t handleScanNetworks(httpd_req_t* req);
+static esp_err_t handleServerKey(httpd_req_t* req);
+static esp_err_t handleProvision(httpd_req_t* req);
 
-static esp_err_t redirectToRoot(httpd_req_t *req);
-static esp_err_t sendSuccess(httpd_req_t *req);
+static esp_err_t redirectToRoot(httpd_req_t* req);
+static esp_err_t sendSuccess(httpd_req_t* req);
 
-static esp_err_t sendEmbeddedFile(httpd_req_t *req, const char *type, const uint8_t *start, const uint8_t *end);
+static esp_err_t sendEmbeddedFile(httpd_req_t* req, const char* type, const uint8_t* start, const uint8_t* end, bool useGzip = false);
+static esp_err_t buildRootAuthorizationHash(const char* ssid, const char* password, uint8_t hash[SHA256_SIZE]);
+static esp_err_t generateRootAuthorizationChallenge();
 
 // -----------------------------------------------------------------------------
 
-esp_err_t capPortalInit(CaptivePortalConfig_t *config)
+esp_err_t capPortalInit(CaptivePortalConfig_t* config)
 {
     AutoRWMutex lock(rwNtx, false);
     P256KeyPair_t keyPair;
     esp_err_t err;
 
-    if (!(config && config->handler)) {
+    if (!(config && config->handler) || (config->requireRootAuthorization && !config->rootAuthorization) ||
+        (config->setupDeviceHostname && !config->requestWifiCredentials) ||
+        (config->requireRootAuthorization && !config->requestWifiCredentials))
+    {
         return ESP_ERR_INVALID_ARG;
     }
 
     handler = config->handler;
     handlerCtx = config->handlerCtx;
+    rootAuthorization = config->rootAuthorization;
+    rootAuthorizationCtx = config->rootAuthorizationCtx;
+    requestWifiCredentials = config->requestWifiCredentials;
     setupRootUser = config->setupRootUser;
     setupDeviceHostname = config->setupDeviceHostname;
+    requireRootAuthorization = config->requireRootAuthorization;
+    rootAuthorizationChallengeValid = false;
 
     // Generate server ECDH key pair for captive portal payload decryption
     p256KeyPairInit(&keyPair);
     err = ecdhGeneratePair(&keyPair);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = p256SavePrivateKey(&keyPair, serverEcdhPrivateKey);
-        if (err == ESP_OK) {
+        if (err == ESP_OK)
+        {
             size_t publicKeyLen = sizeof(serverEcdhPublicKeyB64);
 
             err = p256SavePublicKeyB64(&keyPair, serverEcdhPublicKeyB64, &publicKeyLen, false);
@@ -100,7 +121,8 @@ esp_err_t capPortalInit(CaptivePortalConfig_t *config)
     }
     p256KeyPairDone(&keyPair);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to initialize state. Error: %d.", err);
         capPortalDeinitNoLock();
         return err;
@@ -118,45 +140,50 @@ void capPortalDeinit()
     capPortalDeinitNoLock();
 }
 
-esp_err_t capPortalHandleRequest(httpd_req_t *req)
+esp_err_t capPortalHandleRequest(httpd_req_t* req)
 {
-    static const handlerInfo_t handlers[13] = {
-        { "/",                    handleRoot,         nullptr },
-        { "/assets/app.js",       handleAppJs,        nullptr },
-        { "/assets/app.css",      handleAppCss,       nullptr },
-        { "/init-params",         handleInitParams,   nullptr },
-        { "/scan-networks",       handleScanNetworks, nullptr },
-        { "/server-key",          handleServerKey,    nullptr },
-        { "/provision",           nullptr,            handleProvision },
-        { "/success.txt",         sendSuccess,        nullptr },
-        { "/generate_204",        redirectToRoot,     nullptr },
-        { "/redirect",            redirectToRoot,     nullptr },
-        { "/hotspot-detect.html", redirectToRoot,     nullptr },
-        { "/canonical.html",      redirectToRoot,     nullptr },
-        { "/ncsi.txt",            redirectToRoot,     nullptr }
-    };
+    static const handlerInfo_t handlers[13] = {{"/", handleRoot, nullptr},
+                                               {"/assets/app.js", handleAppJs, nullptr},
+                                               {"/assets/app.css", handleAppCss, nullptr},
+                                               {"/init-params", handleInitParams, nullptr},
+                                               {"/scan-networks", handleScanNetworks, nullptr},
+                                               {"/server-key", handleServerKey, nullptr},
+                                               {"/provision", nullptr, handleProvision},
+                                               {"/success.txt", sendSuccess, nullptr},
+                                               {"/generate_204", redirectToRoot, nullptr},
+                                               {"/redirect", redirectToRoot, nullptr},
+                                               {"/hotspot-detect.html", redirectToRoot, nullptr},
+                                               {"/canonical.html", redirectToRoot, nullptr},
+                                               {"/ncsi.txt", redirectToRoot, nullptr}};
 
     AutoRWMutex lock(rwNtx, true);
 
-    if (!req) {
+    if (!req)
+    {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!handler) {
+    if (!handler)
+    {
         return ESP_ERR_INVALID_STATE;
     }
 
-    for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {
-        if (strcmp(req->uri, handlers[i].uri) == 0) {
-            switch (req->method) {
+    for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++)
+    {
+        if (strcmp(req->uri, handlers[i].uri) == 0)
+        {
+            switch (req->method)
+            {
                 case HTTP_GET:
-                    if (!handlers[i].get) {
+                    if (!handlers[i].get)
+                    {
                         goto error_not_found;
                     }
                     return handlers[i].get(req);
 
                 case HTTP_POST:
-                    if (!handlers[i].post) {
+                    if (!handlers[i].post)
+                    {
                         goto error_not_found;
                     }
                     return handlers[i].post(req);
@@ -175,163 +202,201 @@ static void capPortalDeinitNoLock()
 {
     handler = nullptr;
     handlerCtx = nullptr;
+    rootAuthorization = nullptr;
+    rootAuthorizationCtx = nullptr;
     setupRootUser = true;
     setupDeviceHostname = true;
+    requestWifiCredentials = false;
     memset(serverEcdhPrivateKey, 0, sizeof(serverEcdhPrivateKey));
     memset(serverEcdhPublicKeyB64, 0, sizeof(serverEcdhPublicKeyB64));
+    memset(rootAuthorizationChallenge, 0, sizeof(rootAuthorizationChallenge));
+    memset(rootAuthorizationChallengeB64, 0, sizeof(rootAuthorizationChallengeB64));
+    rootAuthorizationChallengeValid = false;
+    requireRootAuthorization = false;
 }
 
-static esp_err_t handleRoot(httpd_req_t *req)
+static esp_err_t handleRoot(httpd_req_t* req)
 {
     esp_err_t err;
 
-    err = sendEmbeddedFile(req, "text/html", webui_index_html_start, webui_index_html_end);
+    err = sendEmbeddedFile(req, "text/html", webui_index_html_gz_start, webui_index_html_gz_end, true);
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t handleAppJs(httpd_req_t *req)
+static esp_err_t handleAppJs(httpd_req_t* req)
 {
     esp_err_t err;
 
-    err = sendEmbeddedFile(req, "application/javascript", webui_assets_app_js_start, webui_assets_app_js_end);
+    err = sendEmbeddedFile(req, "application/javascript", webui_assets_app_js_gz_start, webui_assets_app_js_gz_end, true);
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t handleAppCss(httpd_req_t *req)
+static esp_err_t handleAppCss(httpd_req_t* req)
 {
     esp_err_t err;
 
-    err = sendEmbeddedFile(req, "text/css", webui_assets_app_css_start, webui_assets_app_css_end);
+    err = sendEmbeddedFile(req, "text/css", webui_assets_app_css_gz_start, webui_assets_app_css_gz_end, true);
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t handleInitParams(httpd_req_t *req)
+static esp_err_t handleInitParams(httpd_req_t* req)
 {
-    cJSON *jsonRoot = nullptr;
-    char *jsonString = nullptr;
+    cJSON* jsonRoot = nullptr;
+    char* jsonString = nullptr;
     esp_err_t err;
+
+    if (requireRootAuthorization)
+    {
+        err = generateRootAuthorizationChallenge();
+        if (err != ESP_OK)
+        {
+            return httpSendInternalErrorResponse(req, err, nullptr);
+        }
+    }
 
     jsonRoot = cJSON_CreateObject();
-    if (!jsonRoot) {
-error_no_mem:
+    if (!jsonRoot)
+    {
+    error_no_mem:
         err = ESP_ERR_NO_MEM;
         goto done;
     }
 
-    if (
+    if ((!cJSON_AddBoolToObject(jsonRoot, "requestWifiCredentials", requestWifiCredentials)) ||
         (!cJSON_AddBoolToObject(jsonRoot, "setupRootUser", setupRootUser)) ||
-        (!cJSON_AddBoolToObject(jsonRoot, "setupDeviceHostname", setupDeviceHostname))
-    ) {
+        (!cJSON_AddBoolToObject(jsonRoot, "setupDeviceHostname", setupDeviceHostname)) ||
+        (!cJSON_AddBoolToObject(jsonRoot, "requireRootAuthorization", requireRootAuthorization)) ||
+        (requireRootAuthorization && !cJSON_AddStringToObject(jsonRoot, "rootAuthorizationChallenge", rootAuthorizationChallengeB64)))
+    {
         goto error_no_mem;
     }
 
     jsonString = cJSON_PrintUnformatted(jsonRoot);
-    if (!jsonString) {
+    if (!jsonString)
+    {
         goto error_no_mem;
     }
 
     err = httpd_resp_set_type(req, "application/json");
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = httpd_resp_sendstr(req, jsonString);
     }
 
 done:
-    if (jsonString) {
+    if (jsonString)
+    {
         cJSON_free(jsonString);
     }
-    if (jsonRoot) {
+    if (jsonRoot)
+    {
         cJSON_Delete(jsonRoot);
     }
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t handleScanNetworks(httpd_req_t *req)
+static esp_err_t handleScanNetworks(httpd_req_t* req)
 {
-    wifi_ap_record_t *records = nullptr;
+    wifi_ap_record_t* records = nullptr;
     uint16_t recordsCount = 0;
     cJSON *jsonRoot = nullptr, *jsonArray = nullptr;
-    char *jsonString = nullptr;
+    char* jsonString = nullptr;
     wifi_scan_config_t scanConfig;
     esp_err_t err;
 
     memset(&scanConfig, 0, sizeof(scanConfig));
     err = esp_wifi_scan_start(&scanConfig, true);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         goto done;
     }
     err = esp_wifi_scan_get_ap_num(&recordsCount);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         goto done;
     }
-    if (recordsCount > 0) {
-        records = (wifi_ap_record_t *)malloc((size_t)recordsCount * sizeof(wifi_ap_record_t));
-        if (!records) {
-error_no_mem:
+    if (recordsCount > 0)
+    {
+        records = static_cast<wifi_ap_record_t*>(malloc(static_cast<size_t>(recordsCount) * sizeof(wifi_ap_record_t)));
+        if (!records)
+        {
+        error_no_mem:
             err = ESP_ERR_NO_MEM;
             goto done;
         }
         err = esp_wifi_scan_get_ap_records(&recordsCount, records);
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
+        {
             goto done;
         }
     }
 
     // Create output
     jsonRoot = cJSON_CreateObject();
-    if (!jsonRoot) {
+    if (!jsonRoot)
+    {
         goto error_no_mem;
     }
     jsonArray = cJSON_AddArrayToObject(jsonRoot, "networks");
-    if (!jsonArray) {
+    if (!jsonArray)
+    {
         goto error_no_mem;
     }
 
-    for (uint16_t i = 0; i < recordsCount; ++i) {
+    for (uint16_t i = 0; i < recordsCount; ++i)
+    {
         bool alreadyPresent = false;
 
-        for (uint16_t j = 0; j < i; j++) {
-            if (strcasecmp((char *)records[i].ssid, (char *)records[j].ssid) == 0) {
+        for (uint16_t j = 0; j < i; j++)
+        {
+            if (strcasecmp(reinterpret_cast<char*>(records[i].ssid), reinterpret_cast<char*>(records[j].ssid)) == 0)
+            {
                 alreadyPresent = true;
                 break;
             }
         }
 
-        if (!alreadyPresent) {
-            cJSON *jsonObj;
+        if (!alreadyPresent)
+        {
+            cJSON* jsonObj;
 
             jsonObj = cJSON_CreateObject();
-            if (!jsonObj) {
+            if (!jsonObj)
+            {
                 goto error_no_mem;
             }
             cJSON_AddItemToArray(jsonArray, jsonObj);
 
-            if (
-                (!cJSON_AddStringToObject(jsonObj, "ssid", (const char *)records[i].ssid)) ||
-                (!cJSON_AddNumberToObject(jsonObj, "rssi", (double)records[i].rssi)) ||
-                (!cJSON_AddBoolToObject(jsonObj, "public", records[i].authmode == WIFI_AUTH_OPEN ? 1 : 0))
-            ) {
+            if ((!cJSON_AddStringToObject(jsonObj, "ssid", reinterpret_cast<const char*>(records[i].ssid))) ||
+                (!cJSON_AddNumberToObject(jsonObj, "rssi", static_cast<double>(records[i].rssi))) ||
+                (!cJSON_AddBoolToObject(jsonObj, "public", records[i].authmode == WIFI_AUTH_OPEN ? 1 : 0)))
+            {
                 goto error_no_mem;
             }
         }
     }
 
     jsonString = cJSON_PrintUnformatted(jsonRoot);
-    if (!jsonString) {
+    if (!jsonString)
+    {
         goto error_no_mem;
     }
 
     // Send response
     err = httpd_resp_set_type(req, "application/json");
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = httpd_resp_send(req, jsonString, strlen(jsonString));
     }
 
 done:
     // Cleanup
-    if (jsonString) {
+    if (jsonString)
+    {
         cJSON_free(jsonString);
     }
-    if (jsonRoot) {
+    if (jsonRoot)
+    {
         cJSON_Delete(jsonRoot);
     }
     free(records);
@@ -340,22 +405,24 @@ done:
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t handleServerKey(httpd_req_t *req)
+static esp_err_t handleServerKey(httpd_req_t* req)
 {
     char responseBody[P256_MAX_B64_PUBLIC_KEY_SIZE + 32];
+    int n;
     esp_err_t err;
 
     err = httpd_resp_set_type(req, "application/json");
-    if (err == ESP_OK) {
-        int n = snprintf(responseBody, sizeof(responseBody), "{\"publicKey\":\"%s\"}", serverEcdhPublicKeyB64);
-        err = (n > 0) ? httpd_resp_send(req, responseBody, (size_t)n) : ESP_FAIL;
+    if (err == ESP_OK)
+    {
+        n = snprintf(responseBody, sizeof(responseBody), "{\"publicKey\":\"%s\"}", serverEcdhPublicKeyB64);
+        err = (n > 0) ? httpd_resp_send(req, responseBody, static_cast<size_t>(n)) : ESP_FAIL;
     }
 
     // Done
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t handleProvision(httpd_req_t *req)
+static esp_err_t handleProvision(httpd_req_t* req)
 {
     GrowableBuffer_t rawBodyBuffer = GB_STATIC_INIT;
     GrowableBuffer_t encryptedPayloadBuffer = GB_STATIC_INIT;
@@ -367,20 +434,25 @@ static esp_err_t handleProvision(httpd_req_t *req)
     uint8_t clientPublicKey[P256_PUBLIC_KEY_SIZE];
     uint8_t nonce[NONCE_SIZE];
     uint8_t iv[IV_SIZE];
-    cJSON *json = nullptr;
+    cJSON* json = nullptr;
     char *clientPublicKeyValue, *nonceValue, *ivValue, *encryptedPayloadValue;
-    char *wifiSsidValue, *wifiPasswordValue, *rootUserPublicKeyValue, *hostnameValue;
+    char *wifiSsidValue, *wifiPasswordValue, *rootUserPublicKeyValue, *hostnameValue, *rootAuthorizationValue;
     CaptivePortalProvisioningConfig_t creds;
     size_t clientPublicKeyLen, nonceLen, ivLen, encryptedPayloadLen;
     size_t rootUserPublicKeyLen;
+    size_t rootAuthorizationLen;
     size_t plaintextLen;
+    uint8_t rootAuthorizationSignature[P256_SIGNATURE_SIZE];
+    uint8_t rootAuthorizationHash[SHA256_SIZE];
     esp_err_t err;
 
     // Get body
-    if (req->content_len > MAX_BODY_SIZE) {
+    if (req->content_len > MAX_BODY_SIZE)
+    {
         return httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, nullptr);
     }
-    if (req->content_len == 0) {
+    if (req->content_len == 0)
+    {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid provisioning data");
     }
 
@@ -391,14 +463,16 @@ static esp_err_t handleProvision(httpd_req_t *req)
 
     // Get body
     err = httpGetRequestBody(&rawBodyBuffer, req);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         goto done;
     }
 
     // Parse encrypted envelope JSON
-    json = cJSON_ParseWithLength((const char*)rawBodyBuffer.buffer, rawBodyBuffer.used);
-    if (!json) {
-error_invalid_data:
+    json = cJSON_ParseWithLength(reinterpret_cast<const char*>(rawBodyBuffer.buffer), rawBodyBuffer.used);
+    if (!json)
+    {
+    error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid provisioning data");
         goto done;
     }
@@ -407,7 +481,8 @@ error_invalid_data:
     nonceValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "nonce"));
     ivValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "iv"));
     encryptedPayloadValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "encryptedPayload"));
-    if ((!clientPublicKeyValue) || (!nonceValue) || (!ivValue) || (!encryptedPayloadValue)) {
+    if ((!clientPublicKeyValue) || (!nonceValue) || (!ivValue) || (!encryptedPayloadValue))
+    {
         goto error_invalid_data;
     }
 
@@ -415,62 +490,68 @@ error_invalid_data:
     nonceLen = sizeof(nonce);
     ivLen = sizeof(iv);
     encryptedPayloadLen = (strlen(encryptedPayloadValue) / 4 + 1) * 3;
-    if (
-        (!fromB64(clientPublicKeyValue, strlen(clientPublicKeyValue), false, clientPublicKey, &clientPublicKeyLen)) ||
-        (!fromB64(nonceValue, strlen(nonceValue), false, nonce, &nonceLen)) ||
-        (!fromB64(ivValue, strlen(ivValue), false, iv, &ivLen))
-    ) {
+    if ((!fromB64(clientPublicKeyValue, strlen(clientPublicKeyValue), false, clientPublicKey, &clientPublicKeyLen)) ||
+        (!fromB64(nonceValue, strlen(nonceValue), false, nonce, &nonceLen)) || (!fromB64(ivValue, strlen(ivValue), false, iv, &ivLen)))
+    {
         goto error_invalid_data;
     }
-    if (
-        (clientPublicKeyLen != sizeof(clientPublicKey)) || (nonceLen != sizeof(nonce)) || (ivLen != sizeof(iv)) ||
-        (!p256ValidatePublicKey(clientPublicKey, sizeof(clientPublicKey)))
-    ) {
+    if ((clientPublicKeyLen != sizeof(clientPublicKey)) || (nonceLen != sizeof(nonce)) || (ivLen != sizeof(iv)) ||
+        (!p256ValidatePublicKey(clientPublicKey, sizeof(clientPublicKey))))
+    {
         goto error_invalid_data;
     }
 
     // Get encrypted payload
     gbReset(&encryptedPayloadBuffer, false);
-    if (!gbReserve(&encryptedPayloadBuffer, encryptedPayloadLen + 1)) {
-error_no_mem:
+    if (!gbReserve(&encryptedPayloadBuffer, encryptedPayloadLen + 1))
+    {
+    error_no_mem:
         err = ESP_ERR_NO_MEM;
         goto done;
     }
-    if (!fromB64(encryptedPayloadValue, strlen(encryptedPayloadValue), false,
-                 encryptedPayloadBuffer.buffer, &encryptedPayloadLen)) {
+    if (!fromB64(encryptedPayloadValue, strlen(encryptedPayloadValue), false, encryptedPayloadBuffer.buffer, &encryptedPayloadLen))
+    {
         goto error_invalid_data;
     }
-    if (encryptedPayloadLen < AES_GCM_TAG_SIZE) {
+    if (encryptedPayloadLen < AES_GCM_TAG_SIZE)
+    {
         goto error_invalid_data;
     }
     encryptedPayloadBuffer.used = encryptedPayloadLen;
 
     // Decrypt payload: ECDH shared secret -> HKDF-SHA256 key -> AES-GCM decrypt
     err = p256LoadPrivateKey(&ecdhKeyPair, serverEcdhPrivateKey);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = p256LoadPublicKey(&ecdhKeyPair, clientPublicKey);
-        if (err == ESP_OK) {
+        if (err == ESP_OK)
+        {
             err = ecdhComputeSharedSecret(&ecdhKeyPair, sharedSecret);
-            if (err == ESP_OK) {
-                err = hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), nonce, sizeof(nonce), (const uint8_t *)hkdfInfo,
+            if (err == ESP_OK)
+            {
+                err = hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), nonce, sizeof(nonce), reinterpret_cast<const uint8_t*>(hkdfInfo),
                                           sizeof(hkdfInfo) - 1, derivedAesKey, sizeof(derivedAesKey));
-                if (err == ESP_OK) {
+                if (err == ESP_OK)
+                {
                     err = aesSetKey(&aesCtx, derivedAesKey, sizeof(derivedAesKey));
                 }
             }
         }
     }
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         goto done;
     }
 
     plaintextLen = encryptedPayloadLen - AES_GCM_TAG_SIZE;
     gbReset(&plaintextBuffer, false);
-    if (!gbReserve(&plaintextBuffer, plaintextLen + 1)) {
+    if (!gbReserve(&plaintextBuffer, plaintextLen + 1))
+    {
         goto error_no_mem;
     }
     err = aesDecrypt(&aesCtx, encryptedPayloadBuffer.buffer, encryptedPayloadLen, iv, sizeof(iv), nullptr, 0, plaintextBuffer.buffer);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unable to decrypt provisioning payload");
         goto done;
     }
@@ -479,8 +560,9 @@ error_no_mem:
 
     // Parse decrypted payload
     cJSON_Delete(json);
-    json = cJSON_ParseWithLength((char *)plaintextBuffer.buffer, plaintextLen);
-    if (!json) {
+    json = cJSON_ParseWithLength(reinterpret_cast<char*>(plaintextBuffer.buffer), plaintextLen);
+    if (!json)
+    {
         goto error_invalid_data;
     }
 
@@ -488,43 +570,53 @@ error_no_mem:
     wifiPasswordValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "wifiPassword"));
     rootUserPublicKeyValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "rootUserPublicKey"));
     hostnameValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "hostname"));
-    if ((!wifiSsidValue) || (!wifiPasswordValue)) {
-        goto error_invalid_data;
+    rootAuthorizationValue = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(json, "rootAuthorization"));
+    if (requestWifiCredentials)
+    {
+        if ((!wifiSsidValue) || (!wifiPasswordValue))
+        {
+            goto error_invalid_data;
+        }
+        if (*wifiSsidValue == 0 || strlen(wifiSsidValue) > 32)
+        {
+            err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID must be 1..32 characters.");
+            goto done;
+        }
+        strlcpy(creds.wifiSSID, wifiSsidValue, sizeof(creds.wifiSSID));
+
+        if (*wifiPasswordValue != 0 && (strlen(wifiPasswordValue) < 8 || strlen(wifiPasswordValue) > 64))
+        {
+            err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be empty or 8..64 characters.");
+            goto done;
+        }
+        strlcpy(creds.wifiPassword, wifiPasswordValue, sizeof(creds.wifiPassword));
     }
 
-    if (*wifiSsidValue == 0 || strlen(wifiSsidValue) > 32) {
-        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID must be 1..32 characters.");
-        goto done;
-    }
-    strlcpy(creds.wifiSSID, wifiSsidValue, sizeof(creds.wifiSSID));
-
-    if (*wifiPasswordValue != 0 && (strlen(wifiPasswordValue) < 8 || strlen(wifiPasswordValue) > 64)) {
-        err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be empty or 8..64 characters.");
-        goto done;
-    }
-    strlcpy(creds.wifiPassword, wifiPasswordValue, sizeof(creds.wifiPassword));
-
-    if (setupRootUser) {
-        if (!rootUserPublicKeyValue) {
+    if (setupRootUser)
+    {
+        if (!rootUserPublicKeyValue)
+        {
             goto error_invalid_data;
         }
 
         rootUserPublicKeyLen = sizeof(creds.rootUserPublicKey);
-        if (
-            (!fromB64(rootUserPublicKeyValue, strlen(rootUserPublicKeyValue), false, creds.rootUserPublicKey, &rootUserPublicKeyLen)) ||
-            (!p256ValidatePublicKey(creds.rootUserPublicKey, rootUserPublicKeyLen))
-        ) {
+        if ((!fromB64(rootUserPublicKeyValue, strlen(rootUserPublicKeyValue), false, creds.rootUserPublicKey, &rootUserPublicKeyLen)) ||
+            (!p256ValidatePublicKey(creds.rootUserPublicKey, rootUserPublicKeyLen)))
+        {
             err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Root user key must be valid Base64 and decode to exactly 65 bytes.");
             goto done;
         }
     }
 
-    if (setupDeviceHostname) {
-        if (!hostnameValue) {
+    if (setupDeviceHostname)
+    {
+        if (!hostnameValue)
+        {
             goto error_invalid_data;
         }
 
-        if (*hostnameValue != 0 && (!isValidHostname(hostnameValue))) {
+        if (*hostnameValue != 0 && (!isValidHostname(hostnameValue)))
+        {
             err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Hostname must be RFC1123 compliant.");
             goto done;
         }
@@ -532,9 +624,40 @@ error_no_mem:
         strlcpy(creds.hostname, hostnameValue, sizeof(creds.hostname));
     }
 
+    if (requireRootAuthorization)
+    {
+        if (!rootAuthorizationChallengeValid || !rootAuthorizationValue)
+        {
+            err = httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Recovery authorization is required.");
+            goto done;
+        }
+        rootAuthorizationLen = sizeof(rootAuthorizationSignature);
+        if (!fromB64(rootAuthorizationValue, strlen(rootAuthorizationValue), false, rootAuthorizationSignature, &rootAuthorizationLen) ||
+            rootAuthorizationLen != sizeof(rootAuthorizationSignature))
+        {
+            err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recovery authorization is invalid.");
+            goto done;
+        }
+        err = buildRootAuthorizationHash(creds.wifiSSID, creds.wifiPassword, rootAuthorizationHash);
+        if (err != ESP_OK)
+        {
+            goto done;
+        }
+        err = rootAuthorization(rootAuthorizationHash, rootAuthorizationSignature, rootAuthorizationCtx);
+        if (err != ESP_OK)
+        {
+            err = httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Recovery authorization failed.");
+            goto done;
+        }
+        memset(rootAuthorizationChallenge, 0, sizeof(rootAuthorizationChallenge));
+        memset(rootAuthorizationChallengeB64, 0, sizeof(rootAuthorizationChallengeB64));
+        rootAuthorizationChallengeValid = false;
+    }
+
     // Call callback
     err = handler(&creds, handlerCtx);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         goto done;
     }
 
@@ -543,12 +666,15 @@ error_no_mem:
 
 done:
     // Cleanup
-    if (json) {
+    if (json)
+    {
         cJSON_Delete(json);
         json = nullptr;
     }
     memset(sharedSecret, 0, sizeof(sharedSecret));
     memset(derivedAesKey, 0, sizeof(derivedAesKey));
+    memset(rootAuthorizationSignature, 0, sizeof(rootAuthorizationSignature));
+    memset(rootAuthorizationHash, 0, sizeof(rootAuthorizationHash));
     gbWipe(&plaintextBuffer);
     gbWipe(&encryptedPayloadBuffer);
     gbWipe(&rawBodyBuffer);
@@ -562,7 +688,71 @@ done:
     return httpSendInternalErrorResponse(req, err, nullptr);
 }
 
-static esp_err_t redirectToRoot(httpd_req_t *req)
+static esp_err_t buildRootAuthorizationHash(const char* ssid, const char* password, uint8_t hash[SHA256_SIZE])
+{
+    static const char domain[] = "iot-comm/captive-portal-recovery/v1";
+    Sha256Context_t sha256Ctx;
+    uint8_t ssidLen = static_cast<uint8_t>(strlen(ssid));
+    uint8_t passwordLen = static_cast<uint8_t>(strlen(password));
+    esp_err_t err;
+
+    sha256Init(&sha256Ctx);
+    err = sha256Start(&sha256Ctx);
+    if (err == ESP_OK)
+    {
+        err = sha256Update(&sha256Ctx, reinterpret_cast<const uint8_t*>(domain), sizeof(domain) - 1);
+    }
+    if (err == ESP_OK)
+    {
+        err = sha256Update(&sha256Ctx, rootAuthorizationChallenge, sizeof(rootAuthorizationChallenge));
+    }
+    if (err == ESP_OK)
+    {
+        err = sha256Update(&sha256Ctx, &ssidLen, sizeof(ssidLen));
+    }
+    if (err == ESP_OK)
+    {
+        err = sha256Update(&sha256Ctx, reinterpret_cast<const uint8_t*>(ssid), ssidLen);
+    }
+    if (err == ESP_OK)
+    {
+        err = sha256Update(&sha256Ctx, &passwordLen, sizeof(passwordLen));
+    }
+    if (err == ESP_OK)
+    {
+        err = sha256Update(&sha256Ctx, reinterpret_cast<const uint8_t*>(password), passwordLen);
+    }
+    if (err == ESP_OK)
+    {
+        err = sha256Finish(&sha256Ctx, hash);
+    }
+    sha256Done(&sha256Ctx);
+    return err;
+}
+
+static esp_err_t generateRootAuthorizationChallenge()
+{
+    size_t challengeB64Len = sizeof(rootAuthorizationChallengeB64);
+    esp_err_t err;
+
+    memset(rootAuthorizationChallenge, 0, sizeof(rootAuthorizationChallenge));
+    memset(rootAuthorizationChallengeB64, 0, sizeof(rootAuthorizationChallengeB64));
+    rootAuthorizationChallengeValid = false;
+    err = randomize(rootAuthorizationChallenge, sizeof(rootAuthorizationChallenge));
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    if (!toB64(rootAuthorizationChallenge, sizeof(rootAuthorizationChallenge), false, rootAuthorizationChallengeB64, &challengeB64Len))
+    {
+        memset(rootAuthorizationChallenge, 0, sizeof(rootAuthorizationChallenge));
+        return ESP_FAIL;
+    }
+    rootAuthorizationChallengeValid = true;
+    return ESP_OK;
+}
+
+static esp_err_t redirectToRoot(httpd_req_t* req)
 {
     char szUri[32];
     uint8_t ip[4];
@@ -572,9 +762,11 @@ static esp_err_t redirectToRoot(httpd_req_t *req)
     snprintf(szUri, sizeof(szUri), "http://%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 
     err = httpd_resp_set_status(req, "302 Found");
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = httpd_resp_set_hdr(req, "Location", szUri);
-        if (err == ESP_OK) {
+        if (err == ESP_OK)
+        {
             err = httpd_resp_send(req, nullptr, 0);
         }
     }
@@ -583,12 +775,13 @@ static esp_err_t redirectToRoot(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t sendSuccess(httpd_req_t *req)
+static esp_err_t sendSuccess(httpd_req_t* req)
 {
     esp_err_t err;
 
     err = httpd_resp_set_status(req, "200 OK");
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = httpd_resp_send(req, nullptr, 0);
     }
 
@@ -596,13 +789,22 @@ static esp_err_t sendSuccess(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t sendEmbeddedFile(httpd_req_t *req, const char *type, const uint8_t *start, const uint8_t *end)
+static esp_err_t sendEmbeddedFile(httpd_req_t* req, const char* type, const uint8_t* start, const uint8_t* end, bool useGzip)
 {
     esp_err_t err;
 
     err = httpd_resp_set_type(req, type);
-    if (err == ESP_OK) {
-        err = httpd_resp_send(req, (const char *)start, (size_t)(end - start));
+    if (err != ESP_OK)
+    {
+        return err;
     }
-    return err;
+    if (useGzip)
+    {
+        err = httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+    return httpd_resp_send(req, reinterpret_cast<const char*>(start), static_cast<size_t>(end - start));
 }

@@ -5,22 +5,16 @@
 
 TEST_CASE("binary reader reads mixed values sequentially", "[binary]")
 {
-    const uint8_t buffer[] = {
-        'o', 'k', 0x00,
-        0xaa, 0xbb, 0xcc,
-        0x7f,
-        0x12, 0x34,
-        0xde, 0xad, 0xbe, 0xef,
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef
-    };
+    const uint8_t buffer[] = {'o',  'k',  0x00, 0xaa, 0xbb, 0xcc, 0x7f, 0x12, 0x34, 0xde, 0xad,
+                              0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
     binary_reader_t br = br_init(buffer, sizeof(buffer));
-    const char      *text;
-    size_t          textLen;
-    const uint8_t   *blob;
-    uint8_t         byteValue;
-    uint16_t        be16Value;
-    uint32_t        be32Value;
-    uint64_t        be64Value;
+    const char* text;
+    size_t textLen;
+    const uint8_t* blob;
+    uint8_t byteValue;
+    uint16_t be16Value;
+    uint32_t be32Value;
+    uint64_t be64Value;
 
     TEST_ASSERT_TRUE(br_read_str(&br, &text, &textLen));
     TEST_ASSERT_EQUAL_UINT32(2, textLen);
@@ -41,16 +35,16 @@ TEST_CASE("binary reader reads mixed values sequentially", "[binary]")
     TEST_ASSERT_EQUAL_HEX32(0xdeadbeef, be32Value);
 
     TEST_ASSERT_TRUE(br_read_be64(&br, &be64Value));
-    TEST_ASSERT_EQUAL_HEX32(0x01234567, (uint32_t)(be64Value >> 32));
-    TEST_ASSERT_EQUAL_HEX32(0x89abcdef, (uint32_t)be64Value);
+    TEST_ASSERT_EQUAL_HEX32(0x01234567, static_cast<uint32_t>(be64Value >> 32));
+    TEST_ASSERT_EQUAL_HEX32(0x89abcdef, static_cast<uint32_t>(be64Value));
     TEST_ASSERT_EQUAL_UINT32(0, br.len);
 }
 
 TEST_CASE("binary reader reports failure on short buffers", "[binary]")
 {
-    const uint8_t   buffer[] = { 0x12 };
+    const uint8_t buffer[] = {0x12};
     binary_reader_t br = br_init(buffer, sizeof(buffer));
-    uint16_t        be16Value = 0xffff;
+    uint16_t be16Value = 0xffff;
 
     TEST_ASSERT_FALSE(br_read_be16(&br, &be16Value));
     TEST_ASSERT_EQUAL_HEX16(0x0000, be16Value);
@@ -59,17 +53,11 @@ TEST_CASE("binary reader reports failure on short buffers", "[binary]")
 
 TEST_CASE("binary writer writes mixed values sequentially", "[binary]")
 {
-    uint8_t         buffer[32] = {};
+    uint8_t buffer[32] = {};
     binary_writer_t bw = bw_init(buffer, sizeof(buffer));
-    const uint8_t   blob[] = { 0xaa, 0xbb, 0xcc };
-    const uint8_t   expected[] = {
-        'o', 'k', 0x00,
-        0xaa, 0xbb, 0xcc,
-        0x7f,
-        0x12, 0x34,
-        0xde, 0xad, 0xbe, 0xef,
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef
-    };
+    const uint8_t blob[] = {0xaa, 0xbb, 0xcc};
+    const uint8_t expected[] = {'o',  'k',  0x00, 0xaa, 0xbb, 0xcc, 0x7f, 0x12, 0x34, 0xde, 0xad,
+                                0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
 
     TEST_ASSERT_TRUE(bw_write_str(&bw, "ok"));
     TEST_ASSERT_TRUE(bw_write_blob(&bw, blob, sizeof(blob)));
@@ -85,7 +73,7 @@ TEST_CASE("binary writer writes mixed values sequentially", "[binary]")
 
 TEST_CASE("binary writer rejects writes that exceed capacity", "[binary]")
 {
-    uint8_t         buffer[4] = {};
+    uint8_t buffer[4] = {};
     binary_writer_t bw = bw_init(buffer, sizeof(buffer));
 
     TEST_ASSERT_TRUE(bw_write_be32(&bw, 0x11223344));

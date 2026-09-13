@@ -8,11 +8,14 @@ import { createECDHCrypto } from './crypto/ecp.js';
 import { fromB64, toB64 } from './crypto/helpers.js';
 import { createHkdfCrypto } from './crypto/hkdf.js';
 import { randomize } from './crypto/random.js';
+import { p256 } from '@noble/curves/nist.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 // -----------------------------------------------------------------------------
 
 const textEncoder = new TextEncoder();
 const HKDF_INFO = textEncoder.encode('iot-comm/provisioning/v1');
+const RECOVERY_AUTH_DOMAIN = textEncoder.encode('iot-comm/captive-portal-recovery/v1');
 
 // -----------------------------------------------------------------------------
 
@@ -41,6 +44,10 @@ let loadingInitParams = true;
 let initParamsError = '';
 let setupRootUser = true;
 let setupDeviceHostname = true;
+let requestWifiCredentials = true;
+let requireRootAuthorization = false;
+let rootAuthorizationChallenge = '';
+let rootUserPrivateKey = '';
 
 // -----------------------------------------------------------------------------
 
@@ -68,8 +75,14 @@ async function loadInitParams() {
         }
 
         const body = await response.json();
+        requestWifiCredentials = body?.requestWifiCredentials === true;
         setupRootUser = body?.setupRootUser !== false;
         setupDeviceHostname = body?.setupDeviceHostname !== false;
+        requireRootAuthorization = body?.requireRootAuthorization === true;
+        rootAuthorizationChallenge = body?.rootAuthorizationChallenge || '';
+        if (requireRootAuthorization && !rootAuthorizationChallenge) {
+            throw new Error('Missing recovery authorization challenge');
+        }
 
         if (!setupRootUser) {
             rootUserPublicKey = '';
@@ -92,6 +105,34 @@ async function loadInitParams() {
         initParamsError = 'Unable to load provisioning options.';
     } finally {
         loadingInitParams = false;
+    }
+}
+
+function createRecoveryAuthorization() {
+    try {
+        const privateKey = new Uint8Array(fromB64(rootUserPrivateKey));
+        const challenge = new Uint8Array(fromB64(rootAuthorizationChallenge));
+        const ssid = textEncoder.encode(wifiSSID);
+        const password = textEncoder.encode(wifiPassword);
+
+        if (privateKey.byteLength !== 32 || challenge.byteLength !== 32 || ssid.byteLength > 32 || password.byteLength > 64) {
+            throw new Error('Invalid recovery authorization data');
+        }
+
+        const transcript = new Uint8Array(RECOVERY_AUTH_DOMAIN.length + challenge.length + 2 + ssid.length + password.length);
+        let offset = 0;
+        transcript.set(RECOVERY_AUTH_DOMAIN, offset);
+        offset += RECOVERY_AUTH_DOMAIN.length;
+        transcript.set(challenge, offset);
+        offset += challenge.length;
+        transcript[offset++] = ssid.length;
+        transcript.set(ssid, offset);
+        offset += ssid.length;
+        transcript[offset++] = password.length;
+        transcript.set(password, offset);
+        return toB64(p256.sign(sha256(transcript), privateKey, { prehash: false, format: 'compact' }));
+    } finally {
+        rootUserPrivateKey = '';
     }
 }
 
@@ -130,6 +171,10 @@ async function scanNetworks() {
 
 async function submitProvisioning() {
     error = '';
+    wifiSSID = wifiSSID.trim();
+    rootUserPublicKey = rootUserPublicKey.trim();
+    repeatRootUserPublicKey = repeatRootUserPublicKey.trim();
+    hostname = hostname.trim();
 
     fieldErrors = validateFields({
         wifiSSID,
@@ -138,10 +183,15 @@ async function submitProvisioning() {
         repeatRootUserPublicKey,
         hostname,
         setupRootUser,
-        setupDeviceHostname
+        setupDeviceHostname,
+        requestWifiCredentials
     });
 
     if (hasFieldErrors(fieldErrors)) {
+        return;
+    }
+    if (requireRootAuthorization && !rootUserPrivateKey) {
+        error = 'Root user private key is required to authorize recovery.';
         return;
     }
 
@@ -164,10 +214,16 @@ async function submitProvisioning() {
         const aes = createAesCrypto();
         await aes.setKey(encryptionKey);
 
-        const provisioningData = {
-            wifiSSID,
-            wifiPassword
-        };
+        const provisioningData = {};
+
+        if (requestWifiCredentials) {
+            provisioningData.wifiSSID = wifiSSID;
+            provisioningData.wifiPassword = wifiPassword;
+        }
+
+        if (requireRootAuthorization) {
+            provisioningData.rootAuthorization = createRecoveryAuthorization();
+        }
 
         if (setupRootUser) {
             provisioningData.rootUserPublicKey = rootUserPublicKey;
@@ -240,8 +296,8 @@ onMount(() => {
     </section>
 {:else}
     <section class="card">
-        <h1>Device Wi-Fi Provisioning</h1>
-        <p class="subtitle">Connect your device to Wi-Fi and configure device parameters.</p>
+        <h1>{requireRootAuthorization ? 'Wi-Fi Recovery' : 'Device Wi-Fi Provisioning'}</h1>
+        <p class="subtitle">{requireRootAuthorization ? 'Authorize replacement Wi-Fi credentials with the existing root private key.' : 'Connect your device to Wi-Fi and configure device parameters.'}</p>
 
     {#if loadingInitParams}
         <p class="loading-state">Loading configuration...</p>
@@ -250,6 +306,7 @@ onMount(() => {
             <input class="autofill-decoy" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true" />
             <input class="autofill-decoy" type="password" name="password" autocomplete="current-password" tabindex="-1" aria-hidden="true" />
 
+        {#if requestWifiCredentials}
             <label class="ssid-field">
             Wi-Fi SSID
             <div class="ssid-input-wrap">
@@ -283,7 +340,9 @@ onMount(() => {
             <small class="field-error">{fieldErrors.wifiSSID}</small>
         {/if}
             </label>
+        {/if}
 
+        {#if requestWifiCredentials}
             <label>
                 Wi-Fi password:
                 <div class="password-input-wrap">
@@ -326,6 +385,25 @@ onMount(() => {
                 <small class="field-error">{fieldErrors.wifiPassword}</small>
         {/if}
             </label>
+        {/if}
+
+        {#if requireRootAuthorization}
+            <label>
+                Root user private key:
+                <input
+                    type="password"
+                    bind:value={rootUserPrivateKey}
+                    maxlength="44"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    spellcheck="false"
+                    placeholder="Base64 raw 32-byte private key"
+                    disabled={submitting}
+                />
+                <small>Used only to authorize this recovery request; it is cleared before transmission.</small>
+            </label>
+        {/if}
 
         {#if setupRootUser}
             <label>
@@ -384,6 +462,10 @@ onMount(() => {
                     bind:value={hostname}
                     on:input={() => clearFieldError('hostname')}
                     maxlength="63"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    spellcheck="false"
                     placeholder="e.g.: my-device"
                     disabled={submitting}
                 />
@@ -399,7 +481,7 @@ onMount(() => {
                 on:click={submitProvisioning}
                 disabled={submitting}
             >
-                {submitting ? 'Saving...' : 'Save & Provision'}
+                {submitting ? 'Saving...' : requireRootAuthorization ? 'Authorize & Recover' : 'Save & Provision'}
             </button>
 
         {#if error}

@@ -21,9 +21,9 @@ extern "C" {
 #endif // __cplusplus
 
 // Converts a native IPv4 socket address into the library representation.
-void parseIPv4(IPAddress_t *addr, const struct sockaddr_in *in);
+void parseIPv4(IPAddress_t* addr, const struct sockaddr_in* in);
 // Converts a native IPv6 socket address into the library representation.
-void parseIPv6(IPAddress_t *addr, const struct sockaddr_in6 *in);
+void parseIPv6(IPAddress_t* addr, const struct sockaddr_in6* in);
 
 // Accepts candidates like:
 //  - "203.0.113.1"
@@ -35,17 +35,17 @@ void parseIPv6(IPAddress_t *addr, const struct sockaddr_in6 *in);
 //  - "203.0.113.1:1234"  (we'll strip :port for IPv4)
 //  - "[2001:db8::1]:1234" (strip brackets + port)
 // Parses an IPv4 or IPv6 address string into the library representation.
-bool parseIP(IPAddress_t *addr, const char *s, size_t len = (size_t)-1);
+bool parseIP(IPAddress_t* addr, const char* s, size_t len = static_cast<size_t>(-1));
 
 // Converts an IPv6 to IPv4 and returns true if conversion could be done or the address already was IPv4.
-bool toIPv4(IPAddress_t *addr);
+bool toIPv4(IPAddress_t* addr);
 
 // Compares two IP addresses for exact equality.
 // NOTE: This function does NOT normalize embedded IPv4 addresses on IPv6 ones.
-bool ipAddressEqual(const IPAddress_t *addr1, const IPAddress_t *addr2);
+bool ipAddressEqual(const IPAddress_t* addr1, const IPAddress_t* addr2);
 
 // Validates whether a string can be used as a single-label device hostname.
-bool isValidHostname(const char *hostname);
+bool isValidHostname(const char* hostname);
 
 #ifdef __cplusplus
 }

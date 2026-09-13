@@ -9,12 +9,12 @@
 // -----------------------------------------------------------------------------
 
 #if ESP_IDF_VERSION_MAJOR >= 6
-static psa_status_t importAesKey(psa_key_id_t *keyId, const uint8_t *key, size_t keyLen);
+static psa_status_t importAesKey(psa_key_id_t* keyId, const uint8_t* key, size_t keyLen);
 #endif
 
 // -----------------------------------------------------------------------------
 
-void aesInit(AesContext_t *ctx)
+void aesInit(AesContext_t* ctx)
 {
     assert(ctx);
 #if ESP_IDF_VERSION_MAJOR >= 6
@@ -26,16 +26,18 @@ void aesInit(AesContext_t *ctx)
     ctx->hasKey = false;
 }
 
-void aesDone(AesContext_t *ctx)
+void aesDone(AesContext_t* ctx)
 {
     assert(ctx);
 
-    if (!ctx->initialized) {
+    if (!ctx->initialized)
+    {
         return;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
-    if (ctx->hasKey) {
+    if (ctx->hasKey)
+    {
         psa_destroy_key(ctx->keyId);
         ctx->keyId = PSA_KEY_ID_NULL;
     }
@@ -47,34 +49,39 @@ void aesDone(AesContext_t *ctx)
     ctx->hasKey = false;
 }
 
-esp_err_t aesSetKey(AesContext_t *ctx, const uint8_t *key, size_t keyLen)
+esp_err_t aesSetKey(AesContext_t* ctx, const uint8_t* key, size_t keyLen)
 {
     esp_err_t err;
 
     assert(ctx);
 
-    if ((!key) || keyLen == 0 || keyLen > 32) {
+    if ((!key) || keyLen == 0 || keyLen > 32)
+    {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!ctx->initialized) {
+    if (!ctx->initialized)
+    {
         return ESP_ERR_INVALID_STATE;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
-    if (ctx->hasKey) {
+    if (ctx->hasKey)
+    {
         psa_destroy_key(ctx->keyId);
         ctx->keyId = PSA_KEY_ID_NULL;
         ctx->hasKey = false;
     }
 
     err = importAesKey(&ctx->keyId, key, keyLen);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
 #else
     err = mbedtls_gcm_setkey(&ctx->gcmCtx, MBEDTLS_CIPHER_ID_AES, key, keyLen * 8);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
 #endif
@@ -83,8 +90,8 @@ esp_err_t aesSetKey(AesContext_t *ctx, const uint8_t *key, size_t keyLen)
     return ESP_OK;
 }
 
-esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plaintextLen, const uint8_t *iv, size_t ivLen,
-                     const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut)
+esp_err_t aesEncrypt(AesContext_t* ctx, const uint8_t* plaintext, size_t plaintextLen, const uint8_t* iv, size_t ivLen, const uint8_t* aad,
+                     size_t aadLen, uint8_t* ciphertextOut)
 {
     uint8_t emptyPlaintext;
 #if ESP_IDF_VERSION_MAJOR >= 6
@@ -97,35 +104,40 @@ esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plainte
 
     assert(ctx);
 
-    if ((!ctx->initialized) || (!ctx->hasKey)) {
+    if ((!ctx->initialized) || (!ctx->hasKey))
+    {
         return ESP_ERR_INVALID_STATE;
     }
-    if (((!plaintext) && plaintextLen != 0) || (!ciphertextOut)) {
+    if (((!plaintext) && plaintextLen != 0) || (!ciphertextOut))
+    {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!plaintext) {
+    if (!plaintext)
+    {
         plaintext = &emptyPlaintext;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = psa_aead_encrypt(ctx->keyId, PSA_ALG_GCM, iv, ivLen, aad, aadLen, plaintext, plaintextLen, ciphertextOut,
                               plaintextLen + GCM_TAG_LEN, &ciphertextLen);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         return status;
     }
     return (ciphertextLen == plaintextLen + GCM_TAG_LEN) ? ESP_OK : ESP_FAIL;
 #else
     err = mbedtls_gcm_crypt_and_tag(&ctx->gcmCtx, MBEDTLS_GCM_ENCRYPT, plaintextLen, iv, ivLen, aad, aadLen, plaintext, ciphertextOut,
                                     GCM_TAG_LEN, tag);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         memcpy(ciphertextOut + plaintextLen, tag, GCM_TAG_LEN);
     }
     return err;
 #endif
 }
 
-esp_err_t aesDecrypt(AesContext_t *ctx, const uint8_t *ciphertext, size_t ciphertextLen, const uint8_t *iv, size_t ivLen,
-                     const uint8_t *aad, size_t aadLen, uint8_t *plaintextOut)
+esp_err_t aesDecrypt(AesContext_t* ctx, const uint8_t* ciphertext, size_t ciphertextLen, const uint8_t* iv, size_t ivLen,
+                     const uint8_t* aad, size_t aadLen, uint8_t* plaintextOut)
 {
     uint8_t emptyPlaintext;
 #if ESP_IDF_VERSION_MAJOR >= 6
@@ -137,49 +149,55 @@ esp_err_t aesDecrypt(AesContext_t *ctx, const uint8_t *ciphertext, size_t cipher
 
     assert(ctx);
 
-    if ((!ctx->initialized) || (!ctx->hasKey)) {
+    if ((!ctx->initialized) || (!ctx->hasKey))
+    {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if ((!ciphertext) || ciphertextLen < GCM_TAG_LEN) {
+    if ((!ciphertext) || ciphertextLen < GCM_TAG_LEN)
+    {
         return ESP_ERR_INVALID_ARG;
     }
 
     ciphertextLen -= GCM_TAG_LEN;
-    if ((!plaintextOut) && ciphertextLen != 0) {
+    if ((!plaintextOut) && ciphertextLen != 0)
+    {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!plaintextOut) {
+    if (!plaintextOut)
+    {
         plaintextOut = &emptyPlaintext;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = psa_aead_decrypt(ctx->keyId, PSA_ALG_GCM, iv, ivLen, aad, aadLen, ciphertext, ciphertextLen + GCM_TAG_LEN, plaintextOut,
                               ciphertextLen, &plaintextLen);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         return status;
     }
     return (plaintextLen == ciphertextLen) ? ESP_OK : ESP_FAIL;
 #else
-    err = mbedtls_gcm_auth_decrypt(&ctx->gcmCtx, ciphertextLen, iv, ivLen, aad, aadLen, ciphertext + ciphertextLen, GCM_TAG_LEN,
-                                   ciphertext, plaintextOut);
+    err = mbedtls_gcm_auth_decrypt(&ctx->gcmCtx, ciphertextLen, iv, ivLen, aad, aadLen, ciphertext + ciphertextLen, GCM_TAG_LEN, ciphertext,
+                                   plaintextOut);
     return err;
 #endif
 }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
-static psa_status_t importAesKey(psa_key_id_t *keyId, const uint8_t *key, size_t keyLen)
+static psa_status_t importAesKey(psa_key_id_t* keyId, const uint8_t* key, size_t keyLen)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_status_t status;
 
     status = psa_crypto_init();
-    if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE) {
+    if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE)
+    {
         return status;
     }
 
     psa_set_key_type(&attr, PSA_KEY_TYPE_AES);
-    psa_set_key_bits(&attr, (size_t)(keyLen * 8));
+    psa_set_key_bits(&attr, static_cast<size_t>(keyLen * 8));
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
     psa_set_key_algorithm(&attr, PSA_ALG_GCM);
 

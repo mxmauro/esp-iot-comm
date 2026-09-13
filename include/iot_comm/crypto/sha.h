@@ -40,17 +40,17 @@ typedef mbedtls_sha512_context Sha512Context_t;
 extern "C" {
 #endif // __cplusplus
 
-void sha256Init(Sha256Context_t *ctx);
-void sha256Done(Sha256Context_t *ctx);
-esp_err_t sha256Start(Sha256Context_t *ctx);
-esp_err_t sha256Update(Sha256Context_t *ctx, const uint8_t *data, size_t len);
-esp_err_t sha256Finish(Sha256Context_t *ctx, uint8_t out[SHA256_SIZE]);
+void sha256Init(Sha256Context_t* ctx);
+void sha256Done(Sha256Context_t* ctx);
+esp_err_t sha256Start(Sha256Context_t* ctx);
+esp_err_t sha256Update(Sha256Context_t* ctx, const uint8_t* data, size_t len);
+esp_err_t sha256Finish(Sha256Context_t* ctx, uint8_t out[SHA256_SIZE]);
 
-void sha512Init(Sha512Context_t *ctx);
-void sha512Done(Sha512Context_t *ctx);
-esp_err_t sha512Start(Sha512Context_t *ctx);
-esp_err_t sha512Update(Sha512Context_t *ctx, const uint8_t *data, size_t len);
-esp_err_t sha512Finish(Sha512Context_t *ctx, uint8_t out[SHA512_SIZE]);
+void sha512Init(Sha512Context_t* ctx);
+void sha512Done(Sha512Context_t* ctx);
+esp_err_t sha512Start(Sha512Context_t* ctx);
+esp_err_t sha512Update(Sha512Context_t* ctx, const uint8_t* data, size_t len);
+esp_err_t sha512Finish(Sha512Context_t* ctx, uint8_t out[SHA512_SIZE]);
 
 #ifdef __cplusplus
 }

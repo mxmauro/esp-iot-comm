@@ -17,7 +17,7 @@ typedef struct RateLimit_s {
 
 // -----------------------------------------------------------------------------
 
-static RateLimit_t *rateLimits = nullptr;
+static RateLimit_t* rateLimits = nullptr;
 static size_t maxSlots = 0;
 static uint32_t windowSizeInMs = 0;
 static uint8_t maxRequestsPerWindow = 0;
@@ -25,8 +25,8 @@ static uint8_t maxConsecutiveFailures = 0;
 
 // -----------------------------------------------------------------------------
 
-static RateLimit_t* findAddress(const IPAddress_t *addr);
-static RateLimit_t* internalRateLimitCheck(const IPAddress_t *addr);
+static RateLimit_t* findAddress(const IPAddress_t* addr);
+static RateLimit_t* internalRateLimitCheck(const IPAddress_t* addr);
 
 // -----------------------------------------------------------------------------
 
@@ -37,8 +37,9 @@ esp_err_t rateLimitInit(size_t _maxSlots, uint32_t _windowSizeInMs, uint8_t _max
     assert(_maxRequestsPerWindow > 1);
     assert(_maxConsecutiveFailures > 1);
 
-    rateLimits = (RateLimit_t *)malloc(_maxSlots * sizeof(RateLimit_t));
-    if (!rateLimits) {
+    rateLimits = static_cast<RateLimit_t*>(malloc(_maxSlots * sizeof(RateLimit_t)));
+    if (!rateLimits)
+    {
         ESP_LOGE(TAG, "Failed to allocate memory for the rate-limit table.");
         return ESP_ERR_NO_MEM;
     }
@@ -55,7 +56,8 @@ esp_err_t rateLimitInit(size_t _maxSlots, uint32_t _windowSizeInMs, uint8_t _max
 
 void rateLimitDeinit()
 {
-    if (rateLimits) {
+    if (rateLimits)
+    {
         memset(rateLimits, 0, maxSlots * sizeof(RateLimit_t));
         free(rateLimits);
         rateLimits = nullptr;
@@ -67,33 +69,37 @@ void rateLimitDeinit()
     maxConsecutiveFailures = 0;
 }
 
-bool rateLimitCheckRequest(const IPAddress_t *addr)
+bool rateLimitCheckRequest(const IPAddress_t* addr)
 {
     RateLimit_t* limit = internalRateLimitCheck(addr);
 
     // Check limits
-    if ((!limit) || limit->requestsCount >= maxRequestsPerWindow) {
+    if ((!limit) || limit->requestsCount >= maxRequestsPerWindow)
+    {
         return false;
     }
     limit->requestsCount += 1;
     return true;
 }
 
-void rateLimitIncrementFailedAuth(const IPAddress_t *addr)
+void rateLimitIncrementFailedAuth(const IPAddress_t* addr)
 {
     RateLimit_t* limit;
 
     // Find rate limit entry
     limit = findAddress(addr);
-    if (!limit) {
+    if (!limit)
+    {
         return;
     }
 
     // Exponential backoff after MAX_CONSECUTIVE_FAILURES
-    if (limit->consecutiveFailures < 255) {
+    if (limit->consecutiveFailures < 255)
+    {
         limit->consecutiveFailures += 1;
     }
-    if (limit->consecutiveFailures >= maxConsecutiveFailures) {
+    if (limit->consecutiveFailures >= maxConsecutiveFailures)
+    {
         uint64_t now;
         uint8_t exponent;
         uint64_t backoffSeconds;
@@ -112,7 +118,8 @@ void rateLimitIncrementFailedAuth(const IPAddress_t *addr)
         backoffSeconds = 1UL << exponent; // 2^exponent
 
         // Cap maximum backoff at 5 minutes
-        if (backoffSeconds > 300) {
+        if (backoffSeconds > 300)
+        {
             backoffSeconds = 300;
         }
 
@@ -120,14 +127,15 @@ void rateLimitIncrementFailedAuth(const IPAddress_t *addr)
     }
 }
 
-bool rateLimitIsAddressBlocked(const IPAddress_t *addr)
+bool rateLimitIsAddressBlocked(const IPAddress_t* addr)
 {
     RateLimit_t* limit;
     uint64_t now;
 
     // Find rate limit entry
     limit = findAddress(addr);
-    if (!limit) {
+    if (!limit)
+    {
         return false;
     }
 
@@ -135,13 +143,14 @@ bool rateLimitIsAddressBlocked(const IPAddress_t *addr)
     return !!(limit->blockedUntil > 0 && now < limit->blockedUntil);
 }
 
-void rateLimitResetAddress(const IPAddress_t *addr)
+void rateLimitResetAddress(const IPAddress_t* addr)
 {
     RateLimit_t* limit;
 
     // Find rate limit entry
     limit = findAddress(addr);
-    if (limit) {
+    if (limit)
+    {
         limit->requestsCount = 0;
         limit->consecutiveFailures = 0;
         limit->blockedUntil = 0;
@@ -155,39 +164,47 @@ void rateLimitResetAll()
 
 // -----------------------------------------------------------------------------
 
-static RateLimit_t* findAddress(const IPAddress_t *addr)
+static RateLimit_t* findAddress(const IPAddress_t* addr)
 {
-    for (size_t i = 0; i < maxSlots; i++) {
-        if (rateLimits[i].windowStart != 0 && ipAddressEqual(&rateLimits[i].clientIP, addr)) {
+    for (size_t i = 0; i < maxSlots; i++)
+    {
+        if (rateLimits[i].windowStart != 0 && ipAddressEqual(&rateLimits[i].clientIP, addr))
+        {
             return &rateLimits[i];
         }
     }
     return nullptr;
 }
 
-static RateLimit_t* internalRateLimitCheck(const IPAddress_t *addr)
+static RateLimit_t* internalRateLimitCheck(const IPAddress_t* addr)
 {
     RateLimit_t* limit = nullptr;
-    size_t emptySlot = (size_t)-1;
+    size_t emptySlot = static_cast<size_t>(-1);
     uint32_t oldestSlot = 0;
     uint64_t oldestSlotTime = 0;
     uint64_t now = now_ms();
 
-    if (now == 0) {
+    if (now == 0)
+    {
         now = 1;
     }
 
     // Find or create rate limit entry
-    for (size_t i = 0; i < maxSlots; i++) {
-        if (rateLimits[i].windowStart != 0 && ipAddressEqual(&rateLimits[i].clientIP, addr)) {
+    for (size_t i = 0; i < maxSlots; i++)
+    {
+        if (rateLimits[i].windowStart != 0 && ipAddressEqual(&rateLimits[i].clientIP, addr))
+        {
             limit = &rateLimits[i];
             break;
         }
-        if (emptySlot == -1) {
-            if (rateLimits[i].windowStart == 0 || now - rateLimits[i].windowStart > windowSizeInMs) {
+        if (emptySlot == -1)
+        {
+            if (rateLimits[i].windowStart == 0 || now - rateLimits[i].windowStart > windowSizeInMs)
+            {
                 emptySlot = i;
             }
-            else if (oldestSlot == -1 || rateLimits[i].windowStart < oldestSlotTime) {
+            else if (oldestSlot == -1 || rateLimits[i].windowStart < oldestSlotTime)
+            {
                 oldestSlot = i;
                 oldestSlotTime = rateLimits[i].windowStart;
             }
@@ -195,8 +212,10 @@ static RateLimit_t* internalRateLimitCheck(const IPAddress_t *addr)
     }
 
     // Create new entry if needed
-    if (limit == nullptr) {
-        if (emptySlot == (size_t)-1) {
+    if (limit == nullptr)
+    {
+        if (emptySlot == static_cast<size_t>(-1))
+        {
             emptySlot = oldestSlot;
         }
         limit = &rateLimits[emptySlot];
@@ -208,12 +227,14 @@ static RateLimit_t* internalRateLimitCheck(const IPAddress_t *addr)
     }
 
     // Check if IP is currently blocked (exponential backoff)
-    if (limit->blockedUntil > 0 && now < limit->blockedUntil) {
+    if (limit->blockedUntil > 0 && now < limit->blockedUntil)
+    {
         return nullptr;
     }
 
     // Reset window if expired
-    if (now - limit->windowStart > windowSizeInMs) {
+    if (now - limit->windowStart > windowSizeInMs)
+    {
         limit->requestsCount = 0;
         limit->windowStart = now;
         limit->blockedUntil = 0;

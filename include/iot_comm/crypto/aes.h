@@ -41,22 +41,22 @@ extern "C" {
 #endif // __cplusplus
 
 // Initializes an AES-GCM context before key setup or data processing.
-void aesInit(AesContext_t *ctx);
+void aesInit(AesContext_t* ctx);
 // Releases resources held by an AES-GCM context.
-void aesDone(AesContext_t *ctx);
+void aesDone(AesContext_t* ctx);
 
 // Loads the encryption key into an AES-GCM context.
-esp_err_t aesSetKey(AesContext_t *ctx, const uint8_t *key, size_t keyLen);
+esp_err_t aesSetKey(AesContext_t* ctx, const uint8_t* key, size_t keyLen);
 
 // Encrypts a buffer with AES-GCM and appends the authentication tag. plaintext may be null when plaintextLen is zero.
 // Size of ciphertextOut must be plaintextLen plus 16 bytes for tag.
-esp_err_t aesEncrypt(AesContext_t *ctx, const uint8_t *plaintext, size_t plaintextLen, const uint8_t *iv, size_t ivLen,
-                      const uint8_t *aad, size_t aadLen, uint8_t *ciphertextOut);
+esp_err_t aesEncrypt(AesContext_t* ctx, const uint8_t* plaintext, size_t plaintextLen, const uint8_t* iv, size_t ivLen, const uint8_t* aad,
+                     size_t aadLen, uint8_t* ciphertextOut);
 // Decrypts and authenticates a buffer produced by AES-GCM.
 // Size of plaintextOut will be ciphertextLen minus 16 bytes because ciphertext must include
 // the tag at the end. plaintextOut may be null when ciphertextLen is 16 bytes.
-esp_err_t aesDecrypt(AesContext_t *ctx, const uint8_t *ciphertext, size_t ciphertextLen, const uint8_t *iv, size_t ivLen,
-                      const uint8_t *aad, size_t aadLen, uint8_t *plaintextOut);
+esp_err_t aesDecrypt(AesContext_t* ctx, const uint8_t* ciphertext, size_t ciphertextLen, const uint8_t* iv, size_t ivLen,
+                     const uint8_t* aad, size_t aadLen, uint8_t* plaintextOut);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,7 @@
 description: 'Test app for the esp-iot-comm library'
 dependencies:
   idf: '>=5.5.0'
+  espressif/mdns: ^1.12.0
   mxmauro/esp-iot-comm:
     version: '*'
     override_path: '../../'

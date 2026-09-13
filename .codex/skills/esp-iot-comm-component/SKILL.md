@@ -20,7 +20,6 @@ This repository is an ESP-IDF component first. Keep changes small, preserve the 
 
 ## Working Rules
 
-- Match local style instead of normalizing files.
 - Prefer fail-closed behavior on auth, crypto, protocol, and provisioning paths.
 - Keep public API changes in `include/` deliberate and minimal.
 - Extend `test/main/test_*.cpp` when behavior changes in protocol, crypto, parsing, OTA, or provisioning logic.

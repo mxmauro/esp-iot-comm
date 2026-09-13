@@ -4,15 +4,15 @@
 
 // -----------------------------------------------------------------------------
 
-static void assertIPv4(const IPAddress_t *addr, uint8_t a, uint8_t b, uint8_t c, uint8_t d);
-static void assertIPv6Bytes(const IPAddress_t *addr, const uint8_t expected[16]);
+static void assertIPv4(const IPAddress_t* addr, uint8_t a, uint8_t b, uint8_t c, uint8_t d);
+static void assertIPv6Bytes(const IPAddress_t* addr, const uint8_t expected[16]);
 
 // -----------------------------------------------------------------------------
 
 TEST_CASE("parseIPv4 extracts IPv4 octets", "[network]")
 {
     struct sockaddr_in in = {};
-    IPAddress_t        addr = {};
+    IPAddress_t addr = {};
 
     TEST_ASSERT_EQUAL_INT(1, inet_pton(AF_INET, "203.0.113.7", &in.sin_addr));
 
@@ -24,11 +24,8 @@ TEST_CASE("parseIPv4 extracts IPv4 octets", "[network]")
 TEST_CASE("parseIPv6 extracts IPv6 bytes", "[network]")
 {
     struct sockaddr_in6 in = {};
-    IPAddress_t         addr = {};
-    const uint8_t       expected[16] = {
-        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef
-    };
+    IPAddress_t addr = {};
+    const uint8_t expected[16] = {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef};
 
     TEST_ASSERT_EQUAL_INT(1, inet_pton(AF_INET6, "2001:db8::dead:beef", &in.sin6_addr));
 
@@ -40,10 +37,7 @@ TEST_CASE("parseIPv6 extracts IPv6 bytes", "[network]")
 TEST_CASE("parseIP accepts supported IPv4 and IPv6 formats", "[network]")
 {
     IPAddress_t addr = {};
-    const uint8_t ipv6Expected[16] = {
-        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef
-    };
+    const uint8_t ipv6Expected[16] = {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef};
 
     TEST_ASSERT_TRUE(parseIP(&addr, " 203.0.113.9 "));
     assertIPv4(&addr, 203, 0, 113, 9);
@@ -95,7 +89,7 @@ TEST_CASE("isValidHostname rejects invalid hostnames", "[mdns]")
 
 // -----------------------------------------------------------------------------
 
-static void assertIPv4(const IPAddress_t *addr, uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+static void assertIPv4(const IPAddress_t* addr, uint8_t a, uint8_t b, uint8_t c, uint8_t d)
 {
     TEST_ASSERT_FALSE(addr->isIPv6);
     TEST_ASSERT_EQUAL_UINT8(a, addr->ip[0]);
@@ -104,7 +98,7 @@ static void assertIPv4(const IPAddress_t *addr, uint8_t a, uint8_t b, uint8_t c,
     TEST_ASSERT_EQUAL_UINT8(d, addr->ip[3]);
 }
 
-static void assertIPv6Bytes(const IPAddress_t *addr, const uint8_t expected[16])
+static void assertIPv6Bytes(const IPAddress_t* addr, const uint8_t expected[16])
 {
     TEST_ASSERT_TRUE(addr->isIPv6);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, addr->ip, 16);

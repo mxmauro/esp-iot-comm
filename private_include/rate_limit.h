@@ -12,13 +12,13 @@ extern "C" {
 esp_err_t rateLimitInit(size_t maxSlots, uint32_t windowSizeInMs, uint8_t maxRequestsPerWindow, uint8_t maxConsecutiveFailures);
 void rateLimitDeinit();
 
-bool rateLimitCheckRequest(const IPAddress_t *addr);
+bool rateLimitCheckRequest(const IPAddress_t* addr);
 
-void rateLimitIncrementFailedAuth(const IPAddress_t *addr);
+void rateLimitIncrementFailedAuth(const IPAddress_t* addr);
 
-bool rateLimitIsAddressBlocked(const IPAddress_t *addr);
+bool rateLimitIsAddressBlocked(const IPAddress_t* addr);
 
-void rateLimitResetAddress(const IPAddress_t *addr);
+void rateLimitResetAddress(const IPAddress_t* addr);
 void rateLimitResetAll();
 
 #ifdef __cplusplus

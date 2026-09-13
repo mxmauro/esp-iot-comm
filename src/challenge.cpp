@@ -17,7 +17,7 @@ typedef struct SuperChallenge_s {
 
 // -----------------------------------------------------------------------------
 
-static SuperChallenge_t *challenges = nullptr;
+static SuperChallenge_t* challenges = nullptr;
 static size_t maxChallengesCount = 0;
 static uint32_t windowSizeInMs = 0;
 
@@ -28,8 +28,9 @@ esp_err_t challengesInit(size_t _maxChallengesCount, uint32_t _windowSizeInMs)
     assert(_maxChallengesCount > 0);
     assert(_windowSizeInMs > 0);
 
-    challenges = (SuperChallenge_t *)malloc(_maxChallengesCount * sizeof(SuperChallenge_t));
-    if (!challenges) {
+    challenges = static_cast<SuperChallenge_t*>(malloc(_maxChallengesCount * sizeof(SuperChallenge_t)));
+    if (!challenges)
+    {
         ESP_LOGE(TAG, "Failed to allocate memory for the challenge table.");
         return ESP_ERR_NO_MEM;
     }
@@ -44,7 +45,8 @@ esp_err_t challengesInit(size_t _maxChallengesCount, uint32_t _windowSizeInMs)
 
 void challengesDeinit()
 {
-    if (challenges) {
+    if (challenges)
+    {
         memset(challenges, 0, maxChallengesCount * sizeof(SuperChallenge_t));
         free(challenges);
         challenges = nullptr;
@@ -53,27 +55,32 @@ void challengesDeinit()
     windowSizeInMs = 0;
 }
 
-void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Challenge_t *challenge)
+void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t* addr, Challenge_t* challenge)
 {
     uint64_t now = now_ms();
     uint64_t oldestSlotTime;
     size_t i, toReplace;
 
-    if (now == 0) {
+    if (now == 0)
+    {
         now = 1;
     }
 
     // First try to find existing slot for this IP (replace old nonce)
-    for (i = 0; i < maxChallengesCount; i++) {
-        if (ipAddressEqual(&challenges[i].clientIP, addr)) {
+    for (i = 0; i < maxChallengesCount; i++)
+    {
+        if (ipAddressEqual(&challenges[i].clientIP, addr))
+        {
             toReplace = i;
             goto do_replacement_skip_ip;
         }
     }
 
     // Find empty or expired slot
-    for (i = 0; i < maxChallengesCount; i++) {
-        if (challenges[i].createdAt == 0 || now - challenges[i].createdAt > windowSizeInMs) {
+    for (i = 0; i < maxChallengesCount; i++)
+    {
+        if (challenges[i].createdAt == 0 || now - challenges[i].createdAt > windowSizeInMs)
+        {
             toReplace = i;
             goto do_replacement;
         }
@@ -82,8 +89,10 @@ void challengesAdd(const ChallengeCookie_t cookie, const IPAddress_t *addr, Chal
     // If still no slot, replace oldest
     toReplace = 0;
     oldestSlotTime = challenges[0].createdAt;
-    for (i = 1; i < maxChallengesCount; i++) {
-        if (challenges[i].createdAt < oldestSlotTime) {
+    for (i = 1; i < maxChallengesCount; i++)
+    {
+        if (challenges[i].createdAt < oldestSlotTime)
+        {
             toReplace = i;
             oldestSlotTime = challenges[i].createdAt;
         }
@@ -100,8 +109,10 @@ do_replacement_skip_ip:
 
 void challengesRemove(const ChallengeCookie_t cookie)
 {
-    for (size_t i = 0; i < maxChallengesCount; i++) {
-        if (challenges[i].createdAt != 0 && constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t))) {
+    for (size_t i = 0; i < maxChallengesCount; i++)
+    {
+        if (challenges[i].createdAt != 0 && constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t)))
+        {
             memset(&challenges[i], 0, sizeof(SuperChallenge_t));
             break;
         }
@@ -113,35 +124,31 @@ void challengesRemoveAll()
     memset(challenges, 0, maxChallengesCount * sizeof(SuperChallenge_t));
 }
 
-Challenge_t* challengesFindByToken(const ChallengeCookie_t cookie, const IPAddress_t *addr)
+Challenge_t* challengesFindByToken(const ChallengeCookie_t cookie, const IPAddress_t* addr)
 {
     uint64_t now = now_ms();
 
-    for (size_t i = 0; i < maxChallengesCount; i++) {
-        if (
-            challenges[i].createdAt != 0 &&
-            constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t)) &&
-            ipAddressEqual(&challenges[i].clientIP, addr) &&
-            now - challenges[i].createdAt < windowSizeInMs
-        ) {
+    for (size_t i = 0; i < maxChallengesCount; i++)
+    {
+        if (challenges[i].createdAt != 0 && constantTimeCompare(challenges[i].cookie, cookie, sizeof(ChallengeCookie_t)) &&
+            ipAddressEqual(&challenges[i].clientIP, addr) && now - challenges[i].createdAt < windowSizeInMs)
+        {
             return &challenges[i].challenge;
         }
     }
     return nullptr;
 }
 
-Challenge_t* challengesFindByWsTicket(const ChallengeWsTicket_t ticket, const IPAddress_t *addr)
+Challenge_t* challengesFindByWsTicket(const ChallengeWsTicket_t ticket, const IPAddress_t* addr)
 {
     uint64_t now = now_ms();
 
-    for (size_t i = 0; i < maxChallengesCount; i++) {
-        if (
-            challenges[i].createdAt != 0 &&
-            challenges[i].challenge.verified &&
+    for (size_t i = 0; i < maxChallengesCount; i++)
+    {
+        if (challenges[i].createdAt != 0 && challenges[i].challenge.verified &&
             constantTimeCompare(challenges[i].challenge.wsTicket, ticket, sizeof(ChallengeWsTicket_t)) &&
-            ipAddressEqual(&challenges[i].clientIP, addr) &&
-            now - challenges[i].createdAt < windowSizeInMs
-        ) {
+            ipAddressEqual(&challenges[i].clientIP, addr) && now - challenges[i].createdAt < windowSizeInMs)
+        {
             return &challenges[i].challenge;
         }
     }

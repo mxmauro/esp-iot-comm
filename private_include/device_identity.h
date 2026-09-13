@@ -9,7 +9,7 @@
 extern "C" {
 #endif // __cplusplus
 
-esp_err_t deviceIdentityInit(const IotCommStorageCallbacks_t *storage);
+esp_err_t deviceIdentityInit(const IotCommStorageCallbacks_t* storage);
 void deviceIdentityDeinit();
 
 esp_err_t deviceIdentityGetPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);

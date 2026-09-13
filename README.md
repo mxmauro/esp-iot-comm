@@ -63,7 +63,7 @@ Open your project's `idf_component.yml` file and add a `dependencies` section if
 dependencies:
   mxmauro/esp_iot_comm:
     git: https://github.com/mxmauro/esp-iot-comm.git
-    version: "*"   # You can also specify a tag, branch or commit hash
+    version: "v0.7.0"   # You can also specify a branch or commit hash
 ```
 
 After that, run:

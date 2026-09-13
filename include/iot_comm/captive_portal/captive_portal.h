@@ -16,14 +16,21 @@ typedef struct CaptivePortalProvisioningConfig_s {
 } CaptivePortalProvisioningConfig_t;
 
 // Receives the validated provisioning config submitted through the captive portal.
-typedef esp_err_t (*CaptivePortalProvisioningConfigHandler_t)(CaptivePortalProvisioningConfig_t *config, void *ctx);
+typedef esp_err_t (*CaptivePortalProvisioningConfigHandler_t)(CaptivePortalProvisioningConfig_t* config, void* ctx);
+// Verifies the root-user signature authorizing recovery provisioning.
+typedef esp_err_t (*CaptivePortalRootAuthorizationHandler_t)(const uint8_t hash[P256_HASH_SIZE],
+                                                             const uint8_t signature[P256_SIGNATURE_SIZE], void* ctx);
 
 // Configures how the captive portal collects and applies provisioning data.
 typedef struct CaptivePortalConfig_s {
     CaptivePortalProvisioningConfigHandler_t handler;
-    void *handlerCtx;
-    bool setupRootUser;
-    bool setupDeviceHostname;
+    void*                                    handlerCtx;
+    CaptivePortalRootAuthorizationHandler_t  rootAuthorization;
+    void*                                    rootAuthorizationCtx;
+    bool                                     requestWifiCredentials;
+    bool                                     setupRootUser;
+    bool                                     setupDeviceHostname;
+    bool                                     requireRootAuthorization;
 } CaptivePortalConfig_t;
 
 // -----------------------------------------------------------------------------
@@ -33,12 +40,12 @@ extern "C" {
 #endif // __cplusplus
 
 // Initializes the captive portal subsystem.
-esp_err_t capPortalInit(CaptivePortalConfig_t *config);
+esp_err_t capPortalInit(CaptivePortalConfig_t* config);
 // Releases resources owned by the captive portal subsystem.
 void capPortalDeinit();
 
 // Processes an incoming HTTP request for the captive portal.
-esp_err_t capPortalHandleRequest(httpd_req_t *req);
+esp_err_t capPortalHandleRequest(httpd_req_t* req);
 
 #ifdef __cplusplus
 }

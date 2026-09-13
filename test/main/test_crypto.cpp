@@ -14,27 +14,29 @@
 // -----------------------------------------------------------------------------
 
 static constexpr size_t kChallengeCookieSize = 12;
-static constexpr size_t kChallengeNonceSize = 16;
+static constexpr size_t kChallengeNonceSize  = 16;
 
-static void fillPattern(uint8_t *dest, size_t len, uint8_t seed)
+static void fillPattern(uint8_t* dest, size_t len, uint8_t seed)
 {
-    for (size_t i = 0; i < len; i++) {
-        dest[i] = (uint8_t)(seed + i * 13);
+    for (size_t i = 0; i < len; i++)
+    {
+        dest[i] = static_cast<uint8_t>(seed + i * 13);
     }
 }
 
 static void deriveWsLoginSalt(const uint8_t serverNonce[kChallengeNonceSize], const uint8_t clientNonce[kChallengeNonceSize],
-                              const uint8_t cookie[kChallengeCookieSize], const uint8_t *wsNonce, uint8_t out[SHA256_SIZE])
+                              const uint8_t cookie[kChallengeCookieSize], const uint8_t* wsNonce, uint8_t out[SHA256_SIZE])
 {
     Sha256Context_t sha256Ctx;
 
     sha256Init(&sha256Ctx);
     TEST_ASSERT_EQUAL(ESP_OK, sha256Start(&sha256Ctx));
-    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, (const uint8_t *)"ws-login-v1", 11));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, reinterpret_cast<const uint8_t*>("ws-login-v1"), 11));
     TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, serverNonce, kChallengeNonceSize));
     TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, clientNonce, kChallengeNonceSize));
     TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, cookie, kChallengeCookieSize));
-    if (wsNonce) {
+    if (wsNonce)
+    {
         TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&sha256Ctx, wsNonce, kChallengeNonceSize));
     }
     TEST_ASSERT_EQUAL(ESP_OK, sha256Finish(&sha256Ctx, out));
@@ -43,9 +45,9 @@ static void deriveWsLoginSalt(const uint8_t serverNonce[kChallengeNonceSize], co
 
 TEST_CASE("constantTimeCompare reports equality and inequality", "[crypto]")
 {
-    const uint8_t a[] = { 0x10, 0x20, 0x30, 0x40 };
-    const uint8_t b[] = { 0x10, 0x20, 0x30, 0x40 };
-    const uint8_t c[] = { 0x10, 0x20, 0x30, 0x41 };
+    const uint8_t a[] = {0x10, 0x20, 0x30, 0x40};
+    const uint8_t b[] = {0x10, 0x20, 0x30, 0x40};
+    const uint8_t c[] = {0x10, 0x20, 0x30, 0x41};
 
     TEST_ASSERT_TRUE(constantTimeCompare(a, b, sizeof(a)));
     TEST_ASSERT_FALSE(constantTimeCompare(a, c, sizeof(a)));
@@ -53,50 +55,31 @@ TEST_CASE("constantTimeCompare reports equality and inequality", "[crypto]")
 
 TEST_CASE("hkdfSha256DeriveKey matches RFC5869 test vector", "[crypto]")
 {
-    const uint8_t ikm[22] = {
-        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
-        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
-    };
-    const uint8_t salt[13] = {
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-        0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c
-    };
-    const uint8_t info[10] = {
-        0xf0, 0xf1, 0xf2, 0xf3, 0xf4,
-        0xf5, 0xf6, 0xf7, 0xf8, 0xf9
-    };
-    const uint8_t expected[42] = {
-        0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a, 0x90, 0x43, 0x4f,
-        0x64, 0xd0, 0x36, 0x2f, 0x2a, 0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a,
-        0x5a, 0x4c, 0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf, 0x34,
-        0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18, 0x58, 0x65
-    };
+    const uint8_t ikm[22] = {0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                             0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b};
+    const uint8_t salt[13] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c};
+    const uint8_t info[10] = {0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9};
+    const uint8_t expected[42] = {0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a, 0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36,
+                                  0x2f, 0x2a, 0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c, 0x5d, 0xb0, 0x2d, 0x56,
+                                  0xec, 0xc4, 0xc5, 0xbf, 0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18, 0x58, 0x65};
     uint8_t out[sizeof(expected)] = {0};
 
-    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(
-        ikm, sizeof(ikm),
-        salt, sizeof(salt),
-        info, sizeof(info),
-        out, sizeof(out)
-    ));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(ikm, sizeof(ikm), salt, sizeof(salt), info, sizeof(info), out, sizeof(out)));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, out, sizeof(expected));
 }
 
 TEST_CASE("sha256 helpers hash incrementally", "[crypto]")
 {
-    static const uint8_t expected[SHA256_SIZE] = {
-        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
-    };
+    static const uint8_t expected[SHA256_SIZE] = {0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
+                                                  0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
+                                                  0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
     Sha256Context_t ctx;
     uint8_t out[SHA256_SIZE];
 
     sha256Init(&ctx);
     TEST_ASSERT_EQUAL(ESP_OK, sha256Start(&ctx));
-    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&ctx, (const uint8_t *)"a", 1));
-    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&ctx, (const uint8_t *)"bc", 2));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&ctx, reinterpret_cast<const uint8_t*>("a"), 1));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Update(&ctx, reinterpret_cast<const uint8_t*>("bc"), 2));
     TEST_ASSERT_EQUAL(ESP_OK, sha256Finish(&ctx, out));
     sha256Done(&ctx);
 
@@ -106,22 +89,16 @@ TEST_CASE("sha256 helpers hash incrementally", "[crypto]")
 TEST_CASE("sha512 helpers hash incrementally", "[crypto]")
 {
     static const uint8_t expected[SHA512_SIZE] = {
-        0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba,
-        0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31,
-        0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9, 0x7e, 0xa2,
-        0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a,
-        0x21, 0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8,
-        0x36, 0xba, 0x3c, 0x23, 0xa3, 0xfe, 0xeb, 0xbd,
-        0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e,
-        0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f
-    };
+        0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba, 0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31, 0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9,
+        0x7e, 0xa2, 0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a, 0x21, 0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8, 0x36, 0xba, 0x3c, 0x23,
+        0xa3, 0xfe, 0xeb, 0xbd, 0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e, 0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f};
     Sha512Context_t ctx;
     uint8_t out[SHA512_SIZE];
 
     sha512Init(&ctx);
     TEST_ASSERT_EQUAL(ESP_OK, sha512Start(&ctx));
-    TEST_ASSERT_EQUAL(ESP_OK, sha512Update(&ctx, (const uint8_t *)"a", 1));
-    TEST_ASSERT_EQUAL(ESP_OK, sha512Update(&ctx, (const uint8_t *)"bc", 2));
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Update(&ctx, reinterpret_cast<const uint8_t*>("a"), 1));
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Update(&ctx, reinterpret_cast<const uint8_t*>("bc"), 2));
     TEST_ASSERT_EQUAL(ESP_OK, sha512Finish(&ctx, out));
     sha512Done(&ctx);
 
@@ -268,7 +245,7 @@ TEST_CASE("ecdh shared secret matches on both sides", "[crypto]")
 TEST_CASE("session master key derives WebSocket transport material", "[crypto]")
 {
     static const char sessionInfo[] = "mx-iot-session-master-v1";
-    static const char wsInfo[] = "mx-iot-ws-v1";
+    static const char wsInfo[]      = "mx-iot-ws-v1";
     P256KeyPair_t alice;
     P256KeyPair_t bob;
     uint8_t alicePublic[P256_PUBLIC_KEY_SIZE];
@@ -305,20 +282,18 @@ TEST_CASE("session master key derives WebSocket transport material", "[crypto]")
     TEST_ASSERT_EQUAL(ESP_OK, ecdhComputeSharedSecret(&alice, aliceSecret));
     TEST_ASSERT_EQUAL(ESP_OK, ecdhComputeSharedSecret(&bob, bobSecret));
 
-    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(aliceSecret, sizeof(aliceSecret), sessionSalt, sizeof(sessionSalt),
-                                                  (const uint8_t *)sessionInfo, sizeof(sessionInfo) - 1,
-                                                  aliceSessionMasterKey, sizeof(aliceSessionMasterKey)));
-    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(bobSecret, sizeof(bobSecret), sessionSalt, sizeof(sessionSalt),
-                                                  (const uint8_t *)sessionInfo, sizeof(sessionInfo) - 1,
-                                                  bobSessionMasterKey, sizeof(bobSessionMasterKey)));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      hkdfSha256DeriveKey(aliceSecret, sizeof(aliceSecret), sessionSalt, sizeof(sessionSalt), reinterpret_cast<const uint8_t*>(sessionInfo),
+                                          sizeof(sessionInfo) - 1, aliceSessionMasterKey, sizeof(aliceSessionMasterKey)));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      hkdfSha256DeriveKey(bobSecret, sizeof(bobSecret), sessionSalt, sizeof(sessionSalt), reinterpret_cast<const uint8_t*>(sessionInfo),
+                                          sizeof(sessionInfo) - 1, bobSessionMasterKey, sizeof(bobSessionMasterKey)));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(aliceSessionMasterKey, bobSessionMasterKey, sizeof(aliceSessionMasterKey));
 
     TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(aliceSessionMasterKey, sizeof(aliceSessionMasterKey), wsSalt, sizeof(wsSalt),
-                                                  (const uint8_t *)wsInfo, sizeof(wsInfo) - 1,
-                                                  aliceWsMaterial, sizeof(aliceWsMaterial)));
+                                                  reinterpret_cast<const uint8_t*>(wsInfo), sizeof(wsInfo) - 1, aliceWsMaterial, sizeof(aliceWsMaterial)));
     TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(bobSessionMasterKey, sizeof(bobSessionMasterKey), wsSalt, sizeof(wsSalt),
-                                                  (const uint8_t *)wsInfo, sizeof(wsInfo) - 1,
-                                                  bobWsMaterial, sizeof(bobWsMaterial)));
+                                                  reinterpret_cast<const uint8_t*>(wsInfo), sizeof(wsInfo) - 1, bobWsMaterial, sizeof(bobWsMaterial)));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(aliceWsMaterial, bobWsMaterial, sizeof(aliceWsMaterial));
 
     TEST_ASSERT_NOT_EQUAL(0, memcmp(aliceSessionMasterKey, aliceWsMaterial, sizeof(aliceSessionMasterKey)));
@@ -329,7 +304,7 @@ TEST_CASE("session master key derives WebSocket transport material", "[crypto]")
 
 TEST_CASE("UDP transport derivation is separated from WebSocket material", "[crypto]")
 {
-    static const char wsInfo[] = "mx-iot-ws-v1";
+    static const char wsInfo[]  = "mx-iot-ws-v1";
     static const char udpInfo[] = "mx-iot-udp-v1";
     uint8_t sessionMasterKey[32];
     uint8_t wsSalt[SHA256_SIZE];
@@ -342,11 +317,9 @@ TEST_CASE("UDP transport derivation is separated from WebSocket material", "[cry
     fillPattern(udpSalt, sizeof(udpSalt), 0x71);
 
     TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sessionMasterKey, sizeof(sessionMasterKey), wsSalt, sizeof(wsSalt),
-                                                  (const uint8_t *)wsInfo, sizeof(wsInfo) - 1,
-                                                  wsMaterial, sizeof(wsMaterial)));
+                                                  reinterpret_cast<const uint8_t*>(wsInfo), sizeof(wsInfo) - 1, wsMaterial, sizeof(wsMaterial)));
     TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sessionMasterKey, sizeof(sessionMasterKey), udpSalt, sizeof(udpSalt),
-                                                  (const uint8_t *)udpInfo, sizeof(udpInfo) - 1,
-                                                  udpMaterial, sizeof(udpMaterial)));
+                                                  reinterpret_cast<const uint8_t*>(udpInfo), sizeof(udpInfo) - 1, udpMaterial, sizeof(udpMaterial)));
 
     TEST_ASSERT_NOT_EQUAL(0, memcmp(wsMaterial, udpMaterial, sizeof(wsMaterial)));
 }
@@ -354,7 +327,7 @@ TEST_CASE("UDP transport derivation is separated from WebSocket material", "[cry
 TEST_CASE("auth envelope derivation is separated from session material", "[crypto]")
 {
     static const char sessionInfo[] = "mx-iot-session-master-v1";
-    static const char authInfo[] = "mx-iot-auth-v1";
+    static const char authInfo[]    = "mx-iot-auth-v1";
     uint8_t sharedSecret[P256_SHARED_SECRET_SIZE];
     uint8_t salt[SHA256_SIZE];
     uint8_t sessionMasterKey[32];
@@ -363,12 +336,10 @@ TEST_CASE("auth envelope derivation is separated from session material", "[crypt
     fillPattern(sharedSecret, sizeof(sharedSecret), 0x12);
     fillPattern(salt, sizeof(salt), 0x34);
 
-    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), salt, sizeof(salt),
-                                                  (const uint8_t *)sessionInfo, sizeof(sessionInfo) - 1,
-                                                  sessionMasterKey, sizeof(sessionMasterKey)));
-    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), salt, sizeof(salt),
-                                                  (const uint8_t *)authInfo, sizeof(authInfo) - 1,
-                                                  authKey, sizeof(authKey)));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), salt, sizeof(salt), reinterpret_cast<const uint8_t*>(sessionInfo),
+                                                  sizeof(sessionInfo) - 1, sessionMasterKey, sizeof(sessionMasterKey)));
+    TEST_ASSERT_EQUAL(ESP_OK, hkdfSha256DeriveKey(sharedSecret, sizeof(sharedSecret), salt, sizeof(salt), reinterpret_cast<const uint8_t*>(authInfo),
+                                                  sizeof(authInfo) - 1, authKey, sizeof(authKey)));
     TEST_ASSERT_NOT_EQUAL(0, memcmp(sessionMasterKey, authKey, sizeof(authKey)));
 }
 

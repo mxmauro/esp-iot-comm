@@ -56,7 +56,8 @@ export function validateFields({
     repeatRootUserPublicKey,
     hostname,
     setupRootUser,
-    setupDeviceHostname
+    setupDeviceHostname,
+    requestWifiCredentials
 }) {
     const fieldErrors = {
         wifiSSID: '',
@@ -66,11 +67,11 @@ export function validateFields({
         hostname: ''
     };
 
-    if (!wifiSSID || wifiSSID.length > 32) {
+    if (requestWifiCredentials && (!wifiSSID || wifiSSID.length > 32)) {
         fieldErrors.wifiSSID = 'SSID must be 1 to 32 characters.';
     }
 
-    if (wifiPassword && (wifiPassword.length < 8 || wifiPassword.length > 64)) {
+    if (requestWifiCredentials && wifiPassword && (wifiPassword.length < 8 || wifiPassword.length > 64)) {
         fieldErrors.wifiPassword = 'Password must be empty or 8 to 64 characters.';
     }
 

@@ -29,7 +29,8 @@ static mbedtls_ecp_group ecpGroup = {};
 #define DELAYED_P256_INIT()     \
     {                           \
         esp_err_t err = init(); \
-        if (err != ESP_OK) {    \
+        if (err != ESP_OK)      \
+        {                       \
             return err;         \
         }                       \
     }
@@ -39,31 +40,31 @@ static mbedtls_ecp_group ecpGroup = {};
 static esp_err_t init();
 
 #if ESP_IDF_VERSION_MAJOR >= 6
-static psa_status_t importPrivateKey(psa_key_id_t *keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t *pair);
-static psa_status_t importPublicKey(psa_key_id_t *keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t *pair);
+static psa_status_t importPrivateKey(psa_key_id_t* keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t* pair);
+static psa_status_t importPublicKey(psa_key_id_t* keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t* pair);
 #else
-static int randomGen(void *ctx, unsigned char *dest, size_t count);
-static esp_err_t loadPublicPoint(mbedtls_ecp_point *point, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
-static esp_err_t loadPrivateScalar(mbedtls_mpi *d, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE]);
+static int randomGen(void* ctx, unsigned char* dest, size_t count);
+static esp_err_t loadPublicPoint(mbedtls_ecp_point* point, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
+static esp_err_t loadPrivateScalar(mbedtls_mpi* d, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE]);
 #endif
 
 // -----------------------------------------------------------------------------
 
-void p256KeyPairInit(P256KeyPair_t *pair)
+void p256KeyPairInit(P256KeyPair_t* pair)
 {
     assert(pair);
 
     memset(pair, 0, sizeof(*pair));
 }
 
-void p256KeyPairDone(P256KeyPair_t *pair)
+void p256KeyPairDone(P256KeyPair_t* pair)
 {
     assert(pair);
 
     memset(pair, 0, sizeof(*pair));
 }
 
-esp_err_t p256LoadPublicKey(P256KeyPair_t *pair, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
+esp_err_t p256LoadPublicKey(P256KeyPair_t* pair, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_id_t keyId = PSA_KEY_ID_NULL;
@@ -83,7 +84,8 @@ esp_err_t p256LoadPublicKey(P256KeyPair_t *pair, const uint8_t publicKey[P256_PU
     temp.hasPublicKey = true;
 
     status = importPublicKey(&keyId, PSA_ALG_ECDSA_ANY, PSA_KEY_USAGE_VERIFY_HASH, &temp);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to import the public key. Error: %d.", status);
         return status;
     }
@@ -92,7 +94,8 @@ esp_err_t p256LoadPublicKey(P256KeyPair_t *pair, const uint8_t publicKey[P256_PU
     mbedtls_ecp_point_init(&q);
     err = loadPublicPoint(&q, publicKey);
     mbedtls_ecp_point_free(&q);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to import the public key. Error: %d.", err);
         return err;
     }
@@ -103,13 +106,14 @@ esp_err_t p256LoadPublicKey(P256KeyPair_t *pair, const uint8_t publicKey[P256_PU
     return ESP_OK;
 }
 
-esp_err_t p256SavePublicKey(P256KeyPair_t *pair, uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
+esp_err_t p256SavePublicKey(P256KeyPair_t* pair, uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
     assert(pair);
 
     DELAYED_P256_INIT();
 
-    if (!pair->hasPublicKey) {
+    if (!pair->hasPublicKey)
+    {
         ESP_LOGE(TAG, "No public key is loaded.");
         return ESP_ERR_INVALID_STATE;
     }
@@ -118,7 +122,7 @@ esp_err_t p256SavePublicKey(P256KeyPair_t *pair, uint8_t publicKey[P256_PUBLIC_K
     return ESP_OK;
 }
 
-esp_err_t p256LoadPrivateKey(P256KeyPair_t *pair, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE])
+esp_err_t p256LoadPrivateKey(P256KeyPair_t* pair, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE])
 {
     assert(pair);
 
@@ -129,13 +133,14 @@ esp_err_t p256LoadPrivateKey(P256KeyPair_t *pair, const uint8_t privateKey[P256_
     return ESP_OK;
 }
 
-esp_err_t p256SavePrivateKey(P256KeyPair_t *pair, uint8_t privateKey[P256_PRIVATE_KEY_SIZE])
+esp_err_t p256SavePrivateKey(P256KeyPair_t* pair, uint8_t privateKey[P256_PRIVATE_KEY_SIZE])
 {
     assert(pair);
 
     DELAYED_P256_INIT();
 
-    if (!pair->hasPrivateKey) {
+    if (!pair->hasPrivateKey)
+    {
         ESP_LOGE(TAG, "No private key is loaded.");
         return ESP_ERR_INVALID_STATE;
     }
@@ -144,7 +149,7 @@ esp_err_t p256SavePrivateKey(P256KeyPair_t *pair, uint8_t privateKey[P256_PRIVAT
     return ESP_OK;
 }
 
-esp_err_t p256DerivePublicKey(P256KeyPair_t *pair)
+esp_err_t p256DerivePublicKey(P256KeyPair_t* pair)
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_id_t keyId = PSA_KEY_ID_NULL;
@@ -161,14 +166,16 @@ esp_err_t p256DerivePublicKey(P256KeyPair_t *pair)
 
     DELAYED_P256_INIT();
 
-    if (!pair->hasPrivateKey) {
+    if (!pair->hasPrivateKey)
+    {
         ESP_LOGE(TAG, "A private key is required to derive the public key.");
         return ESP_ERR_INVALID_STATE;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = importPrivateKey(&keyId, PSA_ALG_ECDSA_ANY, PSA_KEY_USAGE_EXPORT, pair);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to import the private key. Error: %d.", status);
         return status;
     }
@@ -176,13 +183,15 @@ esp_err_t p256DerivePublicKey(P256KeyPair_t *pair)
     status = psa_export_public_key(keyId, pair->publicKey, sizeof(pair->publicKey), &publicKeyLen);
     psa_destroy_key(keyId);
 
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to derive the public key. Error: %d.", status);
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
         pair->hasPublicKey = false;
         return status;
     }
-    if (publicKeyLen != P256_PUBLIC_KEY_SIZE) {
+    if (publicKeyLen != P256_PUBLIC_KEY_SIZE)
+    {
         ESP_LOGE(TAG, "Unexpected public key size: %d bytes.", publicKeyLen);
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
         pair->hasPublicKey = false;
@@ -193,24 +202,27 @@ esp_err_t p256DerivePublicKey(P256KeyPair_t *pair)
     mbedtls_ecp_point_init(&q);
 
     err = loadPrivateScalar(&d, pair->privateKey);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_ecp_mul(&ecpGroup, &q, &d, &ecpGroup.G, randomGen, nullptr);
     }
-    if (err == ESP_OK) {
-        err = mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey,
-                                             P256_PUBLIC_KEY_SIZE);
+    if (err == ESP_OK)
+    {
+        err = mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey, P256_PUBLIC_KEY_SIZE);
     }
 
     mbedtls_mpi_free(&d);
     mbedtls_ecp_point_free(&q);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to derive the public key. Error: %d.", err);
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
         pair->hasPublicKey = false;
         return err;
     }
-    if (outLen != P256_PUBLIC_KEY_SIZE) {
+    if (outLen != P256_PUBLIC_KEY_SIZE)
+    {
         ESP_LOGE(TAG, "Unexpected public key size: %d bytes.", outLen);
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
         pair->hasPublicKey = false;
@@ -222,7 +234,7 @@ esp_err_t p256DerivePublicKey(P256KeyPair_t *pair)
     return ESP_OK;
 }
 
-esp_err_t p256LoadPublicKeyB64(P256KeyPair_t *pair, const char *publicKey, size_t publicKeyLen, bool isUrl)
+esp_err_t p256LoadPublicKeyB64(P256KeyPair_t* pair, const char* publicKey, size_t publicKeyLen, bool isUrl)
 {
     uint8_t buffer[P256_PUBLIC_KEY_SIZE];
     size_t decodedLen;
@@ -230,18 +242,20 @@ esp_err_t p256LoadPublicKeyB64(P256KeyPair_t *pair, const char *publicKey, size_
     assert(pair);
 
     decodedLen = sizeof(buffer);
-    if (!fromB64(publicKey, publicKeyLen, isUrl, buffer, &decodedLen)) {
+    if (!fromB64(publicKey, publicKeyLen, isUrl, buffer, &decodedLen))
+    {
         ESP_LOGE(TAG, "Failed to decode the Base64 public key.");
         return ESP_FAIL;
     }
-    if (decodedLen != P256_PUBLIC_KEY_SIZE) {
+    if (decodedLen != P256_PUBLIC_KEY_SIZE)
+    {
         ESP_LOGE(TAG, "Invalid public key size: %d bytes.", decodedLen);
         return ESP_ERR_INVALID_SIZE;
     }
     return p256LoadPublicKey(pair, buffer);
 }
 
-esp_err_t p256SavePublicKeyB64(P256KeyPair_t *pair, char *publicKey, size_t *publicKeyLen, bool isUrl)
+esp_err_t p256SavePublicKeyB64(P256KeyPair_t* pair, char* publicKey, size_t* publicKeyLen, bool isUrl)
 {
     uint8_t buffer[P256_PUBLIC_KEY_SIZE];
     esp_err_t err;
@@ -249,12 +263,14 @@ esp_err_t p256SavePublicKeyB64(P256KeyPair_t *pair, char *publicKey, size_t *pub
     assert(pair);
 
     err = p256SavePublicKey(pair, buffer);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to export the public key. Error: %d.", err);
         *publicKeyLen = 0;
         return err;
     }
-    if (!toB64(buffer, sizeof(buffer), isUrl, publicKey, publicKeyLen)) {
+    if (!toB64(buffer, sizeof(buffer), isUrl, publicKey, publicKeyLen))
+    {
         ESP_LOGE(TAG, "Failed to encode the public key as Base64.");
         *publicKeyLen = 0;
         return ESP_FAIL;
@@ -262,7 +278,7 @@ esp_err_t p256SavePublicKeyB64(P256KeyPair_t *pair, char *publicKey, size_t *pub
     return ESP_OK;
 }
 
-esp_err_t p256LoadPrivateKeyB64(P256KeyPair_t *pair, const char *privateKey, size_t privateKeyLen, bool isUrl)
+esp_err_t p256LoadPrivateKeyB64(P256KeyPair_t* pair, const char* privateKey, size_t privateKeyLen, bool isUrl)
 {
     uint8_t buffer[P256_PRIVATE_KEY_SIZE];
     size_t decodedLen;
@@ -271,14 +287,17 @@ esp_err_t p256LoadPrivateKeyB64(P256KeyPair_t *pair, const char *privateKey, siz
     assert(pair);
 
     decodedLen = sizeof(buffer);
-    if (!fromB64(privateKey, privateKeyLen, isUrl, buffer, &decodedLen)) {
+    if (!fromB64(privateKey, privateKeyLen, isUrl, buffer, &decodedLen))
+    {
         ESP_LOGE(TAG, "Failed to decode the Base64 private key.");
         return ESP_FAIL;
     }
-    if (decodedLen == P256_PRIVATE_KEY_SIZE) {
+    if (decodedLen == P256_PRIVATE_KEY_SIZE)
+    {
         err = p256LoadPrivateKey(pair, buffer);
     }
-    else {
+    else
+    {
         ESP_LOGE(TAG, "Invalid private key size: %d bytes.", decodedLen);
         err = ESP_ERR_INVALID_SIZE;
     }
@@ -286,7 +305,7 @@ esp_err_t p256LoadPrivateKeyB64(P256KeyPair_t *pair, const char *privateKey, siz
     return err;
 }
 
-esp_err_t p256SavePrivateKeyB64(P256KeyPair_t *pair, char *privateKey, size_t *privateKeyLen, bool isUrl)
+esp_err_t p256SavePrivateKeyB64(P256KeyPair_t* pair, char* privateKey, size_t* privateKeyLen, bool isUrl)
 {
     uint8_t buffer[P256_PRIVATE_KEY_SIZE];
     esp_err_t err;
@@ -294,12 +313,14 @@ esp_err_t p256SavePrivateKeyB64(P256KeyPair_t *pair, char *privateKey, size_t *p
     assert(pair);
 
     err = p256SavePrivateKey(pair, buffer);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to export the private key. Error: %d.", err);
         *privateKeyLen = 0;
         return err;
     }
-    if (!toB64(buffer, sizeof(buffer), isUrl, privateKey, privateKeyLen)) {
+    if (!toB64(buffer, sizeof(buffer), isUrl, privateKey, privateKeyLen))
+    {
         ESP_LOGE(TAG, "Failed to encode the private key as Base64.");
         *privateKeyLen = 0;
         err = ESP_FAIL;
@@ -308,13 +329,14 @@ esp_err_t p256SavePrivateKeyB64(P256KeyPair_t *pair, char *privateKey, size_t *p
     return err;
 }
 
-bool p256ValidatePublicKey(const uint8_t *publicKey, size_t publicKeySize)
+bool p256ValidatePublicKey(const uint8_t* publicKey, size_t publicKeySize)
 {
     uint8_t tempPk[P256_PUBLIC_KEY_SIZE];
     P256KeyPair_t pair;
     bool ret;
 
-    if ((!publicKey) || publicKeySize != P256_PUBLIC_KEY_SIZE) {
+    if ((!publicKey) || publicKeySize != P256_PUBLIC_KEY_SIZE)
+    {
         return false;
     }
 
@@ -330,7 +352,7 @@ bool p256ValidatePublicKey(const uint8_t *publicKey, size_t publicKeySize)
 
 // -----------------------------------------------------------------------------
 
-esp_err_t ecdhGeneratePair(P256KeyPair_t *pair)
+esp_err_t ecdhGeneratePair(P256KeyPair_t* pair)
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
@@ -357,18 +379,21 @@ esp_err_t ecdhGeneratePair(P256KeyPair_t *pair)
 
     status = psa_generate_key(&attr, &keyId);
     psa_reset_key_attributes(&attr);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to generate a key pair. Error: %d.", status);
         return status;
     }
 
     status = psa_export_public_key(keyId, pair->publicKey, sizeof(pair->publicKey), &publicKeyLen);
-    if (status == PSA_SUCCESS) {
+    if (status == PSA_SUCCESS)
+    {
         status = psa_export_key(keyId, pair->privateKey, sizeof(pair->privateKey), &privateKeyLen);
     }
     psa_destroy_key(keyId);
 
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to export the key pair. Error: %d.", status);
         memset(pair->privateKey, 0, sizeof(pair->privateKey));
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
@@ -377,7 +402,8 @@ esp_err_t ecdhGeneratePair(P256KeyPair_t *pair)
         return status;
     }
 
-    if ((publicKeyLen != P256_PUBLIC_KEY_SIZE) || (privateKeyLen != P256_PRIVATE_KEY_SIZE)) {
+    if ((publicKeyLen != P256_PUBLIC_KEY_SIZE) || (privateKeyLen != P256_PRIVATE_KEY_SIZE))
+    {
         ESP_LOGE(TAG, "Unexpected key sizes. Public: %d bytes, private: %d bytes.", publicKeyLen, privateKeyLen);
         memset(pair->privateKey, 0, sizeof(pair->privateKey));
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
@@ -393,13 +419,16 @@ esp_err_t ecdhGeneratePair(P256KeyPair_t *pair)
     // mbedtls_ecdh_gen_public is used despite its name because it will generate both
     // private and public keys in this scenario.
     err = mbedtls_ecdh_gen_public(&ecpGroup, &d, &q, randomGen, nullptr);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_write_binary(&d, pair->privateKey, P256_PRIVATE_KEY_SIZE);
-        if (err == ESP_OK) {
-            err = mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey,
-                                                 P256_PUBLIC_KEY_SIZE);
+        if (err == ESP_OK)
+        {
+            err =
+                mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey, P256_PUBLIC_KEY_SIZE);
         }
-        if ((err == ESP_OK) && (outLen != P256_PUBLIC_KEY_SIZE)) {
+        if ((err == ESP_OK) && (outLen != P256_PUBLIC_KEY_SIZE))
+        {
             err = ESP_FAIL;
         }
     }
@@ -407,7 +436,8 @@ esp_err_t ecdhGeneratePair(P256KeyPair_t *pair)
     mbedtls_mpi_free(&d);
     mbedtls_ecp_point_free(&q);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to generate a key pair. Error: %d.", err);
         memset(pair->privateKey, 0, sizeof(pair->privateKey));
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
@@ -422,7 +452,7 @@ esp_err_t ecdhGeneratePair(P256KeyPair_t *pair)
     return ESP_OK;
 }
 
-esp_err_t ecdhComputeSharedSecret(P256KeyPair_t *pair, uint8_t sharedSecret[P256_SHARED_SECRET_SIZE])
+esp_err_t ecdhComputeSharedSecret(P256KeyPair_t* pair, uint8_t sharedSecret[P256_SHARED_SECRET_SIZE])
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_id_t keyId = PSA_KEY_ID_NULL;
@@ -439,27 +469,31 @@ esp_err_t ecdhComputeSharedSecret(P256KeyPair_t *pair, uint8_t sharedSecret[P256
 
     DELAYED_P256_INIT();
 
-    if (!pair->hasPrivateKey || !pair->hasPublicKey) {
+    if (!pair->hasPrivateKey || !pair->hasPublicKey)
+    {
         ESP_LOGE(TAG, "Both a private key and a peer public key are required.");
         return ESP_ERR_INVALID_STATE;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = importPrivateKey(&keyId, PSA_ALG_ECDH, PSA_KEY_USAGE_DERIVE, pair);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to import the private key. Error: %d.", status);
         return status;
     }
 
-    status = psa_raw_key_agreement(PSA_ALG_ECDH, keyId, pair->publicKey, P256_PUBLIC_KEY_SIZE, sharedSecret,
-                                   P256_SHARED_SECRET_SIZE, &sharedSecretLen);
+    status = psa_raw_key_agreement(PSA_ALG_ECDH, keyId, pair->publicKey, P256_PUBLIC_KEY_SIZE, sharedSecret, P256_SHARED_SECRET_SIZE,
+                                   &sharedSecretLen);
     psa_destroy_key(keyId);
 
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to compute the shared secret. Error: %d.", status);
         return status;
     }
-    if (sharedSecretLen != P256_SHARED_SECRET_SIZE) {
+    if (sharedSecretLen != P256_SHARED_SECRET_SIZE)
+    {
         ESP_LOGE(TAG, "Unexpected shared secret size: %d bytes.", sharedSecretLen);
         return ESP_FAIL;
     }
@@ -469,13 +503,16 @@ esp_err_t ecdhComputeSharedSecret(P256KeyPair_t *pair, uint8_t sharedSecret[P256
     mbedtls_ecp_point_init(&q);
 
     err = loadPrivateScalar(&d, pair->privateKey);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = loadPublicPoint(&q, pair->publicKey);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_ecdh_compute_shared(&ecpGroup, &temp, &q, &d, randomGen, nullptr);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_write_binary(&temp, sharedSecret, P256_SHARED_SECRET_SIZE);
     }
 
@@ -483,7 +520,8 @@ esp_err_t ecdhComputeSharedSecret(P256KeyPair_t *pair, uint8_t sharedSecret[P256
     mbedtls_mpi_free(&temp);
     mbedtls_ecp_point_free(&q);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to compute the shared secret. Error: %d.", err);
         return err;
     }
@@ -494,7 +532,7 @@ esp_err_t ecdhComputeSharedSecret(P256KeyPair_t *pair, uint8_t sharedSecret[P256
 
 // -----------------------------------------------------------------------------
 
-esp_err_t ecdsaGeneratePair(P256KeyPair_t *pair)
+esp_err_t ecdsaGeneratePair(P256KeyPair_t* pair)
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
@@ -521,18 +559,21 @@ esp_err_t ecdsaGeneratePair(P256KeyPair_t *pair)
 
     status = psa_generate_key(&attr, &keyId);
     psa_reset_key_attributes(&attr);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to generate a key pair. Error: %d.", status);
         return status;
     }
 
     status = psa_export_public_key(keyId, pair->publicKey, sizeof(pair->publicKey), &publicKeyLen);
-    if (status == PSA_SUCCESS) {
+    if (status == PSA_SUCCESS)
+    {
         status = psa_export_key(keyId, pair->privateKey, sizeof(pair->privateKey), &privateKeyLen);
     }
     psa_destroy_key(keyId);
 
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to export the key pair. Error: %d.", status);
         memset(pair->privateKey, 0, sizeof(pair->privateKey));
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
@@ -541,7 +582,8 @@ esp_err_t ecdsaGeneratePair(P256KeyPair_t *pair)
         return status;
     }
 
-    if ((publicKeyLen != P256_PUBLIC_KEY_SIZE) || (privateKeyLen != P256_PRIVATE_KEY_SIZE)) {
+    if ((publicKeyLen != P256_PUBLIC_KEY_SIZE) || (privateKeyLen != P256_PRIVATE_KEY_SIZE))
+    {
         ESP_LOGE(TAG, "Unexpected key sizes. Public: %d bytes, private: %d bytes.", publicKeyLen, privateKeyLen);
         memset(pair->privateKey, 0, sizeof(pair->privateKey));
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
@@ -555,13 +597,16 @@ esp_err_t ecdsaGeneratePair(P256KeyPair_t *pair)
     mbedtls_ecp_point_init(&q);
 
     err = mbedtls_ecp_gen_keypair(&ecpGroup, &d, &q, randomGen, nullptr);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_write_binary(&d, pair->privateKey, P256_PRIVATE_KEY_SIZE);
-        if (err == ESP_OK) {
-            err = mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey,
-                                                 P256_PUBLIC_KEY_SIZE);
+        if (err == ESP_OK)
+        {
+            err =
+                mbedtls_ecp_point_write_binary(&ecpGroup, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &outLen, pair->publicKey, P256_PUBLIC_KEY_SIZE);
         }
-        if ((err == ESP_OK) && (outLen != P256_PUBLIC_KEY_SIZE)) {
+        if ((err == ESP_OK) && (outLen != P256_PUBLIC_KEY_SIZE))
+        {
             err = ESP_FAIL;
         }
     }
@@ -569,7 +614,8 @@ esp_err_t ecdsaGeneratePair(P256KeyPair_t *pair)
     mbedtls_mpi_free(&d);
     mbedtls_ecp_point_free(&q);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to generate a key pair. Error: %d.", err);
         memset(pair->privateKey, 0, sizeof(pair->privateKey));
         memset(pair->publicKey, 0, sizeof(pair->publicKey));
@@ -584,7 +630,7 @@ esp_err_t ecdsaGeneratePair(P256KeyPair_t *pair)
     return ESP_OK;
 }
 
-esp_err_t ecdsaSign(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], uint8_t signature[P256_SIGNATURE_SIZE])
+esp_err_t ecdsaSign(P256KeyPair_t* pair, const uint8_t hash[P256_HASH_SIZE], uint8_t signature[P256_SIGNATURE_SIZE])
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_id_t keyId = PSA_KEY_ID_NULL;
@@ -601,14 +647,16 @@ esp_err_t ecdsaSign(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], uin
 
     DELAYED_P256_INIT();
 
-    if (!pair->hasPrivateKey) {
+    if (!pair->hasPrivateKey)
+    {
         ESP_LOGE(TAG, "A private key is required for signing.");
         return ESP_ERR_INVALID_STATE;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = importPrivateKey(&keyId, PSA_ALG_ECDSA_ANY, PSA_KEY_USAGE_SIGN_HASH, pair);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to import the private key. Error: %d.", status);
         return status;
     }
@@ -616,11 +664,13 @@ esp_err_t ecdsaSign(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], uin
     status = psa_sign_hash(keyId, PSA_ALG_ECDSA_ANY, hash, P256_HASH_SIZE, signature, P256_SIGNATURE_SIZE, &signatureLen);
     psa_destroy_key(keyId);
 
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to sign the hash. Error: %d.", status);
         return status;
     }
-    if (signatureLen != P256_SIGNATURE_SIZE) {
+    if (signatureLen != P256_SIGNATURE_SIZE)
+    {
         ESP_LOGE(TAG, "Unexpected signature size: %d bytes.", signatureLen);
         return ESP_FAIL;
     }
@@ -630,13 +680,16 @@ esp_err_t ecdsaSign(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], uin
     mbedtls_mpi_init(&s);
 
     err = loadPrivateScalar(&d, pair->privateKey);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_ecdsa_sign(&ecpGroup, &r, &s, &d, hash, P256_HASH_SIZE, randomGen, nullptr);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_write_binary(&r, signature, P256_SIGNATURE_SIZE / 2);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_write_binary(&s, signature + P256_SIGNATURE_SIZE / 2, P256_SIGNATURE_SIZE / 2);
     }
 
@@ -644,7 +697,8 @@ esp_err_t ecdsaSign(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], uin
     mbedtls_mpi_free(&r);
     mbedtls_mpi_free(&s);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Failed to sign the hash. Error: %d.", err);
         return err;
     }
@@ -653,7 +707,7 @@ esp_err_t ecdsaSign(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], uin
     return ESP_OK;
 }
 
-esp_err_t ecdsaVerify(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], const uint8_t signature[P256_SIGNATURE_SIZE])
+esp_err_t ecdsaVerify(P256KeyPair_t* pair, const uint8_t hash[P256_HASH_SIZE], const uint8_t signature[P256_SIGNATURE_SIZE])
 {
 #if ESP_IDF_VERSION_MAJOR >= 6
     psa_key_id_t keyId = PSA_KEY_ID_NULL;
@@ -668,14 +722,16 @@ esp_err_t ecdsaVerify(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], c
 
     DELAYED_P256_INIT();
 
-    if (!pair->hasPublicKey) {
+    if (!pair->hasPublicKey)
+    {
         ESP_LOGE(TAG, "A public key is required for verification.");
         return ESP_ERR_INVALID_STATE;
     }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     status = importPublicKey(&keyId, PSA_ALG_ECDSA_ANY, PSA_KEY_USAGE_VERIFY_HASH, pair);
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Failed to import the public key. Error: %d.", status);
         return status;
     }
@@ -683,7 +739,8 @@ esp_err_t ecdsaVerify(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], c
     status = psa_verify_hash(keyId, PSA_ALG_ECDSA_ANY, hash, P256_HASH_SIZE, signature, P256_SIGNATURE_SIZE);
     psa_destroy_key(keyId);
 
-    if (status != PSA_SUCCESS) {
+    if (status != PSA_SUCCESS)
+    {
         ESP_LOGE(TAG, "Signature verification failed. Error: %d.", status);
         return status;
     }
@@ -693,13 +750,16 @@ esp_err_t ecdsaVerify(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], c
     mbedtls_mpi_init(&s);
 
     err = loadPublicPoint(&q, pair->publicKey);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_read_binary(&r, signature, P256_SIGNATURE_SIZE / 2);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_mpi_read_binary(&s, signature + P256_SIGNATURE_SIZE / 2, P256_SIGNATURE_SIZE / 2);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         err = mbedtls_ecdsa_verify(&ecpGroup, hash, P256_HASH_SIZE, &q, &r, &s);
     }
 
@@ -707,7 +767,8 @@ esp_err_t ecdsaVerify(P256KeyPair_t *pair, const uint8_t hash[P256_HASH_SIZE], c
     mbedtls_mpi_free(&r);
     mbedtls_mpi_free(&s);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Signature verification failed. Error: %d.", err);
         return err;
     }
@@ -722,7 +783,8 @@ static esp_err_t init()
 {
     AutoMutex lock(initMtx);
 
-    if (!initialized) {
+    if (!initialized)
+    {
 #if ESP_IDF_VERSION_MAJOR >= 6
         psa_status_t status;
 #else
@@ -731,14 +793,16 @@ static esp_err_t init()
 
 #if ESP_IDF_VERSION_MAJOR >= 6
         status = psa_crypto_init();
-        if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE) {
+        if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE)
+        {
             ESP_LOGE(TAG, "Failed to initialize PSA Crypto. Error: %d.", status);
             return status;
         }
 #else
         mbedtls_ecp_group_init(&ecpGroup);
         err = mbedtls_ecp_group_load(&ecpGroup, MBEDTLS_ECP_DP_SECP256R1);
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
+        {
             ESP_LOGE(TAG, "Failed to load the P-256 elliptic-curve group. Error: %d.", err);
             mbedtls_ecp_group_free(&ecpGroup);
             return err;
@@ -752,7 +816,7 @@ static esp_err_t init()
 }
 
 #if ESP_IDF_VERSION_MAJOR >= 6
-static psa_status_t importPrivateKey(psa_key_id_t *keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t *pair)
+static psa_status_t importPrivateKey(psa_key_id_t* keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t* pair)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_status_t status;
@@ -767,7 +831,7 @@ static psa_status_t importPrivateKey(psa_key_id_t *keyId, psa_algorithm_t alg, p
     return status;
 }
 
-static psa_status_t importPublicKey(psa_key_id_t *keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t *pair)
+static psa_status_t importPublicKey(psa_key_id_t* keyId, psa_algorithm_t alg, psa_key_usage_t usage, const P256KeyPair_t* pair)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_status_t status;
@@ -782,20 +846,20 @@ static psa_status_t importPublicKey(psa_key_id_t *keyId, psa_algorithm_t alg, ps
     return status;
 }
 #else
-static int randomGen(void *ctx, unsigned char *dest, size_t count)
+static int randomGen(void* ctx, unsigned char* dest, size_t count)
 {
     (void)ctx;
-    return (int)randomize((uint8_t *)dest, count);
+    return static_cast<int>(randomize(static_cast<uint8_t*>(dest), count));
 }
 
-static esp_err_t loadPublicPoint(mbedtls_ecp_point *point, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
+static esp_err_t loadPublicPoint(mbedtls_ecp_point* point, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
     mbedtls_ecp_point_free(point);
     mbedtls_ecp_point_init(point);
     return mbedtls_ecp_point_read_binary(&ecpGroup, point, publicKey, P256_PUBLIC_KEY_SIZE);
 }
 
-static esp_err_t loadPrivateScalar(mbedtls_mpi *d, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE])
+static esp_err_t loadPrivateScalar(mbedtls_mpi* d, const uint8_t privateKey[P256_PRIVATE_KEY_SIZE])
 {
     mbedtls_mpi_free(d);
     mbedtls_mpi_init(d);

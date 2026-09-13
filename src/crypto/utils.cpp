@@ -31,19 +31,20 @@ static mbedtls_ctr_drbg_context ctrDrbgCtx;
 
 static esp_err_t init();
 #if ESP_IDF_VERSION_MAJOR < 6
-static void initTask(Task_t *task, void *arg);
+static void initTask(Task_t task, void* arg);
 #endif
 
 // -----------------------------------------------------------------------------
 
-esp_err_t randomize(uint8_t *dest, size_t destLen)
+esp_err_t randomize(uint8_t* dest, size_t destLen)
 {
     esp_err_t err;
 
     assert(dest);
 
     err = init();
-    if (err == ESP_OK && destLen > 0) {
+    if (err == ESP_OK && destLen > 0)
+    {
 #if ESP_IDF_VERSION_MAJOR >= 6
         err = psa_generate_random(dest, destLen);
 #else
@@ -53,13 +54,14 @@ esp_err_t randomize(uint8_t *dest, size_t destLen)
     return err;
 }
 
-bool constantTimeCompare(const void *buf1, const void *buf2, size_t len)
+bool constantTimeCompare(const void* buf1, const void* buf2, size_t len)
 {
-    const uint8_t *b1 = (const uint8_t *)buf1;
-    const uint8_t *b2 = (const uint8_t *)buf2;
+    const uint8_t* b1 = static_cast<const uint8_t*>(buf1);
+    const uint8_t* b2 = static_cast<const uint8_t*>(buf2);
     uint8_t diff = 0;
 
-    while (len > 0) {
+    while (len > 0)
+    {
         diff |= (*b1) ^ (*b2);
         b1 += 1;
         b2 += 1;
@@ -74,7 +76,8 @@ static esp_err_t init()
 {
     AutoMutex lock(initMtx);
 
-    if (!initialized) {
+    if (!initialized)
+    {
 #if ESP_IDF_VERSION_MAJOR >= 6
         psa_status_t status;
 #else
@@ -84,19 +87,26 @@ static esp_err_t init()
 
 #if ESP_IDF_VERSION_MAJOR >= 6
         status = psa_crypto_init();
-        if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE) {
+        if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE)
+        {
             ESP_LOGE(TAG, "Failed to initialize PSA Crypto. Error: %d.", status);
             return status;
         }
 #else
-        taskInit(&task);
         taskErr = ESP_FAIL;
-        err = taskCreate(&task, initTask, "rand-init", 3072, &taskErr, uxTaskPriorityGet(nullptr) + 1, tskNO_AFFINITY);
-        if (err == ESP_OK) {
-            taskJoin(&task);
+        task = taskCreate(initTask, "rand-init", 3072, &taskErr, uxTaskPriorityGet(nullptr) + 1, tskNO_AFFINITY);
+        if (task)
+        {
+            taskJoin(task);
+            task = nullptr;
             err = taskErr;
         }
-        if (err != ESP_OK) {
+        else
+        {
+            err = ESP_ERR_NO_MEM;
+        }
+        if (err != ESP_OK)
+        {
             ESP_LOGE(TAG, "Failed to seed the random number generator. Error: %d.", err);
             return err;
         }
@@ -110,9 +120,9 @@ static esp_err_t init()
 }
 
 #if ESP_IDF_VERSION_MAJOR < 6
-static void initTask(Task_t *task, void *arg)
+static void initTask(Task_t task, void* arg)
 {
-    esp_err_t *err = (esp_err_t *)arg;
+    esp_err_t* err = static_cast<esp_err_t*>(arg);
     char pers[10 + 20 + 1];
 
     taskSignalContinue(task);
@@ -121,8 +131,9 @@ static void initTask(Task_t *task, void *arg)
     mbedtls_ctr_drbg_init(&ctrDrbgCtx);
 
     snprintf(pers, sizeof(pers), "iotcomm%llu", esp_timer_get_time());
-    *err = mbedtls_ctr_drbg_seed(&ctrDrbgCtx, mbedtls_entropy_func, &entropyCtx, (const unsigned char*)pers, strlen(pers));
-    if (*err != ESP_OK) {
+    *err = mbedtls_ctr_drbg_seed(&ctrDrbgCtx, mbedtls_entropy_func, &entropyCtx, reinterpret_cast<const unsigned char*>(pers), strlen(pers));
+    if (*err != ESP_OK)
+    {
         mbedtls_ctr_drbg_free(&ctrDrbgCtx);
         mbedtls_entropy_free(&entropyCtx);
     }

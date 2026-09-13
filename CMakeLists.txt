@@ -25,8 +25,8 @@ set(srcs "src/challenge.cpp"
 idf_component_register(SRCS "${srcs}"
                        INCLUDE_DIRS "include"
                        PRIV_INCLUDE_DIRS "private_include"
-                       REQUIRES mbedtls esp_http_server
+                       REQUIRES mbedtls esp_http_server espressif__mdns
                        PRIV_REQUIRES esp_netif esp_event esp_wifi esp_timer nvs_flash app_update
-                       EMBED_FILES "src/captive_portal/web-dist/index.html"
-                                   "src/captive_portal/web-dist/assets/app.js"
-                                   "src/captive_portal/web-dist/assets/app.css")
+                       EMBED_FILES "src/captive_portal/web-dist/index.html.gz"
+                                   "src/captive_portal/web-dist/assets/app.js.gz"
+                                   "src/captive_portal/web-dist/assets/app.css.gz")

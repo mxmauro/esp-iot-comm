@@ -11,20 +11,21 @@ device connected, but it does not own the application protocol itself.
 * Starts a provisioning SoftAP when no STA credentials are stored.
 * Switches the device into STA mode once credentials are available.
 * Notifies the application about connection, disconnection, and auth-failure events.
-* Stores an optional device hostname and applies it to both Wi-Fi netifs.
+* Optionally returns to the captive portal when a STA attempt does not acquire IPv4 or IPv6 connectivity in time.
+* Owns mDNS lifecycle and stores an optional device hostname applied to mDNS and both Wi-Fi netifs.
 
 ## Typical Flow
 
 The normal boot sequence looks like this:
 
-1. Fill `WifiMgrConfig_t` with your event handler and provisioning SoftAP settings.
+1. Fill `WifiMgrConfig_t` with network settings and an event handler.
 2. Optionally call `wifiMgrSetHostname()` before initialization.
 3. Call `wifiMgrInit()`.
+4. On `WifiMgrEventProvisioningRequired`, choose the portal policy and call `wifiMgrStartProvisioning()`.
 
-From there, the manager follows one of two paths:
-
-* If stored STA credentials already exist, it goes straight into STA mode.
-* If not, it starts the provisioning SoftAP and waits for your onboarding flow to provide credentials.
+The Wi-Fi manager does not depend on IotComm or on a captive portal. It reports provisioning as required when no STA credentials are stored
+or when `staConnectTimeoutMs` expires. The application decides whether to start a library portal, a custom portal, or another recovery flow.
+If it uses IotComm, it can also query root-user readiness and request provisioning before starting the authenticated server.
 
 After the captive portal collects the credentials, the application usually calls `wifiMgrStoreSTA()` and then `wifiMgrStartSTA()`.
 
@@ -39,6 +40,18 @@ After the captive portal collects the credentials, the application usually calls
 | `wifiMgrStoreSTA()`      | Stores the SSID and password collected on setup. |
 | `wifiMgrStartSTA()`      | Leaves provisioning mode and starts STA mode.    |
 
+## mDNS APIs
+
+`wifiMgrInit()` initializes mDNS and `wifiMgrDeinit()` releases it, including all registered services. Do not initialize mDNS separately.
+If another part of the application has already initialized mDNS, `wifiMgrInit()` fails.
+
+| API                        | Purpose                                                        |
+|----------------------------|----------------------------------------------------------------|
+| `wifiMgrMdnsServiceAdd()`    | Adds an mDNS service using the ESP-IDF-compatible parameters. |
+| `wifiMgrMdnsServiceRemove()` | Removes an mDNS service by type and protocol.                 |
+
+Both mDNS service APIs return `ESP_ERR_INVALID_STATE` until `wifiMgrInit()` succeeds.
+
 ## Hostname APIs
 
 | API                    | Purpose                                                                                                     |
@@ -51,6 +64,9 @@ After the captive portal collects the credentials, the application usually calls
 * Passing `nullptr` or an empty string clears the stored hostname.
 * These two APIs can be used even before `wifiMgrInit()`.
 
+When the manager is initialized, `wifiMgrSetHostname()` also updates the mDNS hostname. A hostname stored before initialization is
+applied when `wifiMgrInit()` starts mDNS.
+
 If you never set a hostname, the manager falls back to `CONFIG_LWIP_LOCAL_HOSTNAME`.
 
 ## Events
@@ -58,9 +74,15 @@ If you never set a hostname, the manager falls back to `CONFIG_LWIP_LOCAL_HOSTNA
 * `WifiMgrEventConnected`: the station acquired IPv4 or IPv6 connectivity.
 * `WifiMgrEventDisconnected`: an established STA connection was lost.
 * `WifiMgrEventAuthenticationFailed`: a reconnect attempt failed with `WIFI_REASON_AUTH_FAIL`.
+* `WifiMgrEventProvisioningRequired`: no credentials are available or STA connection timed out.
+* `WifiMgrEventProvisioningStarted`: the application-selected AP provisioning host is ready.
+* `WifiMgrEventProvisioningStopped`: the AP provisioning host has stopped.
 
 The manager automatically retries after a disconnect. The auth-failure event is there to distinguish a normal link drop from a reconnect
 attempt where the stored credentials are no longer accepted.
+
+Provisioning lifecycle events are informational. `wifiMgrStartProvisioning()` and `wifiMgrStopProvisioning()` host whichever portal or
+application the caller selected; Wi-Fi itself does not choose bootstrap or recovery policy.
 
 ## What Gets Stored
 

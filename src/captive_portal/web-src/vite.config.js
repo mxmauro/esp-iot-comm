@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { compression, defineAlgorithm } from 'vite-plugin-compression2';
 import { DEV_SERVER_PUBLIC_KEY_B64 } from './vite.config.dev-keys.js';
 import { decryptEncryptedRequest, readJsonBody } from './vite.config.helpers.js';
 
@@ -11,6 +12,15 @@ export default defineConfig({
         outDir: '../web-dist',
         emptyOutDir: true,
         assetsDir: 'assets',
+        minify: 'terser',
+        terserOptions: {
+            compress: {
+                drop_console: true,
+                drop_debugger: true
+            }
+        },
+        cssCodeSplit: false,
+        assetsInlineLimit: 10000,
         rollupOptions: {
             output: {
                 entryFileNames: 'assets/app.js',
@@ -25,6 +35,16 @@ export default defineConfig({
     },
     plugins: [
         svelte(),
+        compression({
+            algorithms: [
+                defineAlgorithm('gzip', {
+                    level: 9
+                })
+            ],
+            exclude: [/\.(br)$/, /\.(gz)$/], // Don't compress already compressed files
+            deleteOriginalAssets: false, // Keep original files
+            skipIfLargerOrEqual: false
+        }),
         {
             name: 'mock-api',
             configureServer(server) {
@@ -52,8 +72,10 @@ export default defineConfig({
 
                     res.setHeader('Content-Type', 'application/json');
                     res.end(JSON.stringify({
+                        requestWifiCredentials: true,
                         setupRootUser: true,
-                        setupDeviceHostname: true
+                        setupDeviceHostname: true,
+                        requireRootAuthorization: false
                     }));
                 });
 

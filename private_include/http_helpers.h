@@ -12,19 +12,19 @@
 extern "C" {
 #endif // __cplusplus
 
-esp_err_t httpGetCORSOrigin(httpd_req_t *req, char **originOut);
-void httpFreeCORSOrigin(char *origin);
+esp_err_t httpGetCORSOrigin(httpd_req_t* req, char** originOut);
+void httpFreeCORSOrigin(char* origin);
 
-esp_err_t httpSendDefaultCORS(httpd_req_t *req, const char *origin);
-esp_err_t httpSendPreflightResponse(httpd_req_t *req, const char *origin);
+esp_err_t httpSendDefaultCORS(httpd_req_t* req, const char* origin);
+esp_err_t httpSendPreflightResponse(httpd_req_t* req, const char* origin);
 
-esp_err_t httpGetRequestBody(GrowableBuffer_t *rawBodyBuffer, httpd_req_t *req);
-esp_err_t httpGetRequestQueryParams(GrowableBuffer_t *rawQueryParams, httpd_req_t *req, size_t maxSize = 1024);
+esp_err_t httpGetRequestBody(GrowableBuffer_t* rawBodyBuffer, httpd_req_t* req);
+esp_err_t httpGetRequestQueryParams(GrowableBuffer_t* rawQueryParams, httpd_req_t* req, size_t maxSize = 1024);
 
-esp_err_t httpSendNotFound(httpd_req_t *req);
-esp_err_t httpSendInternalErrorResponse(httpd_req_t *req, esp_err_t err, const char *message);
+esp_err_t httpSendNotFound(httpd_req_t* req);
+esp_err_t httpSendInternalErrorResponse(httpd_req_t* req, esp_err_t err, const char* message);
 
-bool httpGetClientIpFromRequest(httpd_req_t *req, IPAddress_t *out);
+bool httpGetClientIpFromRequest(httpd_req_t* req, IPAddress_t* out);
 
 #ifdef __cplusplus
 }

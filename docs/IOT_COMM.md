@@ -24,7 +24,7 @@ The usual setup looks like this:
 3. Provide a root key source for the first-boot path.
 4. Register an `IotCommEventHandler_t`.
 5. Call `iotCommInit()`.
-6. Start the listener with `iotCommStartServer()`.
+6. After a network interface is connected and a root user is configured, start the listener with `iotCommStartServer()`.
 
 In practice, your event handler is where the application protocol lives. The library takes care of authentication and parsing; your code
 decides what a custom command means and how to answer it.
@@ -34,6 +34,7 @@ decides what a custom command means and how to answer it.
 | API                                   | Purpose                                                |
 |---------------------------------------|--------------------------------------------------------|
 | `iotCommInit()`                       | Initializes global communication state.                |
+| `iotCommGetReadiness()`               | Reports initialization and root-user readiness.        |
 | `iotCommStartServer()`                | Starts accepting HTTP/WebSocket connections.           |
 | `iotCommStopServer()`                 | Stops the listener and active server work.             |
 | `iotCommGetDeviceIdentityPublicKey()` | Returns the persisted device identity public key.      |
