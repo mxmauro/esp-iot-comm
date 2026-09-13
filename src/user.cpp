@@ -224,7 +224,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
 {
     User_t* user;
     User_t origUser;
-    bool forceAndReset;
+    bool force, isReset;
     esp_err_t err;
 
     user = findUserByID(userId);
@@ -238,18 +238,19 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     if (requestingUserId == users[0].id)
     {
         // Admin request
-        forceAndReset = true;
+        force = true;
+        isReset = (requestingUserId == userId) ? false : true;
     }
     else if (requestingUserId == userId)
     {
         // Normal user request (or admin changing own credentials)
-        forceAndReset = false;
+        force = isReset = false;
     }
     else
     {
-        ESP_LOGE(TAG, "Only the root administrator can change another user's credentials.");
+        ESP_LOGE(TAG, "Only an administrator can change another user's credentials.");
         memset(&origUser, 0, sizeof(User_t));
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_NOT_ALLOWED;
     }
 
     // Try to load the public key to check if valid
@@ -263,7 +264,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
     memcpy(&origUser, user, sizeof(User_t));
 
     // Update credentials
-    err = internalChangeUserCredentials(user, publicKey, forceAndReset, forceAndReset);
+    err = internalChangeUserCredentials(user, publicKey, force, isReset);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to update the user's credentials. Error: %d.", err);
