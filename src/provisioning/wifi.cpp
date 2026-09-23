@@ -50,7 +50,7 @@ static esp_netif_t* defNetIfWifiAp = nullptr;
 
 static bool provisioned = false;
 static bool mdnsInitialized = false;
-static bool staConnectAttemptActive = false;
+static bool staAutoConnectEnabled = false;
 static uint32_t staConnectTimeoutMs = 0;
 
 typedef struct captive_portal_config_s {
@@ -176,7 +176,7 @@ esp_err_t wifiMgrStartProvisioning(const WifiMgrSoftApConfig_t* softAP, const Wi
 
     ESP_LOGD(TAG, "Starting provisioning Wi-Fi lifecycle.");
     stopStaConnectTimeout();
-    staConnectAttemptActive = false;
+    staAutoConnectEnabled = false;
     connected = false;
     esp_wifi_disconnect();
     err = esp_wifi_stop();
@@ -260,7 +260,7 @@ bool wifiMgrDeleteConfig()
         staTransitionPending = false;
     }
     stopStaConnectTimeout();
-    staConnectAttemptActive = false;
+    staAutoConnectEnabled = false;
 
     err = esp_wifi_restore();
     if (err != ESP_OK)
@@ -473,7 +473,7 @@ static void wifiMgrDeinitNoLock()
         staConnectTimeoutTimer = nullptr;
     }
     staTransitionPending = false;
-    staConnectAttemptActive = false;
+    staAutoConnectEnabled = false;
 
     if (mdnsInitialized)
     {
@@ -585,7 +585,7 @@ static esp_err_t initNetworkAndProvisioning(WifiMgrConfig_t* config)
     {
         ESP_LOGI(TAG, "Stored credentials were found; starting STA mode.");
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Failed to set STA mode");
-        staConnectAttemptActive = true;
+        staAutoConnectEnabled = true;
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start the interface");
         if (!connected)
         {
@@ -791,24 +791,22 @@ static void onManagerEvent(void* arg, esp_event_base_t eventBase, int32_t eventI
             performStaModeTransition();
             break;
 
-        case WifiMgrInternalEventProvisioningRequired: {
-            AutoMutex lock(mtx);
-
-            if (staConnectAttemptActive && !connected)
-            {
-                staConnectAttemptActive = false;
-                stopStaConnectTimeout();
-                esp_wifi_disconnect();
-                err = esp_wifi_stop();
-                if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED)
-                {
-                    ESP_LOGE(TAG, "Failed to stop STA mode for provisioning. Error: %d.", err);
-                    return;
-                }
-            }
-        }
+        case WifiMgrInternalEventProvisioningRequired:
             {
                 AutoMutex lock(mtx);
+
+                if (staAutoConnectEnabled && (!connected))
+                {
+                    staAutoConnectEnabled = false;
+                    stopStaConnectTimeout();
+                    esp_wifi_disconnect();
+                    err = esp_wifi_stop();
+                    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED)
+                    {
+                        ESP_LOGE(TAG, "Failed to stop STA mode for provisioning. Error: %d.", err);
+                        return;
+                    }
+                }
 
                 eventHandler = handler;
                 eventHandlerCtx = handlerCtx;
@@ -843,79 +841,81 @@ static void onEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void
     {
         switch (eventId)
         {
-            case WIFI_EVENT_STA_START: {
-                bool shouldConnect;
-                AutoRundownProtection rpLock(rp);
-
-                shouldConnect = false;
-                if (rpLock.acquired())
+            case WIFI_EVENT_STA_START:
                 {
-                    AutoMutex lock(mtx);
+                    bool shouldConnect;
+                    AutoRundownProtection rpLock(rp);
 
-                    shouldConnect = provisioned && staConnectAttemptActive;
-                }
-                if (shouldConnect)
-                {
-                    esp_wifi_connect();
-                }
-            }
-            break;
-
-            case WIFI_EVENT_STA_DISCONNECTED: {
-                wifi_event_sta_disconnected_t* event;
-                WifiMgrEventHandler_t eventHandler;
-                void* eventHandlerCtx;
-                WifiMgrEvent_t notifyEvent;
-                bool shouldNotify;
-                bool shouldReconnect;
-                AutoRundownProtection rpLock(rp);
-
-                event = static_cast<wifi_event_sta_disconnected_t*>(eventData);
-                eventHandler = nullptr;
-                eventHandlerCtx = nullptr;
-                notifyEvent = WifiMgrEventDisconnected;
-                shouldNotify = false;
-                shouldReconnect = false;
-                if (!event)
-                {
-                    return;
-                }
-
-                ESP_LOGI(TAG, "Disconnected (reason=%u, rssi=%d); reconnecting to the configured access point.", event->reason,
-                         event->rssi);
-
-                if (rpLock.acquired())
-                {
-                    AutoMutex lock(mtx);
-
-                    if (provisioned && staConnectAttemptActive)
+                    shouldConnect = false;
+                    if (rpLock.acquired())
                     {
-                        if (connected)
-                        {
-                            connected = false;
-                            notifyEvent = WifiMgrEventDisconnected;
-                            shouldNotify = true;
-                        }
-                        else if (event->reason == WIFI_REASON_AUTH_FAIL)
-                        {
-                            notifyEvent = WifiMgrEventAuthenticationFailed;
-                            shouldNotify = true;
-                        }
-                        eventHandler = handler;
-                        eventHandlerCtx = handlerCtx;
-                        shouldReconnect = true;
+                        AutoMutex lock(mtx);
+
+                        shouldConnect = provisioned && staAutoConnectEnabled;
+                    }
+                    if (shouldConnect)
+                    {
+                        esp_wifi_connect();
                     }
                 }
-                if (shouldNotify && eventHandler)
+                break;
+
+            case WIFI_EVENT_STA_DISCONNECTED:
                 {
-                    eventHandler(notifyEvent, eventHandlerCtx);
+                    AutoRundownProtection rpLock(rp);
+                    wifi_event_sta_disconnected_t* event;
+                    WifiMgrEventHandler_t eventHandler;
+                    void* eventHandlerCtx;
+                    WifiMgrEvent_t notifyEvent;
+                    bool shouldNotify;
+                    bool shouldReconnect;
+
+                    event = static_cast<wifi_event_sta_disconnected_t*>(eventData);
+                    eventHandler = nullptr;
+                    eventHandlerCtx = nullptr;
+                    notifyEvent = WifiMgrEventDisconnected;
+                    shouldNotify = false;
+                    shouldReconnect = false;
+                    if (!event)
+                    {
+                        return;
+                    }
+
+                    ESP_LOGI(TAG, "Disconnected (reason=%u, rssi=%d); reconnecting to the configured access point.", event->reason,
+                             event->rssi);
+
+                    if (rpLock.acquired())
+                    {
+                        AutoMutex lock(mtx);
+
+                        if (provisioned && staAutoConnectEnabled)
+                        {
+                            if (connected)
+                            {
+                                connected = false;
+                                notifyEvent = WifiMgrEventDisconnected;
+                                shouldNotify = true;
+                            }
+                            else if (event->reason == WIFI_REASON_AUTH_FAIL)
+                            {
+                                notifyEvent = WifiMgrEventAuthenticationFailed;
+                                shouldNotify = true;
+                            }
+                            eventHandler = handler;
+                            eventHandlerCtx = handlerCtx;
+                            shouldReconnect = true;
+                        }
+                    }
+                    if (shouldNotify && eventHandler)
+                    {
+                        eventHandler(notifyEvent, eventHandlerCtx);
+                    }
+                    if (shouldReconnect)
+                    {
+                        esp_wifi_connect();
+                    }
                 }
-                if (shouldReconnect)
-                {
-                    esp_wifi_connect();
-                }
-            }
-            break;
+                break;
 
             case WIFI_EVENT_AP_START:
                 ESP_LOGI(TAG, "Access point started.");
@@ -930,81 +930,83 @@ static void onEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void
     {
         switch (eventId)
         {
-            case IP_EVENT_STA_GOT_IP: {
-                ip_event_got_ip_t* event;
-                WifiMgrEventHandler_t eventHandler;
-                void* eventHandlerCtx;
-                bool shouldNotify;
-                AutoRundownProtection rpLock(rp);
-
-                event = static_cast<ip_event_got_ip_t*>(eventData);
-                eventHandler = nullptr;
-                eventHandlerCtx = nullptr;
-                shouldNotify = false;
-                if (!event)
+            case IP_EVENT_STA_GOT_IP:
                 {
-                    return;
-                }
+                    ip_event_got_ip_t* event;
+                    WifiMgrEventHandler_t eventHandler;
+                    void* eventHandlerCtx;
+                    bool shouldNotify;
+                    AutoRundownProtection rpLock(rp);
 
-                ESP_LOGI(TAG, "Connected; acquired IPv4 address " IPSTR ".", IP2STR(&event->ip_info.ip));
-                if (rpLock.acquired())
-                {
-                    AutoMutex lock(mtx);
-
-                    staConnectAttemptActive = false;
-                    stopStaConnectTimeout();
-                    if (!connected)
+                    event = static_cast<ip_event_got_ip_t*>(eventData);
+                    eventHandler = nullptr;
+                    eventHandlerCtx = nullptr;
+                    shouldNotify = false;
+                    if (!event)
                     {
-                        connected = true;
-                        eventHandler = handler;
-                        eventHandlerCtx = handlerCtx;
-                        shouldNotify = true;
+                        return;
+                    }
+
+                    ESP_LOGI(TAG, "Connected; acquired IPv4 address " IPSTR ".", IP2STR(&event->ip_info.ip));
+                    if (rpLock.acquired())
+                    {
+                        AutoMutex lock(mtx);
+
+                        stopStaConnectTimeout();
+                        // Keep automatic reconnects active after the initial connection succeeds.
+                        if (!connected)
+                        {
+                            connected = true;
+                            eventHandler = handler;
+                            eventHandlerCtx = handlerCtx;
+                            shouldNotify = true;
+                        }
+                    }
+                    if (shouldNotify && eventHandler)
+                    {
+                        eventHandler(WifiMgrEventConnected, eventHandlerCtx);
                     }
                 }
-                if (shouldNotify && eventHandler)
+                break;
+
+            case IP_EVENT_GOT_IP6:
                 {
-                    eventHandler(WifiMgrEventConnected, eventHandlerCtx);
-                }
-            }
-            break;
+                    ip_event_got_ip6_t* event;
+                    WifiMgrEventHandler_t eventHandler;
+                    void* eventHandlerCtx;
+                    bool shouldNotify;
+                    AutoRundownProtection rpLock(rp);
 
-            case IP_EVENT_GOT_IP6: {
-                ip_event_got_ip6_t* event;
-                WifiMgrEventHandler_t eventHandler;
-                void* eventHandlerCtx;
-                bool shouldNotify;
-                AutoRundownProtection rpLock(rp);
-
-                event = static_cast<ip_event_got_ip6_t*>(eventData);
-                eventHandler = nullptr;
-                eventHandlerCtx = nullptr;
-                shouldNotify = false;
-                if (!event)
-                {
-                    return;
-                }
-
-                ESP_LOGI(TAG, "Connected; acquired IPv6 address " IPV6STR ".", IPV62STR(event->ip6_info.ip));
-                if (rpLock.acquired())
-                {
-                    AutoMutex lock(mtx);
-
-                    staConnectAttemptActive = false;
-                    stopStaConnectTimeout();
-                    if (!connected)
+                    event = static_cast<ip_event_got_ip6_t*>(eventData);
+                    eventHandler = nullptr;
+                    eventHandlerCtx = nullptr;
+                    shouldNotify = false;
+                    if (!event)
                     {
-                        connected = true;
-                        eventHandler = handler;
-                        eventHandlerCtx = handlerCtx;
-                        shouldNotify = true;
+                        return;
+                    }
+
+                    ESP_LOGI(TAG, "Connected; acquired IPv6 address " IPV6STR ".", IPV62STR(event->ip6_info.ip));
+                    if (rpLock.acquired())
+                    {
+                        AutoMutex lock(mtx);
+
+                        stopStaConnectTimeout();
+                        // Keep automatic reconnects active after the initial connection succeeds.
+                        if (!connected)
+                        {
+                            connected = true;
+                            eventHandler = handler;
+                            eventHandlerCtx = handlerCtx;
+                            shouldNotify = true;
+                        }
+                    }
+                    if (shouldNotify && eventHandler)
+                    {
+                        eventHandler(WifiMgrEventConnected, eventHandlerCtx);
                     }
                 }
-                if (shouldNotify && eventHandler)
-                {
-                    eventHandler(WifiMgrEventConnected, eventHandlerCtx);
-                }
-            }
-            break;
+                break;
         }
     }
 }
@@ -1026,7 +1028,7 @@ static void performStaModeTransition()
     esp_err_t err;
 
     staTransitionPending = false;
-    staConnectAttemptActive = false;
+    staAutoConnectEnabled = false;
 
     ESP_LOGI(TAG, "Switching from provisioning SoftAP mode to STA mode.");
 
@@ -1060,11 +1062,11 @@ static void performStaModeTransition()
         return;
     }
 
-    staConnectAttemptActive = true;
+    staAutoConnectEnabled = true;
     err = esp_wifi_start();
     if (err != ESP_OK)
     {
-        staConnectAttemptActive = false;
+        staAutoConnectEnabled = false;
         ESP_LOGE(TAG, "Failed to start STA mode. Error: %d.", err);
     }
     else if (!connected)
