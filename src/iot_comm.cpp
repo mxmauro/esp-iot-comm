@@ -912,12 +912,14 @@ static esp_err_t serveWsInit(httpd_req_t* req)
 
     if (!rpLock.acquired())
     {
+        ESP_LOGD(TAG, "Server shutting down.");
         return ESP_ERR_INVALID_STATE;
     }
 
     serverCtx = static_cast<ServerContext_t*>(httpd_get_global_user_ctx(req->handle));
     if (!serverCtx)
     {
+        ESP_LOGD(TAG, "WebSocket server context is unavailable.");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -929,6 +931,7 @@ static esp_err_t serveWsInit(httpd_req_t* req)
     ctx = static_cast<ServeWsInitContext_t*>(malloc(sizeof(ServeWsInitContext_t)));
     if (!ctx)
     {
+        ESP_LOGD(TAG, "Failed to allocate the WebSocket initialization context.");
         return ESP_ERR_NO_MEM;
     }
     memset(ctx, 0, sizeof(ServeWsInitContext_t));
@@ -1057,6 +1060,10 @@ static esp_err_t serveWsInit(httpd_req_t* req)
 
 done:
     err = httpSendInternalErrorResponse(req, err, nullptr);
+    if (err != ESP_OK)
+    {
+        ESP_LOGD(TAG, "WebSocket initialization request failed. Error: %d.", err);
+    }
 
     // Cleanup
     if (ctx->json)
@@ -1084,6 +1091,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
 
     if (!rpLock.acquired())
     {
+        ESP_LOGD(TAG, "Server shutting down.");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1095,6 +1103,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
     ctx = static_cast<ServeWsAuthContext_t*>(malloc(sizeof(ServeWsAuthContext_t)));
     if (!ctx)
     {
+        ESP_LOGD(TAG, "Failed to allocate the WebSocket authentication context.");
         return ESP_ERR_NO_MEM;
     }
     memset(ctx, 0, sizeof(ServeWsAuthContext_t));
@@ -1342,6 +1351,10 @@ done:
     }
 
     err = httpSendInternalErrorResponse(req, err, nullptr);
+    if (err != ESP_OK)
+    {
+        ESP_LOGD(TAG, "WebSocket authentication request failed. Error: %d.", err);
+    }
 
     // Cleanup
     if (ctx->json)
@@ -1382,12 +1395,14 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
 
     if (!rpLock.acquired())
     {
+        ESP_LOGD(TAG, "Server shutting down.");
         return ESP_ERR_INVALID_STATE;
     }
 
     ctx = static_cast<ServeWsPreHandshakeContext_t*>(malloc(sizeof(ServeWsPreHandshakeContext_t)));
     if (!ctx)
     {
+        ESP_LOGD(TAG, "Failed to allocate the WebSocket pre-handshake context.");
         return ESP_ERR_NO_MEM;
     }
     memset(ctx, 0, sizeof(ServeWsPreHandshakeContext_t));
@@ -1600,6 +1615,7 @@ done:
             // If we are stopping the handshake, we must return a failure.
             err = ESP_FAIL;
         }
+        ESP_LOGD(TAG, "WebSocket pre-handshake failed. Error: %d.", err);
     }
 
     // Cleanup
@@ -1620,32 +1636,50 @@ done:
 static esp_err_t serveWs(httpd_req_t* req)
 {
     AutoRundownProtection rpLock(rp);
+    esp_err_t err;
 
     if (!rpLock.acquired())
     {
+        ESP_LOGD(TAG, "Server shutting down.");
         return ESP_ERR_INVALID_STATE;
     }
 
     switch (req->method)
     {
         case HTTP_OPTIONS:
-            return sendCORSPreflightResponse(req);
+            err = sendCORSPreflightResponse(req);
+            if (err != ESP_OK)
+            {
+                ESP_LOGD(TAG, "Failed to send the WebSocket CORS preflight response. Error: %d.", err);
+            }
+            return err;
 
         case HTTP_GET:
             // Check if it is a real websocket request. ESP_HTTP_SERVER calls the handle even when not a websocket connection
             if (httpd_req_get_hdr_value_len(req, "Upgrade") == 0)
             {
-                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
+                err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a websocket request");
+                if (err != ESP_OK)
+                {
+                    ESP_LOGD(TAG, "Failed to send the non-WebSocket request error response. Error: %d.", err);
+                }
+                return err;
             }
 
             // Done
             return ESP_OK;
 
         case 0:
-            return serveWsPacket(req);
+            err = serveWsPacket(req);
+            if (err != ESP_OK)
+            {
+                ESP_LOGD(TAG, "WebSocket packet handling failed. Error: %d.", err);
+            }
+            return err;
     }
 
     // Drop connection (should not reach here)
+    ESP_LOGD(TAG, "Received an unexpected WebSocket request method.");
     return ESP_FAIL;
 }
 
@@ -1744,6 +1778,7 @@ static esp_err_t serveWsPacket(httpd_req_t* req)
     {
         if (!gbEnsureSize(&commandCtx.session->plaintextIn, dataAndTagLen - TAG_LEN))
         {
+            ESP_LOGD(TAG, "Failed to allocate memory for the decrypted WebSocket payload.");
             return closeWsWithCmdCtxAndError(&commandCtx, "read", ESP_ERR_NO_MEM);
         }
     }
@@ -1762,7 +1797,12 @@ static esp_err_t serveWsPacket(httpd_req_t* req)
     gbReset(&commandCtx.session->ciphertextIn, false);
 
     commandCtx.br = br_init(commandCtx.session->plaintextIn.buffer, dataAndTagLen - TAG_LEN);
-    return dispatchCommand(&commandCtx);
+    err = dispatchCommand(&commandCtx);
+    if (err != ESP_OK)
+    {
+        ESP_LOGD(TAG, "WebSocket command dispatch failed. Error: %d.", err);
+    }
+    return err;
 }
 
 static esp_err_t dispatchCommand(CommandContext_t* commandCtx)

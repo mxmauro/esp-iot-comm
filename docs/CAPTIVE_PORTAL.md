@@ -37,6 +37,10 @@ with a different authorization backend.
 Configure recovery with `setupRootUser` and `setupDeviceHostname` disabled. Its callback should only store the replacement STA credentials
 and start STA mode. A lost root key requires a physical reset.
 
+The SoftAP password is independent of recovery authorization. Applications may leave the SoftAP open for local-access compatibility, or
+set a unique WPA2 passphrase to prevent unauthenticated association. In either case, require root authorization before accepting
+replacement credentials.
+
 ## Typical Integration
 
 1. Initialize Wi-Fi and react to `WifiMgrEventProvisioningRequired`.

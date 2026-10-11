@@ -50,6 +50,7 @@ typedef struct WifiMgrConfig_s {
     void*                 handlerCtx;
     float                 maxWifiPower; // In dBm, between 8 and 20. 0 To use default setting.
     uint32_t              staConnectTimeoutMs; // 0 disables connection-timeout provisioning notifications.
+    uint32_t              recoveryPortalTimeoutMs; // 0 disables automatic STA recovery after timed provisioning.
 } WifiMgrConfig_t;
 
 // -----------------------------------------------------------------------------
@@ -84,6 +85,9 @@ esp_err_t wifiMgrMdnsServiceRemove(const char* serviceType, const char* proto);
 
 // Starts a SoftAP, DNS catch-all, and HTTP dispatcher for an application-selected provisioning flow.
 esp_err_t wifiMgrStartProvisioning(const WifiMgrSoftApConfig_t* softAP, const WifiMgrProvisioningHandlerConfig_t* handler);
+// Starts a timed provisioning flow for replacing stored STA credentials after a failed connection attempt.
+// Requires nonzero STA and recovery-portal timeouts configured through WifiMgrConfig_t.
+esp_err_t wifiMgrStartRecoveryProvisioning(const WifiMgrSoftApConfig_t* softAP, const WifiMgrProvisioningHandlerConfig_t* handler);
 // Reports whether the provisioning SoftAP, DNS, and HTTP dispatcher are active.
 bool wifiMgrIsProvisioningActive();
 // Stops the active SoftAP provisioning flow without changing stored STA credentials.

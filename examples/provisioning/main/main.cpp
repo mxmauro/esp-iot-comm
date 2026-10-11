@@ -58,6 +58,7 @@ static void setupTask(Task_t task, void*)
     wifiConfig.handler = wifiMgrEventHandler;
     wifiConfig.maxWifiPower = 8.5f; // To get rid of the ESP32-C3 bad "antenna" design.
     wifiConfig.staConnectTimeoutMs = 30000;
+    wifiConfig.recoveryPortalTimeoutMs = 300000;
 
     ESP_ERROR_CHECK(wifiMgrInit(&wifiConfig));
     ESP_ERROR_CHECK(iotCommIsRootUserConfigured(&provisioningRootUserConfigured));
@@ -92,6 +93,9 @@ static void startProvisioning()
         return;
     }
     softApConfig.ssid = provisioningSSID;
+    // Set a per-device passphrase here to require WPA2 association before opening the portal.
+    // Leaving it null preserves the open-SoftAP provisioning behavior.
+    softApConfig.password = nullptr;
     provisioningConfig.start = [](void*) -> esp_err_t
     {
         CaptivePortalConfig_t capPortalConfig = {};
@@ -120,7 +124,8 @@ static void startProvisioning()
     {
         return capPortalHandleRequest(req);
     };
-    err = wifiMgrStartProvisioning(&softApConfig, &provisioningConfig);
+    err = provisioningRootUserConfigured ? wifiMgrStartRecoveryProvisioning(&softApConfig, &provisioningConfig)
+                                         : wifiMgrStartProvisioning(&softApConfig, &provisioningConfig);
     if (err == ESP_ERR_INVALID_STATE)
     {
         ESP_LOGW(TAG, "Provisioning request ignored; provisioning is already active or transitioning.");

@@ -12,6 +12,7 @@ device connected, but it does not own the application protocol itself.
 * Switches the device into STA mode once credentials are available.
 * Notifies the application about connection, disconnection, and auth-failure events.
 * Optionally returns to the captive portal when a STA attempt does not acquire IPv4 or IPv6 connectivity in time.
+* Can cycle a timed recovery portal back to STA mode after stored credentials fail to connect.
 * Owns mDNS lifecycle and stores an optional device hostname applied to mDNS and both Wi-Fi netifs.
 
 ## Typical Flow
@@ -21,11 +22,28 @@ The normal boot sequence looks like this:
 1. Fill `WifiMgrConfig_t` with network settings and an event handler.
 2. Optionally call `wifiMgrSetHostname()` before initialization.
 3. Call `wifiMgrInit()`.
-4. On `WifiMgrEventProvisioningRequired`, choose the portal policy and call `wifiMgrStartProvisioning()`.
+4. On `WifiMgrEventProvisioningRequired`, choose the portal policy and call `wifiMgrStartProvisioning()` for bootstrap or
+   `wifiMgrStartRecoveryProvisioning()` for credential recovery.
 
 The Wi-Fi manager does not depend on IotComm or on a captive portal. It reports provisioning as required when no STA credentials are stored
 or when `staConnectTimeoutMs` expires. The application decides whether to start a library portal, a custom portal, or another recovery flow.
 If it uses IotComm, it can also query root-user readiness and request provisioning before starting the authenticated server.
+
+## Timed Recovery
+
+Set both `staConnectTimeoutMs` and `recoveryPortalTimeoutMs` to enable timed recovery. When the station does not acquire an IPv4 or
+IPv6 address within `staConnectTimeoutMs`, including after an established connection is lost, the manager raises
+`WifiMgrEventProvisioningRequired` and stops STA mode. The application can then call `wifiMgrStartRecoveryProvisioning()`. That portal
+remains active for `recoveryPortalTimeoutMs`, then the manager returns to STA mode and starts the next connection timeout. This produces
+a fixed STA-attempt and recovery-portal cycle.
+
+`wifiMgrStartRecoveryProvisioning()` requires stored STA credentials and nonzero values for both timeouts. Calling
+`wifiMgrStartProvisioning()` remains the unbounded bootstrap/manual provisioning path. A zero `recoveryPortalTimeoutMs` disables timed
+recovery without changing existing provisioning behavior.
+
+`WifiMgrSoftApConfig_t::password` remains optional. An empty password allows nearby clients to associate with the SoftAP; a unique WPA2
+passphrase, such as one supplied on a device label or QR code, limits portal access. SoftAP association does not authorize credential
+replacement: recovery portals should still require application-level authorization.
 
 After the captive portal collects the credentials, the application usually calls `wifiMgrStoreSTA()` and then `wifiMgrStartSTA()`.
 
@@ -39,6 +57,7 @@ After the captive portal collects the credentials, the application usually calls
 | `wifiMgrDeleteConfig()`  | Deletes the stored STA credentials.              |
 | `wifiMgrStoreSTA()`      | Stores the SSID and password collected on setup. |
 | `wifiMgrStartSTA()`      | Leaves provisioning mode and starts STA mode.    |
+| `wifiMgrStartRecoveryProvisioning()` | Starts a bounded recovery portal and schedules the STA retry. |
 
 ## mDNS APIs
 

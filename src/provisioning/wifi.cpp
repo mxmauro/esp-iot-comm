@@ -28,7 +28,8 @@ typedef enum wifi_mgr_internal_event_e {
     WifiMgrInternalEventStartSta = 1,
     WifiMgrInternalEventProvisioningRequired = 2,
     WifiMgrInternalEventProvisioningStarted = 3,
-    WifiMgrInternalEventProvisioningStopped = 4
+    WifiMgrInternalEventProvisioningStopped = 4,
+    WifiMgrInternalEventRecoveryProvisioningTimeout = 5
 } wifi_mgr_internal_event_t;
 
 // -----------------------------------------------------------------------------
@@ -51,7 +52,9 @@ static esp_netif_t* defNetIfWifiAp = nullptr;
 static bool provisioned = false;
 static bool mdnsInitialized = false;
 static bool staAutoConnectEnabled = false;
+static bool recoveryProvisioningActive = false;
 static uint32_t staConnectTimeoutMs = 0;
+static uint32_t recoveryPortalTimeoutMs = 0;
 
 typedef struct captive_portal_config_s {
     char ssid[sizeof(static_cast<wifi_config_t*>(nullptr)->ap.ssid)];
@@ -83,6 +86,7 @@ static bool connected = false;
 static bool staTransitionPending = false;
 static esp_timer_handle_t staTransitionTimer = nullptr;
 static esp_timer_handle_t staConnectTimeoutTimer = nullptr;
+static esp_timer_handle_t recoveryPortalTimeoutTimer = nullptr;
 static float maxWifiPower = 0.0f;
 
 // -----------------------------------------------------------------------------
@@ -93,11 +97,16 @@ static void onEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void
 static void onManagerEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void* eventData);
 static void staTransitionTimerCallback(void* arg);
 static void staConnectTimeoutTimerCallback(void* arg);
+static void recoveryPortalTimeoutTimerCallback(void* arg);
 static void postManagerEvent(wifi_mgr_internal_event_t event);
 static void performStaModeTransition();
+static esp_err_t startProvisioning(const WifiMgrSoftApConfig_t* softAP, const WifiMgrProvisioningHandlerConfig_t* provisioning,
+                                   bool recovery);
 static esp_err_t startCaptivePortal();
 static esp_err_t startStaConnectTimeout();
 static void stopStaConnectTimeout();
+static esp_err_t startRecoveryPortalTimeout();
+static void stopRecoveryPortalTimeout();
 static esp_err_t setWifiTxPower(float power);
 static esp_err_t loadStoredHostnameOrDefault(char hostname[MAX_HOSTNAME_LEN + 1]);
 static esp_err_t saveStoredHostname(const char* hostname);
@@ -127,6 +136,7 @@ esp_err_t wifiMgrInit(WifiMgrConfig_t* config)
     handler = config->handler;
     handlerCtx = config->handlerCtx;
     staConnectTimeoutMs = config->staConnectTimeoutMs;
+    recoveryPortalTimeoutMs = config->recoveryPortalTimeoutMs;
 
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -158,6 +168,28 @@ esp_err_t wifiMgrInit(WifiMgrConfig_t* config)
 esp_err_t wifiMgrStartProvisioning(const WifiMgrSoftApConfig_t* softAP, const WifiMgrProvisioningHandlerConfig_t* provisioning)
 {
     AutoMutex lock(mtx);
+
+    return startProvisioning(softAP, provisioning, false);
+}
+
+esp_err_t wifiMgrStartRecoveryProvisioning(const WifiMgrSoftApConfig_t* softAP, const WifiMgrProvisioningHandlerConfig_t* provisioning)
+{
+    AutoMutex lock(mtx);
+
+    if (!handler || !provisioned)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (staConnectTimeoutMs == 0 || recoveryPortalTimeoutMs == 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return startProvisioning(softAP, provisioning, true);
+}
+
+static esp_err_t startProvisioning(const WifiMgrSoftApConfig_t* softAP, const WifiMgrProvisioningHandlerConfig_t* provisioning,
+                                   bool recovery)
+{
     esp_err_t err;
 
     if (!(handler && softAP && softAP->ssid && softAP->ssid[0] != 0 && provisioning && provisioning->httpReq))
@@ -174,7 +206,7 @@ esp_err_t wifiMgrStartProvisioning(const WifiMgrSoftApConfig_t* softAP, const Wi
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGD(TAG, "Starting provisioning Wi-Fi lifecycle.");
+    ESP_LOGI(TAG, "Switching to provisioning SoftAP mode.");
     stopStaConnectTimeout();
     staAutoConnectEnabled = false;
     connected = false;
@@ -201,8 +233,22 @@ esp_err_t wifiMgrStartProvisioning(const WifiMgrSoftApConfig_t* softAP, const Wi
     {
         ESP_LOGE(TAG, "Provisioning Wi-Fi lifecycle failed. Error: %s (0x%x).",
                  esp_err_to_name(err), err);
+        return err;
     }
-    return err;
+    if (recovery)
+    {
+        recoveryProvisioningActive = true;
+        err = startRecoveryPortalTimeout();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to start the recovery provisioning timer. Error: %d.", err);
+            stopCaptivePortal();
+            esp_wifi_stop();
+            return err;
+        }
+    }
+
+    return ESP_OK;
 }
 
 bool wifiMgrIsProvisioningActive()
@@ -472,8 +518,15 @@ static void wifiMgrDeinitNoLock()
         esp_timer_delete(staConnectTimeoutTimer);
         staConnectTimeoutTimer = nullptr;
     }
+    if (recoveryPortalTimeoutTimer)
+    {
+        esp_timer_stop(recoveryPortalTimeoutTimer);
+        esp_timer_delete(recoveryPortalTimeoutTimer);
+        recoveryPortalTimeoutTimer = nullptr;
+    }
     staTransitionPending = false;
     staAutoConnectEnabled = false;
+    recoveryProvisioningActive = false;
 
     if (mdnsInitialized)
     {
@@ -512,6 +565,7 @@ static void wifiMgrDeinitNoLock()
 
     maxWifiPower = 0.0f;
     staConnectTimeoutMs = 0;
+    recoveryPortalTimeoutMs = 0;
     memset(&cpConfig, 0, sizeof(cpConfig));
     connected = false;
     provisioned = false;
@@ -741,6 +795,36 @@ static void stopStaConnectTimeout()
     }
 }
 
+static esp_err_t startRecoveryPortalTimeout()
+{
+    esp_err_t err;
+    esp_timer_create_args_t timerArgs;
+
+    if (!recoveryPortalTimeoutTimer)
+    {
+        memset(&timerArgs, 0, sizeof(timerArgs));
+        timerArgs.callback = &recoveryPortalTimeoutTimerCallback;
+        timerArgs.dispatch_method = ESP_TIMER_TASK;
+        timerArgs.name = "iotcomm-wifi_recovery";
+        err = esp_timer_create(&timerArgs, &recoveryPortalTimeoutTimer);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+    esp_timer_stop(recoveryPortalTimeoutTimer);
+    return esp_timer_start_once(recoveryPortalTimeoutTimer, static_cast<uint64_t>(recoveryPortalTimeoutMs) * 1000);
+}
+
+static void stopRecoveryPortalTimeout()
+{
+    if (recoveryPortalTimeoutTimer)
+    {
+        esp_timer_stop(recoveryPortalTimeoutTimer);
+    }
+    recoveryProvisioningActive = false;
+}
+
 static void staConnectTimeoutTimerCallback(void* arg)
 {
     AutoRundownProtection rpLock(rp);
@@ -748,6 +832,16 @@ static void staConnectTimeoutTimerCallback(void* arg)
     if (rpLock.acquired())
     {
         postManagerEvent(WifiMgrInternalEventProvisioningRequired);
+    }
+}
+
+static void recoveryPortalTimeoutTimerCallback(void* arg)
+{
+    AutoRundownProtection rpLock(rp);
+
+    if (rpLock.acquired())
+    {
+        postManagerEvent(WifiMgrInternalEventRecoveryProvisioningTimeout);
     }
 }
 
@@ -832,6 +926,31 @@ static void onManagerEvent(void* arg, esp_event_base_t eventBase, int32_t eventI
                              eventHandlerCtx);
             }
             break;
+
+        case WifiMgrInternalEventRecoveryProvisioningTimeout:
+            {
+                bool startSta = false;
+
+                {
+                    AutoMutex lock(mtx);
+
+                    if (recoveryProvisioningActive && cpActive && provisioned && !staTransitionPending)
+                    {
+                        stopRecoveryPortalTimeout();
+                        startSta = true;
+                    }
+                }
+                if (startSta)
+                {
+                    ESP_LOGI(TAG, "Recovery provisioning window expired; returning to STA mode.");
+                    err = wifiMgrStartSTA();
+                    if (err != ESP_OK)
+                    {
+                        ESP_LOGE(TAG, "Failed to return to STA mode after recovery provisioning. Error: %d.", err);
+                    }
+                }
+            }
+            break;
     }
 }
 
@@ -869,6 +988,7 @@ static void onEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void
                     WifiMgrEvent_t notifyEvent;
                     bool shouldNotify;
                     bool shouldReconnect;
+                    esp_err_t err;
 
                     event = static_cast<wifi_event_sta_disconnected_t*>(eventData);
                     eventHandler = nullptr;
@@ -895,6 +1015,11 @@ static void onEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void
                                 connected = false;
                                 notifyEvent = WifiMgrEventDisconnected;
                                 shouldNotify = true;
+                                err = startStaConnectTimeout();
+                                if (err != ESP_OK)
+                                {
+                                    ESP_LOGE(TAG, "Failed to start the STA connection timeout after disconnect. Error: %d.", err);
+                                }
                             }
                             else if (event->reason == WIFI_REASON_AUTH_FAIL)
                             {
@@ -1420,6 +1545,8 @@ static void stopCaptivePortal()
 {
     int dnsSocketToClose = -1;
     bool wasActive = cpActive;
+
+    stopRecoveryPortalTimeout();
 
     if (cpHttpServer)
     {
