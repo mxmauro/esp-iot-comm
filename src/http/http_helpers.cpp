@@ -197,72 +197,142 @@ esp_err_t httpSendInternalErrorResponse(httpd_req_t* req, esp_err_t err, const c
     return err;
 }
 
-bool httpGetClientIpFromRequest(httpd_req_t* req, IPAddress_t* out)
+bool httpValidateTrustedProxy(const IotCommTrustedProxy_t* proxy)
 {
+    size_t addressLen;
+    size_t firstHostByte;
+
+    if (!proxy)
+    {
+        return false;
+    }
+    addressLen = proxy->network.isIPv6 ? 16 : 4;
+    if (proxy->prefixLength > addressLen * 8)
+    {
+        return false;
+    }
+
+    firstHostByte = proxy->prefixLength / 8;
+    if (proxy->prefixLength % 8 != 0)
+    {
+        uint8_t hostMask = static_cast<uint8_t>((1U << (8 - (proxy->prefixLength % 8))) - 1U);
+
+        if ((proxy->network.ip[firstHostByte] & hostMask) != 0)
+        {
+            return false;
+        }
+        firstHostByte++;
+    }
+    for (size_t i = firstHostByte; i < addressLen; i++)
+    {
+        if (proxy->network.ip[i] != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool httpIsTrustedProxy(const IPAddress_t* addr, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount)
+{
+    if ((!addr) || (!trustedProxies))
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < trustedProxiesCount; i++)
+    {
+        const IotCommTrustedProxy_t* proxy = &trustedProxies[i];
+        size_t fullBytes;
+        uint8_t remainingBits;
+
+        if (!httpValidateTrustedProxy(proxy) || addr->isIPv6 != proxy->network.isIPv6)
+        {
+            continue;
+        }
+        fullBytes = proxy->prefixLength / 8;
+        remainingBits = proxy->prefixLength % 8;
+        if (fullBytes > 0 && memcmp(addr->ip, proxy->network.ip, fullBytes) != 0)
+        {
+            continue;
+        }
+        if (remainingBits > 0)
+        {
+            uint8_t mask = static_cast<uint8_t>(0xFFU << (8 - remainingBits));
+
+            if ((addr->ip[fullBytes] & mask) != (proxy->network.ip[fullBytes] & mask))
+            {
+                continue;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool httpSelectClientIpFromXForwardedFor(const char* header, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount,
+                                         IPAddress_t* out)
+{
+    const char* tokenEnd;
+
+    if ((!header) || (!out) || ((!trustedProxies) && trustedProxiesCount != 0))
+    {
+        return false;
+    }
+
+    tokenEnd = header + strlen(header);
+    while (tokenEnd > header)
+    {
+        const char* tokenStart = tokenEnd;
+        IPAddress_t candidate;
+
+        while (tokenStart > header && *(tokenStart - 1) != ',')
+        {
+            tokenStart--;
+        }
+        if (!parseIP(&candidate, tokenStart, static_cast<size_t>(tokenEnd - tokenStart)))
+        {
+            return false;
+        }
+        if (!httpIsTrustedProxy(&candidate, trustedProxies, trustedProxiesCount))
+        {
+            memcpy(out, &candidate, sizeof(candidate));
+            return true;
+        }
+        if (tokenStart == header)
+        {
+            break;
+        }
+        tokenEnd = tokenStart - 1;
+    }
+    return false;
+}
+
+bool httpGetClientIpFromRequest(httpd_req_t* req, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount,
+                                IPAddress_t* out)
+{
+    IPAddress_t peerAddr;
     char hdr[256];
-    size_t len;
     esp_err_t err;
 
     assert(req);
     assert(out);
 
-    err = httpd_req_get_hdr_value_str(req, "Forwarded", hdr, sizeof(hdr));
-    if (err == ESP_OK && hdr[0] != 0)
+    if (!getIpFromPeer(httpd_req_to_sockfd(req), &peerAddr))
     {
-        hdr[sizeof(hdr) - 1] = '\0';
-
-        const char* p    = hdr;
-        const char* pEnd = hdr + sizeof(hdr);
-        while (p < pEnd && (p = strcasestr(p, "for=")) != nullptr)
-        {
-            p += 4; // skip "for="
-
-            len = 0;
-            while (p[len] != 0 && p[len] != ',' && p + len < pEnd - 1)
-            {
-                len++;
-            }
-
-            if (parseIP(out, p, len))
-            {
-                return true;
-            }
-
-            p += len;
-        }
+        return false;
     }
-
-    err = httpd_req_get_hdr_value_str(req, "X-Forwarded-For", hdr, sizeof(hdr));
-    if (err == ESP_OK && hdr[0] != 0)
+    if (httpIsTrustedProxy(&peerAddr, trustedProxies, trustedProxiesCount))
     {
-        len = 0;
-        while (hdr[len] != 0 && hdr[len] != ',' && len < sizeof(hdr) - 1)
-        {
-            len++;
-        }
-        if (parseIP(out, hdr, len))
+        err = httpd_req_get_hdr_value_str(req, "X-Forwarded-For", hdr, sizeof(hdr));
+        if (err == ESP_OK && hdr[0] != 0 && httpSelectClientIpFromXForwardedFor(hdr, trustedProxies, trustedProxiesCount, out))
         {
             return true;
         }
     }
 
-    err = httpd_req_get_hdr_value_str(req, "X-Real-IP", hdr, sizeof(hdr));
-    if (err == ESP_OK && hdr[0] != 0)
-    {
-        hdr[sizeof(hdr) - 1] = '\0';
-        if (parseIP(out, hdr))
-        {
-            return true;
-        }
-    }
-
-    if (getIpFromPeer(httpd_req_to_sockfd(req), out))
-    {
-        return true;
-    }
-
-    // We were unable to determine the IP
-    return false;
+    memcpy(out, &peerAddr, sizeof(peerAddr));
+    return true;
 }
 
 // -----------------------------------------------------------------------------

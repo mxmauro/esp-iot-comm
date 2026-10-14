@@ -115,12 +115,15 @@ void rateLimitIncrementFailedAuth(const IPAddress_t* addr)
         // failures=8: 2^6 = 64 seconds
         // Cap at 5 minutes (300 seconds)
         exponent = limit->consecutiveFailures - maxConsecutiveFailures + 1;
-        backoffSeconds = 1UL << exponent; // 2^exponent
-
-        // Cap maximum backoff at 5 minutes
-        if (backoffSeconds > 300)
+        // Saturate before shifting so saturated failure counts cannot cause an
+        // undefined shift on 32-bit targets.
+        if (exponent >= 9)
         {
             backoffSeconds = 300;
+        }
+        else
+        {
+            backoffSeconds = 1ULL << exponent; // 2^exponent
         }
 
         limit->blockedUntil = now + (backoffSeconds * 1000);
@@ -180,7 +183,7 @@ static RateLimit_t* internalRateLimitCheck(const IPAddress_t* addr)
 {
     RateLimit_t* limit = nullptr;
     size_t emptySlot = static_cast<size_t>(-1);
-    uint32_t oldestSlot = 0;
+    size_t oldestSlot = static_cast<size_t>(-1);
     uint64_t oldestSlotTime = 0;
     uint64_t now = now_ms();
 
@@ -197,13 +200,13 @@ static RateLimit_t* internalRateLimitCheck(const IPAddress_t* addr)
             limit = &rateLimits[i];
             break;
         }
-        if (emptySlot == -1)
+        if (emptySlot == static_cast<size_t>(-1))
         {
             if (rateLimits[i].windowStart == 0 || now - rateLimits[i].windowStart > windowSizeInMs)
             {
                 emptySlot = i;
             }
-            else if (oldestSlot == -1 || rateLimits[i].windowStart < oldestSlotTime)
+            else if (oldestSlot == static_cast<size_t>(-1) || rateLimits[i].windowStart < oldestSlotTime)
             {
                 oldestSlot = i;
                 oldestSlotTime = rateLimits[i].windowStart;
@@ -217,6 +220,11 @@ static RateLimit_t* internalRateLimitCheck(const IPAddress_t* addr)
         if (emptySlot == static_cast<size_t>(-1))
         {
             emptySlot = oldestSlot;
+            if (emptySlot == static_cast<size_t>(-1))
+            {
+                ESP_LOGE(TAG, "Rate limit table is full and no expired slots are available.");
+                return nullptr;
+            }
         }
         limit = &rateLimits[emptySlot];
         memcpy(&limit->clientIP, addr, sizeof(IPAddress_t));

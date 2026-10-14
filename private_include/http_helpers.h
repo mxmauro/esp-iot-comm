@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sdkconfig.h"
+#include "iot_comm/iot_comm.h"
 #include "iot_comm/utils/network.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
@@ -24,7 +25,12 @@ esp_err_t httpGetRequestQueryParams(GrowableBuffer_t* rawQueryParams, httpd_req_
 esp_err_t httpSendNotFound(httpd_req_t* req);
 esp_err_t httpSendInternalErrorResponse(httpd_req_t* req, esp_err_t err, const char* message);
 
-bool httpGetClientIpFromRequest(httpd_req_t* req, IPAddress_t* out);
+bool httpValidateTrustedProxy(const IotCommTrustedProxy_t* proxy);
+bool httpIsTrustedProxy(const IPAddress_t* addr, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount);
+bool httpSelectClientIpFromXForwardedFor(const char* header, const IotCommTrustedProxy_t* trustedProxies,
+                                         size_t trustedProxiesCount, IPAddress_t* out);
+bool httpGetClientIpFromRequest(httpd_req_t* req, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount,
+                                IPAddress_t* out);
 
 #ifdef __cplusplus
 }

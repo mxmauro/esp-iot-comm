@@ -4,12 +4,14 @@
 #include <fnv.h>
 #include <freertos/FreeRTOS.h>
 #include <lightstd/vector.h>
+#include <mutex.h>
 #include <string.h>
 #include <time.h>
 
 static const char* TAG = "Users";
 
 #define ADMIN_USER_INDEX 0
+#define USER_ID_GENERATION_ATTEMPTS 8
 
 #define X_ESP_ERR_CANCELLED -1000
 
@@ -30,9 +32,11 @@ static User_t* users = nullptr; // User 0 is the administrator
 static size_t maxUsersCount = 0;
 static IotCommSaveToStorageCallback_t saveUsers = nullptr;
 static void* saveUsersCtx = nullptr;
+static Mutex usersMtx;
 
 // -----------------------------------------------------------------------------
 
+static void usersDeinitNoLock();
 static esp_err_t saveAllUsers();
 static User_t* findUserByName(const char* name, size_t nameLen);
 static User_t* findUserByID(uint32_t id);
@@ -49,6 +53,7 @@ static bool validateUserName(const char* name, size_t nameLen);
 
 esp_err_t usersInit(UsersConfig_t* config)
 {
+    AutoMutex lock(usersMtx);
     size_t usersDataLen;
     esp_err_t err;
 
@@ -77,7 +82,7 @@ esp_err_t usersInit(UsersConfig_t* config)
         if (err != ESP_ERR_NOT_FOUND)
         {
             ESP_LOGE(TAG, "Failed to load users from storage. Error: %d.", err);
-            usersDeinit();
+            usersDeinitNoLock();
             return err;
         }
 
@@ -95,7 +100,7 @@ esp_err_t usersInit(UsersConfig_t* config)
             if (err != ESP_OK)
             {
                 ESP_LOGE(TAG, "Failed to load the default root user key. Error: %d.", err);
-                usersDeinit();
+                usersDeinitNoLock();
                 return err;
             }
         }
@@ -109,7 +114,7 @@ esp_err_t usersInit(UsersConfig_t* config)
         err = saveAllUsers();
         if (err != ESP_OK)
         {
-            usersDeinit();
+            usersDeinitNoLock();
             return err;
         }
     }
@@ -120,20 +125,15 @@ esp_err_t usersInit(UsersConfig_t* config)
 
 void usersDeinit()
 {
-    if (users)
-    {
-        memset(users, 0, (1 + maxUsersCount) * sizeof(User_t));
-        free(users);
-        users = nullptr;
-    }
-    saveUsers = nullptr;
-    saveUsersCtx = nullptr;
-    maxUsersCount = 0;
+    AutoMutex lock(usersMtx);
+
+    usersDeinitNoLock();
 }
 
 uint32_t userCreate(uint8_t flags, const char* name, size_t nameLen, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
-    User_t* user;
+    AutoMutex lock(usersMtx);
+    User_t* user = nullptr;
     esp_err_t err;
 
     if (!validateUserName(name, nameLen))
@@ -163,8 +163,31 @@ uint32_t userCreate(uint8_t flags, const char* name, size_t nameLen, const uint8
         return 0;
     }
 
-    // Add new user
-    internalCreateUser(user, flags, name, nameLen, publicKey);
+    // Add a new user with an ID not used by any active user.
+    for (size_t attempt = 0; attempt < USER_ID_GENERATION_ATTEMPTS; attempt++)
+    {
+        bool idInUse = false;
+
+        internalCreateUser(user, flags, name, nameLen, publicKey);
+        for (size_t i = 0; i < 1 + maxUsersCount; i++)
+        {
+            if (&users[i] != user && users[i].inUse && users[i].id == user->id)
+            {
+                idInUse = true;
+                break;
+            }
+        }
+        if (!idInUse)
+        {
+            break;
+        }
+        if (attempt == USER_ID_GENERATION_ATTEMPTS - 1)
+        {
+            ESP_LOGE(TAG, "Cannot create user: unable to generate a unique user ID.");
+            memset(user, 0, sizeof(User_t));
+            return 0;
+        }
+    }
 
     // Save users
     err = saveAllUsers();
@@ -181,6 +204,7 @@ uint32_t userCreate(uint8_t flags, const char* name, size_t nameLen, const uint8
 
 esp_err_t userDestroy(uint32_t userId)
 {
+    AutoMutex lock(usersMtx);
     User_t oldUser;
     User_t* user;
     esp_err_t err;
@@ -214,6 +238,7 @@ esp_err_t userDestroy(uint32_t userId)
 
 uint32_t userGetID(const char* name, size_t nameLen)
 {
+    AutoMutex lock(usersMtx);
     User_t* user = findUserByName(name, nameLen);
 
     // Done
@@ -222,6 +247,7 @@ uint32_t userGetID(const char* name, size_t nameLen)
 
 esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, const uint8_t publicKey[P256_PUBLIC_KEY_SIZE])
 {
+    AutoMutex lock(usersMtx);
     User_t* user;
     User_t origUser;
     bool force, isReset;
@@ -290,6 +316,7 @@ esp_err_t userChangeCredentials(uint32_t userId, uint32_t requestingUserId, cons
 
 esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE], const uint8_t signature[P256_SIGNATURE_SIZE])
 {
+    AutoMutex lock(usersMtx);
     P256KeyPair_t keyPair;
     User_t* user;
     esp_err_t err;
@@ -329,6 +356,7 @@ esp_err_t userVerifySignature(uint32_t userId, const uint8_t hash[P256_HASH_SIZE
 
 esp_err_t userIsPublicKeySet(uint32_t userId, bool* isSet)
 {
+    AutoMutex lock(usersMtx);
     User_t* user;
 
     if (!isSet)
@@ -340,12 +368,14 @@ esp_err_t userIsPublicKeySet(uint32_t userId, bool* isSet)
     {
         return ESP_ERR_NOT_FOUND;
     }
+
     *isSet = isUserPublicKeySet(user);
     return ESP_OK;
 }
 
 esp_err_t userMustChangeCredentials(uint32_t userId, bool* mustChange)
 {
+    AutoMutex lock(usersMtx);
     User_t* user;
 
     assert(mustChange);
@@ -364,6 +394,7 @@ esp_err_t userMustChangeCredentials(uint32_t userId, bool* mustChange)
 
 esp_err_t userIsAdmin(uint32_t userId, bool* isAdmin)
 {
+    AutoMutex lock(usersMtx);
     User_t* user;
 
     assert(isAdmin);
@@ -381,6 +412,19 @@ esp_err_t userIsAdmin(uint32_t userId, bool* isAdmin)
 }
 
 // -----------------------------------------------------------------------------
+
+static void usersDeinitNoLock()
+{
+    if (users)
+    {
+        memset(users, 0, (1 + maxUsersCount) * sizeof(User_t));
+        free(users);
+        users = nullptr;
+    }
+    saveUsers = nullptr;
+    saveUsersCtx = nullptr;
+    maxUsersCount = 0;
+}
 
 static esp_err_t saveAllUsers()
 {
@@ -452,7 +496,7 @@ static void internalCreateUser(User_t* user, uint8_t flags, const char* name, si
     user->id = fnv1a32(user->publicKey, sizeof(user->publicKey), user->id);
     user->id = fnv1a32(&ui32, sizeof(ui32), user->id);
     user->id = fnv1a32(&ui64, sizeof(ui64), user->id);
-    user->id = fnv1a32(&name, sizeof(char*));
+    user->id = fnv1a32(&name, sizeof(name), user->id);
     if (user->id == 0)
     {
         user->id = 1;

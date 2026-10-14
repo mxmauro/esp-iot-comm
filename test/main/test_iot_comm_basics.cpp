@@ -1,5 +1,6 @@
 #include <unity.h>
 #include <iot_comm/iot_comm.h>
+#include "../../private_include/http_helpers.h"
 
 // -----------------------------------------------------------------------------
 
@@ -24,9 +25,35 @@ TEST_CASE("iotCommDefaultConfig returns expected defaults", "[iot_comm]")
     TEST_ASSERT_NULL(cfg.storage.ctx);
     TEST_ASSERT_NULL(cfg.handler);
     TEST_ASSERT_NULL(cfg.handlerCtx);
+    TEST_ASSERT_NULL(cfg.proxy.trustedProxies);
+    TEST_ASSERT_EQUAL_UINT32(0, cfg.proxy.trustedProxiesCount);
 
     TEST_ASSERT_EQUAL_INT(IotCommStorageItemTypeUsers, 1);
     TEST_ASSERT_EQUAL_INT(IotCommStorageItemTypeDeviceIdentityKeyPair, 2);
+}
+
+TEST_CASE("trusted proxy rules validate CIDRs and resolve X-Forwarded-For", "[iot_comm]")
+{
+    IotCommTrustedProxy_t trustedProxy = {};
+    IPAddress_t trustedAddress = {};
+    IPAddress_t untrustedAddress = {};
+    IPAddress_t clientAddress = {};
+
+    TEST_ASSERT_TRUE(parseIP(&trustedProxy.network, "10.0.0.0"));
+    trustedProxy.prefixLength = 8;
+    TEST_ASSERT_TRUE(httpValidateTrustedProxy(&trustedProxy));
+    TEST_ASSERT_TRUE(parseIP(&trustedAddress, "10.1.2.3"));
+    TEST_ASSERT_TRUE(httpIsTrustedProxy(&trustedAddress, &trustedProxy, 1));
+    TEST_ASSERT_TRUE(parseIP(&untrustedAddress, "192.0.2.1"));
+    TEST_ASSERT_FALSE(httpIsTrustedProxy(&untrustedAddress, &trustedProxy, 1));
+
+    TEST_ASSERT_TRUE(httpSelectClientIpFromXForwardedFor("198.51.100.4, 10.1.2.3", &trustedProxy, 1, &clientAddress));
+    TEST_ASSERT_TRUE(parseIP(&untrustedAddress, "198.51.100.4"));
+    TEST_ASSERT_TRUE(ipAddressEqual(&clientAddress, &untrustedAddress));
+    TEST_ASSERT_FALSE(httpSelectClientIpFromXForwardedFor("198.51.100.4, invalid", &trustedProxy, 1, &clientAddress));
+
+    TEST_ASSERT_TRUE(parseIP(&trustedProxy.network, "10.0.0.1"));
+    TEST_ASSERT_FALSE(httpValidateTrustedProxy(&trustedProxy));
 }
 
 TEST_CASE("iotCommDefaultServerConfig returns expected defaults", "[iot_comm]")

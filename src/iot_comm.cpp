@@ -55,7 +55,8 @@ static const char* TAG = "IotComm";
 #define CMD_OTA_CANCEL              0x7FF7
 #define CMD_UDP_OPEN                0x7FF8
 
-#define SESSION_FLAG_OTA_UPDATE 0x00000001UL
+#define SESSION_FLAG_OTA_UPDATE         0x00000001UL
+#define SESSION_FLAG_HTTPD_BOUND        0x00000002UL
 
 #define SESSION_IV_LEN      12
 #define SESSION_AES_KEY_LEN 32
@@ -78,19 +79,24 @@ typedef enum IncomingBufferType_e {
 } IncomingBufferType_t;
 
 typedef struct ServerContext_s {
+    uint32_t refCount;
     size_t   maxPacketSize;
     size_t   maxConnectionsCount;
     uint16_t udpListenPort;
-
-    struct
-    {
-        RwMutex_t             mtx;
+    struct {
+        Task_t   task;
+        int      socketFd;
+        uint8_t* rxBuffer;
+    } udp;
+    struct {
+        portMUX_TYPE          mux;
         struct SessionInfo_s* first;
         struct SessionInfo_s* last;
     } sessions;
 } ServerContext_t;
 
 typedef struct SessionInfo_s {
+    uint32_t                  refCount;
     struct SessionInfo_s*     next;
     struct SessionInfo_s*     prev;
     ServerContext_t*          serverCtx;
@@ -117,9 +123,7 @@ typedef struct SessionInfo_s {
     uint8_t                   isAdmin : 1;
     uint8_t                   mustChangeCredentials : 1;
     uint8_t                   credentialsChangeAttempts : 2;
-    uint8_t                   isClosed : 1;
-    uint32_t                  refCount;
-    uint32_t                  udpInFlight;
+    uint32_t                  isClosed;
     uint32_t                  flags;
     SemaphoreHandle_t         dispatchMtx;
     IncomingBufferType_t      incomingMessageType;
@@ -225,10 +229,10 @@ typedef struct ServeWsAuthContext_s {
 } ServeWsAuthContext_t;
 
 typedef struct ServeWsPreHandshakeContext_s {
-    ServerContext_t* serverCtx;
-    IPAddress_t      remoteAddr;
-    GrowableBuffer_t reqQueryParams;
-    char ticketB64[B64_ENCODE_SIZE(CHALLENGE_WS_TICKET_SIZE) + 1];
+    ServerContext_t*    serverCtx;
+    IPAddress_t         remoteAddr;
+    GrowableBuffer_t    reqQueryParams;
+    char                ticketB64[B64_ENCODE_SIZE(CHALLENGE_WS_TICKET_SIZE) + 1];
     ChallengeWsTicket_t wsTicket;
     bool                removeChallenge;
     bool                carrierSelected;
@@ -251,15 +255,16 @@ static RundownProtection_t rp = RUNDOWN_PROTECTION_INIT_STATIC;
 static IotCommEventHandler_t handler = nullptr;
 static void* handlerCtx = nullptr;
 static httpd_handle_t server = nullptr;
-static ServerContext_t* activeServerCtx = nullptr;
 static _Atomic(uint32_t) nextSessionId = {0};
-static Task_t udpServerTask = nullptr;
-static _Atomic(int) udpServerSocket = {-1};
+static IotCommTrustedProxy_t* trustedProxies = nullptr;
+static size_t trustedProxiesCount = 0;
 
 // -----------------------------------------------------------------------------
 
 static void iotCommDeinitNoLock();
 static void iotCommStopServerNoLock();
+static esp_err_t copyTrustedProxies(const IotCommProxyConfig_t* config);
+static void clearTrustedProxies();
 
 static esp_err_t serveWsInit(httpd_req_t* req);
 static esp_err_t serveWsAuth(httpd_req_t* req);
@@ -292,13 +297,20 @@ static esp_err_t closeWsWithSessionAndError(SessionInfo_t* session, httpd_handle
 static esp_err_t closeWsWithCmdCtx(CommandContext_t* commandCtx, uint16_t code, const char* reason);
 static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t* commandCtx, const char* zone, esp_err_t err);
 
+static ServerContext_t* createServerCtx(IotCommServerConfig_t* config);
 static void destroyServerCtx(void* ctx);
-static void destroySessionCtx(void* ctx);
+static void incrementServerCtxRefCount(ServerContext_t* serverCtx);
+static void decrementServerCtxRefCount(ServerContext_t* serverCtx);
 
-static SessionInfo_t* createSession();
-static void incrementSessionRefCount(SessionInfo_t* session);
-static void decrementSessionRefCount(SessionInfo_t* session);
-static void freeSession(SessionInfo_t* session);
+static SessionInfo_t* createSessionInfo(ServerContext_t* serverCtx);
+static void destroySessionInfo(void* ctx);
+static void incrementSessionInfoRefCount(SessionInfo_t* session);
+static void decrementSessionInfoRefCount(SessionInfo_t* session);
+static bool isSessionClosed(const SessionInfo_t* session);
+static bool closeSession(SessionInfo_t* session);
+static void clearUdpSessionState(SessionInfo_t* session);
+static void closeUserSessions(ServerContext_t* serverCtx, httpd_handle_t serverHandle, int exceptSockfd, uint32_t userId,
+                              const char* reason);
 
 static esp_err_t readWsPacket(ServerContext_t* serverCtx, SessionInfo_t* session, httpd_req_t* req, bool* messageComplete);
 
@@ -306,9 +318,10 @@ static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, cons
 static void otaRestartTaskMain(Task_t task, void* arg);
 
 static esp_err_t startUdpServer(ServerContext_t* serverCtx);
-static void stopUdpServer();
+static void stopUdpServer(ServerContext_t* serverCtx);
 static void udpServerTaskMain(Task_t task, void* arg);
-static void processUdpPacket(ServerContext_t* serverCtx, const uint8_t* packet, size_t packetLen, const IPAddress_t* remoteAddr);
+static void processUdpPacket(ServerContext_t* serverCtx, int socketFd, const uint8_t* packet, size_t packetLen,
+                             const IPAddress_t* remoteAddr);
 
 static bool extGbAddB64(GrowableBuffer_t* buf, const uint8_t* src, size_t srcLen, bool isUrl);
 static bool extGbAddBool(GrowableBuffer_t* buf, bool value);
@@ -342,6 +355,11 @@ esp_err_t iotCommInit(IotCommConfig_t* config)
     uint8_t maxRequestsPerWindow;
     esp_err_t ret;
 
+    if (handler)
+    {
+        return ESP_OK;
+    }
+
     if (!(config && config->handler))
     {
         return ESP_ERR_INVALID_ARG;
@@ -351,6 +369,8 @@ esp_err_t iotCommInit(IotCommConfig_t* config)
     rundownProtInit(&rp);
 
     atomic_store_explicit(&nextSessionId, 1, memory_order_relaxed);
+
+    ESP_GOTO_ON_ERROR(copyTrustedProxies(&config->proxy), on_error, TAG, "Failed to configure trusted proxies");
 
     // Initialize users manager
     memset(&usersConfig, 0, sizeof(usersConfig));
@@ -435,17 +455,12 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     iotCommStopServerNoLock();
 
     // Create http server context
-    serverCtx = static_cast<ServerContext_t*>(malloc(sizeof(ServerContext_t)));
+    serverCtx = createServerCtx(config);
     if (!serverCtx)
     {
         err = ESP_ERR_NO_MEM;
         goto on_error;
     }
-    memset(serverCtx, 0, sizeof(ServerContext_t));
-    serverCtx->maxConnectionsCount = static_cast<size_t>(config->maxConnections);
-    serverCtx->maxPacketSize = (config->maxPacketSize > MIN_WS_PACKET_SIZE) ? static_cast<size_t>(config->maxPacketSize) : MIN_WS_PACKET_SIZE;
-    serverCtx->udpListenPort = config->udpListenPort;
-    rwMutexInit(&serverCtx->sessions.mtx);
 
     // Setup http server configuration
     httpdConfig = HTTPD_DEFAULT_CONFIG();
@@ -464,7 +479,6 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
         destroyServerCtx(serverCtx);
         goto on_error;
     }
-    activeServerCtx = serverCtx;
 
     if (serverCtx->udpListenPort != 0)
     {
@@ -687,6 +701,10 @@ esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t* reply, size
         {
             return ESP_ERR_NOT_FOUND;
         }
+        if (otfe->event->command->transportType == IotCommTransportTypeUDP)
+        {
+            return ESP_ERR_NOT_ALLOWED;
+        }
 
         // If some error happened previously for this event, return it
         if (otfe->savedErr != ESP_OK)
@@ -694,7 +712,7 @@ esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t* reply, size
             return otfe->savedErr;
         }
         // If closed or a reply was already sent, block
-        if (otfe->session->isClosed || otfe->replySent || otfe->closeSent)
+        if (isSessionClosed(otfe->session) || otfe->replySent || otfe->closeSent)
         {
             return ESP_FAIL;
         }
@@ -729,6 +747,10 @@ esp_err_t iotCommEventReplyWithError(IotCommSessionHandle_t h, uint32_t code, co
         {
             return ESP_ERR_NOT_FOUND;
         }
+        if (otfe->event->command->transportType == IotCommTransportTypeUDP)
+        {
+            return ESP_ERR_NOT_ALLOWED;
+        }
 
         // If some error happened previously for this event, return it
         if (otfe->savedErr != ESP_OK)
@@ -736,7 +758,7 @@ esp_err_t iotCommEventReplyWithError(IotCommSessionHandle_t h, uint32_t code, co
             return otfe->savedErr;
         }
         // If closed or a reply was already sent, block
-        if (otfe->session->isClosed || otfe->replySent || otfe->closeSent)
+        if (isSessionClosed(otfe->session) || otfe->replySent || otfe->closeSent)
         {
             return ESP_FAIL;
         }
@@ -790,7 +812,7 @@ void iotCommSessionClose(IotCommSessionHandle_t h, uint16_t reason, const char* 
                 break;
 
             case IotCommEventTypeCustomCommand:
-                if (!(otfe->session->isClosed || otfe->closeSent))
+                if (!(isSessionClosed(otfe->session) || otfe->closeSent))
                 {
                     otfe->closeSent = true;
                     otfe->closeErr = closeWsWithCmdCtx(otfe->commandCtx, reason, message);
@@ -887,17 +909,65 @@ static void iotCommDeinitNoLock()
     rateLimitDeinit();
     deviceIdentityDeinit();
     usersDeinit();
+    clearTrustedProxies();
 
     handler = nullptr;
     handlerCtx = nullptr;
 }
 
+static esp_err_t copyTrustedProxies(const IotCommProxyConfig_t* config)
+{
+    IotCommTrustedProxy_t* proxies;
+
+    if ((!config) || ((!config->trustedProxies) && config->trustedProxiesCount != 0) ||
+        config->trustedProxiesCount > static_cast<size_t>(-1) / sizeof(IotCommTrustedProxy_t))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < config->trustedProxiesCount; i++)
+    {
+        if (!httpValidateTrustedProxy(&config->trustedProxies[i]))
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    if (config->trustedProxiesCount == 0)
+    {
+        return ESP_OK;
+    }
+
+    proxies = static_cast<IotCommTrustedProxy_t*>(malloc(config->trustedProxiesCount * sizeof(IotCommTrustedProxy_t)));
+    if (!proxies)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(proxies, config->trustedProxies, config->trustedProxiesCount * sizeof(IotCommTrustedProxy_t));
+    trustedProxies = proxies;
+    trustedProxiesCount = config->trustedProxiesCount;
+    return ESP_OK;
+}
+
+static void clearTrustedProxies()
+{
+    if (trustedProxies)
+    {
+        memset(trustedProxies, 0, trustedProxiesCount * sizeof(IotCommTrustedProxy_t));
+        free(trustedProxies);
+        trustedProxies = nullptr;
+    }
+    trustedProxiesCount = 0;
+}
+
 static void iotCommStopServerNoLock()
 {
-    stopUdpServer();
-
     if (server)
     {
+        ServerContext_t* serverCtx = static_cast<ServerContext_t*>(httpd_get_global_user_ctx(server));
+
+        if (serverCtx)
+        {
+            stopUdpServer(serverCtx);
+        }
         httpd_stop(server);
         server = nullptr;
     }
@@ -949,7 +1019,7 @@ static esp_err_t serveWsInit(httpd_req_t* req)
         goto done;
     }
 
-    if (!httpGetClientIpFromRequest(req, &ctx->remoteAddr))
+    if (!httpGetClientIpFromRequest(req, trustedProxies, trustedProxiesCount, &ctx->remoteAddr))
     {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
@@ -1123,7 +1193,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
         goto done;
     }
 
-    if (!httpGetClientIpFromRequest(req, &ctx->remoteAddr))
+    if (!httpGetClientIpFromRequest(req, trustedProxies, trustedProxiesCount, &ctx->remoteAddr))
     {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
@@ -1412,7 +1482,7 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
 
     // Prepare
     // Get request IP address
-    if (!httpGetClientIpFromRequest(req, &ctx->remoteAddr))
+    if (!httpGetClientIpFromRequest(req, trustedProxies, trustedProxiesCount, &ctx->remoteAddr))
     {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
@@ -1514,25 +1584,24 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
     }
 
     // Create user session
-    ctx->session = createSession();
+    ctx->session = createSessionInfo(ctx->serverCtx);
     if (!ctx->session)
     {
         err = ESP_ERR_NO_MEM;
         goto done;
     }
-    ctx->session->serverCtx = ctx->serverCtx;
+
     ctx->session->sockfd = httpd_req_to_sockfd(req);
     memcpy(&ctx->session->addr, &ctx->remoteAddr, sizeof(ctx->remoteAddr));
     ctx->session->userId = ctx->challengeCopy.userId;
-    ctx->session->nextRxCounter = 1;
-    ctx->session->nextTxCounter = 1;
+
     memcpy(ctx->session->sessionMasterKey, ctx->sessionMasterKey, sizeof(ctx->session->sessionMasterKey));
     memcpy(ctx->session->nonce, ctx->challengeCopy.wsNonce, sizeof(ChallengeNonce_t));
     err = aesSetKey(&ctx->session->clientAesCtx, ctx->derivedKey, AES_KEY_LEN);
     if (err != ESP_OK)
     {
-    error_destroy_session_and_done:
-        decrementSessionRefCount(ctx->session);
+error_destroy_session_and_done:
+        decrementSessionInfoRefCount(ctx->session);
         goto done;
     }
     err = aesSetKey(&ctx->session->serverAesCtx, ctx->derivedKey + AES_KEY_LEN, AES_KEY_LEN);
@@ -1558,7 +1627,7 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
     ctx->session->mustChangeCredentials = (ctx->b) ? 1 : 0;
 
     // Add the session to the server's sessions list
-    rwMutexLockWrite(&ctx->serverCtx->sessions.mtx);
+    portENTER_CRITICAL(&ctx->serverCtx->sessions.mux);
     ctx->session->prev = ctx->serverCtx->sessions.last;
     if (ctx->serverCtx->sessions.last)
     {
@@ -1569,10 +1638,11 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
         ctx->serverCtx->sessions.first = ctx->session;
     }
     ctx->serverCtx->sessions.last = ctx->session;
-    rwMutexUnlockWrite(&ctx->serverCtx->sessions.mtx);
+    portEXIT_CRITICAL(&ctx->serverCtx->sessions.mux);
 
     // Bind our internal session to the connection
-    httpd_sess_set_ctx(req->handle, ctx->session->sockfd, ctx->session, destroySessionCtx);
+    ctx->session->flags |= SESSION_FLAG_HTTPD_BOUND;
+    httpd_sess_set_ctx(req->handle, ctx->session->sockfd, ctx->session, destroySessionInfo);
 
     // Call session start callback
     if (handleSessionStart(ctx->session, req, &err))
@@ -1580,24 +1650,8 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
         goto done;
     }
 
-    // Look for existing sessions for the same user and close them
-    rwMutexLockRead(&ctx->serverCtx->sessions.mtx);
-    for (SessionInfo_t* otherSession = ctx->serverCtx->sessions.first; otherSession; otherSession = otherSession->next)
-    {
-        // Dont close our own session
-        if (otherSession->sockfd == ctx->session->sockfd)
-        {
-            continue;
-        }
-
-        if (otherSession->userId == ctx->session->userId)
-        {
-            ESP_LOGD(TAG, "Closing existing session %u for user %u.", otherSession->id, otherSession->userId);
-            otherSession->isClosed = true;
-            closeWs(req->handle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User opened new session");
-        }
-    }
-    rwMutexUnlockRead(&ctx->serverCtx->sessions.mtx);
+    // Close existing sessions for the same user.
+    closeUserSessions(ctx->serverCtx, req->handle, ctx->session->sockfd, ctx->session->userId, "User opened new session");
 
     // Reset rate limits for successful access
     rateLimitResetAddress(&ctx->remoteAddr);
@@ -1704,7 +1758,7 @@ static esp_err_t serveWsPacket(httpd_req_t* req)
     }
 
     // Check if already closed
-    if (commandCtx.session->isClosed)
+    if (isSessionClosed(commandCtx.session))
     {
         return ESP_OK;
     }
@@ -1809,66 +1863,88 @@ static esp_err_t dispatchCommand(CommandContext_t* commandCtx)
 {
     esp_err_t err;
 
-    incrementSessionRefCount(commandCtx->session);
+    incrementSessionInfoRefCount(commandCtx->session);
 
     if (!commandCtx->session->dispatchMtx)
     {
-        decrementSessionRefCount(commandCtx->session);
+        decrementSessionInfoRefCount(commandCtx->session);
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(commandCtx->session->dispatchMtx, portMAX_DELAY);
 
-    // Check if the only accepted command is to change the credentials
-    if (commandCtx->session->mustChangeCredentials != 0 && commandCtx->cmd != CMD_CHANGE_USER_CREDENTIALS)
+    if (isSessionClosed(commandCtx->session))
     {
-        ESP_LOGD(TAG, "The user must change their credentials before issuing other commands.");
-        err = closeWsWithCmdCtx(commandCtx, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
         xSemaphoreGive(commandCtx->session->dispatchMtx);
-        decrementSessionRefCount(commandCtx->session);
-        return err;
+        decrementSessionInfoRefCount(commandCtx->session);
+        return ESP_ERR_INVALID_STATE;
     }
 
-    switch (commandCtx->cmd)
+    // UDP is a one-way custom-command transport. Built-in commands are only
+    // available over WebSocket, where their request and reply semantics apply.
+    if (commandCtx->serverHandle == nullptr)
     {
-        case CMD_CREATE_USER:
-            err = handleCreateUser(commandCtx);
-            break;
-
-        case CMD_DELETE_USER:
-            err = handleDeleteUser(commandCtx);
-            break;
-
-        case CMD_RESET_USER_CREDENTIALS:
-            err = handleResetUserCredentials(commandCtx);
-            break;
-
-        case CMD_CHANGE_USER_CREDENTIALS:
-            err = handleChangeUserCredentials(commandCtx);
-            break;
-
-        case CMD_OTA_BEGIN:
-            err = handleOtaBegin(commandCtx);
-            break;
-
-        case CMD_OTA_WRITE:
-            err = handleOtaWrite(commandCtx);
-            break;
-
-        case CMD_OTA_CANCEL:
-            err = handleOtaCancel(commandCtx);
-            break;
-
-        case CMD_UDP_OPEN:
-            err = handleUdpOpen(commandCtx);
-            break;
-
-        default:
+        if (commandCtx->cmd >= IOTCOMM_RESERVED_CMD_ID_MIN && commandCtx->cmd <= IOTCOMM_RESERVED_CMD_ID_MAX)
+        {
+            err = ESP_ERR_NOT_ALLOWED;
+        }
+        else
+        {
             err = handleCustomCommand(commandCtx);
-            break;
+        }
+    }
+    else
+    {
+        // Check if the only accepted command is to change the credentials
+        if (commandCtx->session->mustChangeCredentials != 0 && commandCtx->cmd != CMD_CHANGE_USER_CREDENTIALS)
+        {
+            ESP_LOGD(TAG, "The user must change their credentials before issuing other commands.");
+            err = closeWsWithCmdCtx(commandCtx, WS_CLOSE_APP_CREDENTIALS_CHANGE_MANDATORY, "User must change the access credentials.");
+        }
+        else
+        {
+            switch (commandCtx->cmd)
+            {
+                case CMD_CREATE_USER:
+                    err = handleCreateUser(commandCtx);
+                    break;
+
+                case CMD_DELETE_USER:
+                    err = handleDeleteUser(commandCtx);
+                    break;
+
+                case CMD_RESET_USER_CREDENTIALS:
+                    err = handleResetUserCredentials(commandCtx);
+                    break;
+
+                case CMD_CHANGE_USER_CREDENTIALS:
+                    err = handleChangeUserCredentials(commandCtx);
+                    break;
+
+                case CMD_OTA_BEGIN:
+                    err = handleOtaBegin(commandCtx);
+                    break;
+
+                case CMD_OTA_WRITE:
+                    err = handleOtaWrite(commandCtx);
+                    break;
+
+                case CMD_OTA_CANCEL:
+                    err = handleOtaCancel(commandCtx);
+                    break;
+
+                case CMD_UDP_OPEN:
+                    err = handleUdpOpen(commandCtx);
+                    break;
+
+                default:
+                    err = handleCustomCommand(commandCtx);
+                    break;
+            }
+        }
     }
 
     xSemaphoreGive(commandCtx->session->dispatchMtx);
-    decrementSessionRefCount(commandCtx->session);
+    decrementSessionInfoRefCount(commandCtx->session);
     return err;
 }
 
@@ -1963,24 +2039,8 @@ static esp_err_t handleDeleteUser(CommandContext_t* commandCtx)
     // Delete it
     userDestroy(targetUserId);
 
-    // Delete active target user sessions
-    rwMutexLockRead(&commandCtx->serverCtx->sessions.mtx);
-    for (SessionInfo_t* otherSession = commandCtx->serverCtx->sessions.first; otherSession; otherSession = otherSession->next)
-    {
-        // Dont close our own session
-        if (otherSession->sockfd == commandCtx->sockfd)
-        {
-            continue;
-        }
-
-        if (otherSession->userId == targetUserId)
-        {
-            ESP_LOGD(TAG, "Closing session %u for deleted user %u.", otherSession->id, otherSession->userId);
-            otherSession->isClosed = true;
-            closeWs(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User has been deleted");
-        }
-    }
-    rwMutexUnlockRead(&commandCtx->serverCtx->sessions.mtx);
+    // Close active target user sessions.
+    closeUserSessions(commandCtx->serverCtx, commandCtx->serverHandle, commandCtx->sockfd, targetUserId, "User has been deleted");
 
     // Done
     ESP_LOGD(TAG, "DELETE USER command: user deleted successfully.");
@@ -2046,24 +2106,9 @@ static esp_err_t handleResetUserCredentials(CommandContext_t* commandCtx)
         return buildAndSendErrorReply(commandCtx, ESP_FAIL, "Unable to reset user credentials", true);
     }
 
-    // Delete active target user sessions
-    rwMutexLockRead(&commandCtx->serverCtx->sessions.mtx);
-    for (SessionInfo_t* otherSession = commandCtx->serverCtx->sessions.first; otherSession; otherSession = otherSession->next)
-    {
-        // Dont close our own session
-        if (otherSession->sockfd == commandCtx->sockfd)
-        {
-            continue;
-        }
-
-        if (otherSession->userId == targetUserId)
-        {
-            ESP_LOGD(TAG, "Closing session %u for user %u after a credential reset.", otherSession->id, otherSession->userId);
-            otherSession->isClosed = true;
-            closeWs(commandCtx->serverHandle, otherSession->sockfd, WS_CLOSE_GOING_AWAY, "User credentials has been reset");
-        }
-    }
-    rwMutexUnlockRead(&commandCtx->serverCtx->sessions.mtx);
+    // Close active target user sessions.
+    closeUserSessions(commandCtx->serverCtx, commandCtx->serverHandle, commandCtx->sockfd, targetUserId,
+                      "User credentials have been reset");
 
     // Done
     ESP_LOGD(TAG, "RESET USER CREDENTIALS command: credentials reset successfully.");
@@ -2380,14 +2425,17 @@ static esp_err_t handleUdpOpen(CommandContext_t* commandCtx)
     err = buildAndSendReply(commandCtx, reply, bw.written, true);
     if (err == ESP_OK)
     {
-        rwMutexLockWrite(&commandCtx->serverCtx->sessions.mtx);
-        memcpy(commandCtx->session->clientUdpNonce, clientUdpNonce, sizeof(commandCtx->session->clientUdpNonce));
-        memcpy(commandCtx->session->serverUdpNonce, serverUdpNonce, sizeof(commandCtx->session->serverUdpNonce));
-        commandCtx->session->udpConnectionId = udpConnectionId;
-        commandCtx->session->udpNextRxCounter = 1;
-        memcpy(commandCtx->session->udpClientAesKey, udpClientAesKey, sizeof(commandCtx->session->udpClientAesKey));
-        memcpy(commandCtx->session->udpClientBaseIV, udpClientBaseIV, sizeof(commandCtx->session->udpClientBaseIV));
-        rwMutexUnlockWrite(&commandCtx->serverCtx->sessions.mtx);
+        portENTER_CRITICAL(&commandCtx->serverCtx->sessions.mux);
+        if (!isSessionClosed(commandCtx->session))
+        {
+            memcpy(commandCtx->session->clientUdpNonce, clientUdpNonce, sizeof(commandCtx->session->clientUdpNonce));
+            memcpy(commandCtx->session->serverUdpNonce, serverUdpNonce, sizeof(commandCtx->session->serverUdpNonce));
+            commandCtx->session->udpConnectionId = udpConnectionId;
+            commandCtx->session->udpNextRxCounter = 1;
+            memcpy(commandCtx->session->udpClientAesKey, udpClientAesKey, sizeof(commandCtx->session->udpClientAesKey));
+            memcpy(commandCtx->session->udpClientBaseIV, udpClientBaseIV, sizeof(commandCtx->session->udpClientBaseIV));
+        }
+        portEXIT_CRITICAL(&commandCtx->serverCtx->sessions.mux);
     }
 
     memset(serverUdpNonce, 0, sizeof(serverUdpNonce));
@@ -2627,7 +2675,7 @@ static esp_err_t encryptAndSend(SessionInfo_t* session, httpd_handle_t serverHan
 
 static esp_err_t closeWsWithSession(SessionInfo_t* session, httpd_handle_t serverHandle, uint16_t code, const char* reason)
 {
-    session->isClosed = 1;
+    closeSession(session);
     return closeWs(serverHandle, session->sockfd, code, reason) ? ESP_OK : ESP_FAIL;
 }
 
@@ -2647,7 +2695,7 @@ static esp_err_t closeWsWithCmdCtx(CommandContext_t* commandCtx, uint16_t code, 
     }
     if (commandCtx->session)
     {
-        commandCtx->session->isClosed = 1;
+        closeSession(commandCtx->session);
     }
     return closeWs(commandCtx->serverHandle, commandCtx->sockfd, code, reason) ? ESP_OK : ESP_FAIL;
 }
@@ -2660,69 +2708,72 @@ static esp_err_t closeWsWithCmdCtxAndError(CommandContext_t* commandCtx, const c
     return closeWsWithCmdCtx(commandCtx, WS_CLOSE_INTERNAL_ERROR, reason);
 }
 
+static void clearUdpSessionState(SessionInfo_t* session)
+{
+    session->udpConnectionId = 0;
+    session->udpNextRxCounter = 0;
+    memset(session->clientUdpNonce, 0, sizeof(session->clientUdpNonce));
+    memset(session->serverUdpNonce, 0, sizeof(session->serverUdpNonce));
+    memset(session->udpClientAesKey, 0, sizeof(session->udpClientAesKey));
+    memset(session->udpClientBaseIV, 0, sizeof(session->udpClientBaseIV));
+}
+
+static ServerContext_t* createServerCtx(IotCommServerConfig_t* config)
+{
+    ServerContext_t* serverCtx;
+
+    // Create http server context
+    serverCtx = static_cast<ServerContext_t*>(malloc(sizeof(ServerContext_t)));
+    if (!serverCtx)
+    {
+        return nullptr;
+    }
+    memset(serverCtx, 0, sizeof(ServerContext_t));
+    serverCtx->maxConnectionsCount = static_cast<size_t>(config->maxConnections);
+    serverCtx->maxPacketSize = (config->maxPacketSize > MIN_WS_PACKET_SIZE) ? static_cast<size_t>(config->maxPacketSize) : MIN_WS_PACKET_SIZE;
+    serverCtx->udpListenPort = config->udpListenPort;
+    serverCtx->refCount = 1;
+    serverCtx->udp.socketFd = -1;
+    portMUX_INITIALIZE(&serverCtx->sessions.mux);
+
+    // Done
+    return serverCtx;
+}
+
 static void destroyServerCtx(void* ctx)
 {
     if (ctx)
     {
         ServerContext_t* serverCtx = static_cast<ServerContext_t*>(ctx);
 
-        if (activeServerCtx == serverCtx)
-        {
-            activeServerCtx = nullptr;
-        }
-        rwMutexDeinit(&serverCtx->sessions.mtx);
+        decrementServerCtxRefCount(serverCtx);
+    }
+}
 
+static void incrementServerCtxRefCount(ServerContext_t* serverCtx)
+{
+    assert(serverCtx);
+    __atomic_fetch_add(&serverCtx->refCount, 1, __ATOMIC_ACQ_REL);
+}
+
+static void decrementServerCtxRefCount(ServerContext_t* serverCtx)
+{
+    assert(serverCtx);
+    if (__atomic_sub_fetch(&serverCtx->refCount, 1, __ATOMIC_ACQ_REL) == 0)
+    {
+        assert(serverCtx->udp.task == nullptr);
+        assert(serverCtx->udp.socketFd < 0);
+        if (serverCtx->udp.rxBuffer)
+        {
+            memset(serverCtx->udp.rxBuffer, 0, serverCtx->maxPacketSize);
+            free(serverCtx->udp.rxBuffer);
+        }
+        memset(serverCtx, 0, sizeof(ServerContext_t));
         free(serverCtx);
     }
 }
 
-static void destroySessionCtx(void* ctx)
-{
-    if (ctx)
-    {
-        SessionInfo_t* session = static_cast<SessionInfo_t*>(ctx);
-        ServerContext_t* serverCtx = session->serverCtx;
-
-        // Remove the session from the server's session list
-        rwMutexLockWrite(&serverCtx->sessions.mtx);
-        session->isClosed = 1;
-        session->udpConnectionId = 0;
-        session->udpNextRxCounter = 0;
-        memset(session->clientUdpNonce, 0, sizeof(session->clientUdpNonce));
-        memset(session->serverUdpNonce, 0, sizeof(session->serverUdpNonce));
-        memset(session->udpClientAesKey, 0, sizeof(session->udpClientAesKey));
-        memset(session->udpClientBaseIV, 0, sizeof(session->udpClientBaseIV));
-        if (session->prev)
-        {
-            session->prev->next = session->next;
-        }
-        else
-        {
-            serverCtx->sessions.first = session->next;
-        }
-        if (session->next)
-        {
-            session->next->prev = session->prev;
-        }
-        else
-        {
-            serverCtx->sessions.last = session->prev;
-        }
-        rwMutexUnlockWrite(&serverCtx->sessions.mtx);
-
-        while (__atomic_load_n(&session->udpInFlight, __ATOMIC_ACQUIRE) != 0)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-
-        // Call session end callback
-        handleSessionEnd(session);
-
-        decrementSessionRefCount(session);
-    }
-}
-
-static SessionInfo_t* createSession()
+static SessionInfo_t* createSessionInfo(ServerContext_t* serverCtx)
 {
     SessionInfo_t* session;
 
@@ -2752,6 +2803,9 @@ static SessionInfo_t* createSession()
     session->nextRxCounter = 1;
     session->nextTxCounter = 1;
 
+    session->serverCtx = serverCtx;
+    incrementServerCtxRefCount(serverCtx);
+
     // Generate unique ID
     do
     {
@@ -2763,55 +2817,105 @@ static SessionInfo_t* createSession()
     return session;
 }
 
-static void incrementSessionRefCount(SessionInfo_t* session)
+static void destroySessionInfo(void* ctx)
+{
+    if (ctx)
+    {
+        SessionInfo_t* session = static_cast<SessionInfo_t*>(ctx);
+        ServerContext_t* serverCtx = session->serverCtx;
+
+        // Remove the session from the server's session list.
+        portENTER_CRITICAL(&serverCtx->sessions.mux);
+        closeSession(session);
+        clearUdpSessionState(session);
+        if (session->prev)
+        {
+            session->prev->next = session->next;
+        }
+        else
+        {
+            serverCtx->sessions.first = session->next;
+        }
+        if (session->next)
+        {
+            session->next->prev = session->prev;
+        }
+        else
+        {
+            serverCtx->sessions.last = session->prev;
+        }
+        portEXIT_CRITICAL(&serverCtx->sessions.mux);
+
+        decrementSessionInfoRefCount(session);
+    }
+}
+
+static void incrementSessionInfoRefCount(SessionInfo_t* session)
 {
     assert(session);
     __atomic_fetch_add(&session->refCount, 1, __ATOMIC_ACQ_REL);
 }
 
-static void decrementSessionRefCount(SessionInfo_t* session)
+static void decrementSessionInfoRefCount(SessionInfo_t* session)
 {
     assert(session);
     if (__atomic_sub_fetch(&session->refCount, 1, __ATOMIC_ACQ_REL) == 0)
     {
-        freeSession(session);
+        ServerContext_t* serverCtx = session->serverCtx;
+
+        if (session->flags & SESSION_FLAG_HTTPD_BOUND)
+        {
+            handleSessionEnd(session);
+        }
+
+        // Free user data
+        if (session->userData)
+        {
+            if (session->userDataFreeFn)
+            {
+                session->userDataFreeFn(session->userData);
+            }
+            else
+            {
+                free(session->userData);
+            }
+        }
+
+        // Wipe session data
+        aesDone(&session->clientAesCtx);
+        aesDone(&session->serverAesCtx);
+        memset(session->sessionMasterKey, 0, sizeof(session->sessionMasterKey));
+
+        gbWipe(&session->plaintextIn);
+        gbReset(&session->plaintextIn, true);
+        gbWipe(&session->ciphertextIn);
+        gbReset(&session->ciphertextIn, true);
+        gbWipe(&session->ciphertextOut);
+        gbReset(&session->ciphertextOut, true);
+
+        if (session->dispatchMtx)
+        {
+            vSemaphoreDelete(session->dispatchMtx);
+            session->dispatchMtx = nullptr;
+        }
+
+        memset(session, 0, sizeof(SessionInfo_t));
+        free(session);
+
+        decrementServerCtxRefCount(serverCtx);
     }
 }
 
-static void freeSession(SessionInfo_t* session)
+static bool isSessionClosed(const SessionInfo_t* session)
 {
     assert(session);
+    return __atomic_load_n(&session->isClosed, __ATOMIC_ACQUIRE) != 0;
+}
 
-    // Free user data
-    if (session->userData)
-    {
-        if (session->userDataFreeFn)
-        {
-            session->userDataFreeFn(session->userData);
-        }
-        else
-        {
-            free(session->userData);
-        }
-    }
-
-    aesDone(&session->clientAesCtx);
-    aesDone(&session->serverAesCtx);
-    memset(session->sessionMasterKey, 0, sizeof(session->sessionMasterKey));
-
-    gbWipe(&session->plaintextIn);
-    gbReset(&session->plaintextIn, true);
-    gbWipe(&session->ciphertextIn);
-    gbReset(&session->ciphertextIn, true);
-    gbWipe(&session->ciphertextOut);
-    gbReset(&session->ciphertextOut, true);
-    if (session->dispatchMtx)
-    {
-        vSemaphoreDelete(session->dispatchMtx);
-        session->dispatchMtx = nullptr;
-    }
-    memset(session, 0, sizeof(SessionInfo_t));
-    free(session);
+static bool closeSession(SessionInfo_t* session)
+{
+    assert(session);
+    return __atomic_exchange_n(&session->isClosed, 1, __ATOMIC_ACQ_REL) == 0;
 }
 
 static esp_err_t readWsPacket(ServerContext_t* serverCtx, SessionInfo_t* session, httpd_req_t* req, bool* messageComplete)
@@ -2914,6 +3018,35 @@ static bool closeWs(httpd_handle_t serverHandle, int sockfd, uint16_t code, cons
     return httpd_ws_send_frame_async(serverHandle, sockfd, &frame) == ESP_OK && httpd_sess_trigger_close(serverHandle, sockfd) == ESP_OK;
 }
 
+static void closeUserSessions(ServerContext_t* serverCtx, httpd_handle_t serverHandle, int exceptSockfd, uint32_t userId, const char* reason)
+{
+    while (true)
+    {
+        SessionInfo_t* session = nullptr;
+
+        portENTER_CRITICAL(&serverCtx->sessions.mux);
+        for (SessionInfo_t* candidate = serverCtx->sessions.first; candidate; candidate = candidate->next)
+        {
+            if (candidate->sockfd != exceptSockfd && candidate->userId == userId && closeSession(candidate))
+            {
+                incrementSessionInfoRefCount(candidate);
+                session = candidate;
+                break;
+            }
+        }
+        portEXIT_CRITICAL(&serverCtx->sessions.mux);
+
+        if (!session)
+        {
+            return;
+        }
+
+        ESP_LOGD(TAG, "Closing session %u for user %u.", session->id, session->userId);
+        closeWs(serverHandle, session->sockfd, WS_CLOSE_GOING_AWAY, reason);
+        decrementSessionInfoRefCount(session);
+    }
+}
+
 static void otaRestartTaskMain(Task_t task, void* arg)
 {
     taskDetach(task);
@@ -2925,9 +3058,12 @@ static void otaRestartTaskMain(Task_t task, void* arg)
 static esp_err_t startUdpServer(ServerContext_t* serverCtx)
 {
     struct sockaddr_in addr;
+    struct timeval timeout;
     int socketFd;
 
-    stopUdpServer();
+    assert(serverCtx);
+    assert(serverCtx->udp.task == nullptr);
+    assert(serverCtx->udp.socketFd < 0);
 
     socketFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (socketFd < 0)
@@ -2947,12 +3083,32 @@ static esp_err_t startUdpServer(ServerContext_t* serverCtx)
         return ESP_FAIL;
     }
 
-    atomic_store_explicit(&udpServerSocket, socketFd, memory_order_release);
-    udpServerTask = taskCreate(udpServerTaskMain, "iotcomm-udp", 6144, serverCtx, 4, tskNO_AFFINITY);
-    if (!udpServerTask)
+    memset(&timeout, 0, sizeof(timeout));
+    timeout.tv_usec = 100000;
+    if (setsockopt(socketFd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        ESP_LOGE(TAG, "Failed to configure the UDP socket receive timeout.");
+        close(socketFd);
+        return ESP_FAIL;
+    }
+
+    serverCtx->udp.rxBuffer = static_cast<uint8_t*>(malloc(serverCtx->maxPacketSize));
+    if (!serverCtx->udp.rxBuffer)
+    {
+        ESP_LOGE(TAG, "Failed to allocate the UDP receive buffer.");
+        close(socketFd);
+        return ESP_ERR_NO_MEM;
+    }
+
+    serverCtx->udp.socketFd = socketFd;
+    incrementServerCtxRefCount(serverCtx);
+    serverCtx->udp.task = taskCreate(udpServerTaskMain, "iotcomm-udp", 6144, serverCtx, 4, tskNO_AFFINITY);
+    if (!serverCtx->udp.task)
     {
         ESP_LOGE(TAG, "Failed to start the UDP server task.");
-        close(atomic_exchange_explicit(&udpServerSocket, -1, memory_order_acq_rel));
+        close(serverCtx->udp.socketFd);
+        serverCtx->udp.socketFd = -1;
+        decrementServerCtxRefCount(serverCtx);
         return ESP_ERR_NO_MEM;
     }
 
@@ -2960,22 +3116,21 @@ static esp_err_t startUdpServer(ServerContext_t* serverCtx)
     return ESP_OK;
 }
 
-static void stopUdpServer()
+static void stopUdpServer(ServerContext_t* serverCtx)
 {
     int socketFd;
 
-    socketFd = atomic_exchange_explicit(&udpServerSocket, -1, memory_order_acq_rel);
-    if (udpServerTask)
-    {
-        if (socketFd >= 0)
-        {
-            close(socketFd);
-        }
+    assert(serverCtx);
 
-        taskJoin(udpServerTask);
-        udpServerTask = nullptr;
+    if (serverCtx->udp.task)
+    {
+        taskJoin(serverCtx->udp.task);
+        serverCtx->udp.task = nullptr;
     }
-    else if (socketFd >= 0)
+
+    socketFd = serverCtx->udp.socketFd;
+    serverCtx->udp.socketFd = -1;
+    if (socketFd >= 0)
     {
         close(socketFd);
     }
@@ -2984,33 +3139,21 @@ static void stopUdpServer()
 static void udpServerTaskMain(Task_t task, void* arg)
 {
     ServerContext_t* serverCtx;
-    uint8_t* rxBuffer;
+    int socketFd;
 
     serverCtx = static_cast<ServerContext_t*>(arg);
+    socketFd = serverCtx->udp.socketFd;
 
     taskSignalContinue(task);
-
-    rxBuffer = static_cast<uint8_t*>(malloc(serverCtx->maxPacketSize));
-    if (!rxBuffer)
-    {
-        ESP_LOGE(TAG, "Failed to allocate the UDP receive buffer.");
-        return;
-    }
 
     while (!taskShouldQuit(task))
     {
         struct sockaddr_storage srcAddr = {};
         socklen_t srcAddrLen = sizeof(srcAddr);
         IPAddress_t remoteAddr;
-        int socketFd;
         int len;
 
-        socketFd = atomic_load_explicit(&udpServerSocket, memory_order_acquire);
-        if (socketFd < 0)
-        {
-            break;
-        }
-        len = recvfrom(socketFd, rxBuffer, serverCtx->maxPacketSize, 0, reinterpret_cast<sockaddr*>(&srcAddr), &srcAddrLen);
+        len = recvfrom(socketFd, serverCtx->udp.rxBuffer, serverCtx->maxPacketSize, 0, reinterpret_cast<sockaddr*>(&srcAddr), &srcAddrLen);
         if (taskShouldQuit(task))
         {
             break;
@@ -3034,13 +3177,14 @@ static void udpServerTaskMain(Task_t task, void* arg)
                 continue;
         }
 
-        processUdpPacket(serverCtx, rxBuffer, static_cast<size_t>(len), &remoteAddr);
+        processUdpPacket(serverCtx, socketFd, serverCtx->udp.rxBuffer, static_cast<size_t>(len), &remoteAddr);
     }
 
-    free(rxBuffer);
+    decrementServerCtxRefCount(serverCtx);
 }
 
-static void processUdpPacket(ServerContext_t* serverCtx, const uint8_t* packet, size_t packetLen, const IPAddress_t* remoteAddr)
+static void processUdpPacket(ServerContext_t* serverCtx, int socketFd, const uint8_t* packet, size_t packetLen,
+                             const IPAddress_t* remoteAddr)
 {
     const UdpPacketHeader_t* hdr;
     SessionInfo_t* session = nullptr;
@@ -3077,21 +3221,20 @@ static void processUdpPacket(ServerContext_t* serverCtx, const uint8_t* packet, 
     ciphertextLen = packetLen - sizeof(UdpPacketHeader_t);
     plaintextLen = ciphertextLen - TAG_LEN;
 
-    rwMutexLockRead(&serverCtx->sessions.mtx);
+    portENTER_CRITICAL(&serverCtx->sessions.mux);
     for (SessionInfo_t* candidate = serverCtx->sessions.first; candidate; candidate = candidate->next)
     {
-        if (candidate->isClosed == 0 && candidate->udpConnectionId == udpConnectionId && ipAddressEqual(&candidate->addr, remoteAddr))
+        if ((!isSessionClosed(candidate)) && candidate->udpConnectionId == udpConnectionId && ipAddressEqual(&candidate->addr, remoteAddr))
         {
             session = candidate;
-            incrementSessionRefCount(session);
-            __atomic_fetch_add(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
+            incrementSessionInfoRefCount(session);
             expectedRxCounter = session->udpNextRxCounter;
             memcpy(udpClientAesKey, session->udpClientAesKey, sizeof(udpClientAesKey));
             memcpy(udpClientBaseIV, session->udpClientBaseIV, sizeof(udpClientBaseIV));
             break;
         }
     }
-    rwMutexUnlockRead(&serverCtx->sessions.mtx);
+    portEXIT_CRITICAL(&serverCtx->sessions.mux);
 
     if (!session)
     {
@@ -3133,37 +3276,34 @@ static void processUdpPacket(ServerContext_t* serverCtx, const uint8_t* packet, 
 
     memset(&commandCtx, 0, sizeof(commandCtx));
     commandCtx.serverCtx = serverCtx;
-    commandCtx.sockfd = atomic_load_explicit(&udpServerSocket, memory_order_acquire);
+    commandCtx.sockfd = socketFd;
     commandCtx.session = session;
     commandCtx.cmd = be16dec(hdr->packetHeader.cmd);
     commandCtx.br = br_init(plaintext, plaintextLen);
     commandCtx.rxCounter = rxCounter;
-    dispatchCommand(&commandCtx);
+    err = dispatchCommand(&commandCtx);
 
-    if (session->udpConnectionId == udpConnectionId && session->udpNextRxCounter <= rxCounter)
+    portENTER_CRITICAL(&serverCtx->sessions.mux);
+    if ((!isSessionClosed(session)) && session->udpConnectionId == udpConnectionId && session->udpNextRxCounter <= rxCounter)
     {
-        if (rxCounter == UINT64_MAX - 1)
+        if (err != ESP_OK || rxCounter == UINT64_MAX - 1)
         {
-            session->udpConnectionId = 0;
-            session->udpNextRxCounter = 0;
-            memset(session->clientUdpNonce, 0, sizeof(session->clientUdpNonce));
-            memset(session->serverUdpNonce, 0, sizeof(session->serverUdpNonce));
-            memset(session->udpClientAesKey, 0, sizeof(session->udpClientAesKey));
-            memset(session->udpClientBaseIV, 0, sizeof(session->udpClientBaseIV));
+            // A failed authenticated command invalidates this UDP negotiation.
+            clearUdpSessionState(session);
         }
         else
         {
             session->udpNextRxCounter = rxCounter + 1;
         }
     }
+    portEXIT_CRITICAL(&serverCtx->sessions.mux);
 
 done:
     if (plaintext)
     {
         free(plaintext);
     }
-    __atomic_fetch_sub(&session->udpInFlight, 1, __ATOMIC_ACQ_REL);
-    decrementSessionRefCount(session);
+    decrementSessionInfoRefCount(session);
 }
 
 static bool extGbAddB64(GrowableBuffer_t* buf, const uint8_t* src, size_t srcLen, bool isUrl)

@@ -24,6 +24,9 @@
 #define IOTCOMM_DEFAULT_MAX_CHALLENGES_SLOTS                10
 #define IOTCOMM_DEFAULT_CHALLENGE_WINDOW_TIME_MS            60000
 
+#define IOTCOMM_RESERVED_CMD_ID_MIN 0x7F00
+#define IOTCOMM_RESERVED_CMD_ID_MAX 0x7FFF
+
 // The following commands are handled by the IoT-Comm engine.
 //
 // NOTE: Command in the 0x7F00-0x7FFF range are reserved for current and future use.
@@ -61,6 +64,10 @@
 //
 // UDP data packets use this encrypted binary packet header layout:
 //     udpConnectionId(4) | version(1) | cmd(2) | flags(1) | counter(8)
+// UDP is a one-way transport for custom command IDs outside 0x7F00-0x7FFF.
+// Reserved built-in command IDs are rejected and invalidate the current UDP
+// negotiation; open UDP again with CMD_UDP_OPEN. UDP custom commands do not
+// support iotCommEventReply*() responses; those APIs return ESP_ERR_NOT_ALLOWED.
 //
 
 // Websocket close codes
@@ -165,6 +172,20 @@ typedef struct IotCommRateChallengeConfig_s {
     uint32_t windowSizeInMs;
 } IotCommRateChallengeConfig_t;
 
+// Identifies a trusted reverse-proxy network that may supply client IP headers.
+// The address must be the canonical network address for the prefix length.
+typedef struct IotCommTrustedProxy_s {
+    IPAddress_t network;
+    uint8_t     prefixLength;
+} IotCommTrustedProxy_t;
+
+// Configures reverse proxies trusted to supply X-Forwarded-For. An empty list
+// ignores forwarded headers and uses the direct TCP peer address.
+typedef struct IotCommProxyConfig_s {
+    const IotCommTrustedProxy_t* trustedProxies;
+    size_t                       trustedProxiesCount;
+} IotCommProxyConfig_t;
+
 // Receives server lifecycle and command events.
 typedef void (*IotCommEventHandler_t)(IotCommEvent_t* event);
 
@@ -175,6 +196,7 @@ typedef struct IotCommConfig_s {
     IotCommStorageCallbacks_t            storage;
     IotCommRateLimitConfig_t             rateLimit;
     IotCommRateChallengeConfig_t         challenge;
+    IotCommProxyConfig_t                 proxy;
     IotCommEventHandler_t                handler;
     void*                                handlerCtx;
 } IotCommConfig_t;
@@ -199,9 +221,12 @@ typedef struct IotCommReadiness_s {
 extern "C" {
 #endif // __cplusplus
 
-// Initializes the IoT communication subsystem with the provided settings.
+// Initializes the IoT communication subsystem with the provided settings. If it
+// is already initialized, returns ESP_OK and preserves the active settings.
 esp_err_t iotCommInit(IotCommConfig_t* config);
-// Releases resources owned by the IoT communication subsystem.
+// Releases resources owned by the IoT communication subsystem. Do not call this
+// synchronously from an IoT-Comm event callback; it waits for that callback's
+// rundown reference to finish.
 void iotCommDeinit();
 
 // Returns the persisted device identity public key used to authenticate the server handshake.
@@ -209,7 +234,9 @@ esp_err_t iotCommGetDeviceIdentityPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SI
 
 // Starts the IoT communication server with the given listener configuration.
 esp_err_t iotCommStartServer(IotCommServerConfig_t* config);
-// Stops the IoT communication server if it is running.
+// Stops the IoT communication server if it is running. Do not call this
+// synchronously from an IoT-Comm event callback; it waits for that callback's
+// rundown reference to finish.
 void iotCommStopServer();
 
 // Reports whether the IoT communication server is currently accepting connections.
@@ -230,7 +257,8 @@ bool iotCommIsSessionUserAdmin(IotCommSessionHandle_t h);
 IPAddress_t iotCommGetSessionIpAddress(IotCommSessionHandle_t h);
 
 // NOTE: Event replies are synchronous to the event callback. Do not retain event data
-//       or defer completion to another task/core after the callback returns.
+//       or defer completion to another task/core after the callback returns. UDP custom
+//       commands are one-way; these APIs return ESP_ERR_NOT_ALLOWED for them.
 // Sends a successful reply for the current event callback.
 esp_err_t iotCommEventReply(IotCommSessionHandle_t h, const uint8_t* reply, size_t replyLen);
 // Sends an error reply for the current event callback.

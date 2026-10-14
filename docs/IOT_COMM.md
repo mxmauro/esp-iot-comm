@@ -26,6 +26,29 @@ The usual setup looks like this:
 5. Call `iotCommInit()`.
 6. After a network interface is connected and a root user is configured, start the listener with `iotCommStartServer()`.
 
+After successful initialization, repeated `iotCommInit()` calls return `ESP_OK` and retain the original configuration.
+
+## Reverse Proxies
+
+By default, client identity, challenge binding, and rate limiting use the direct TCP peer address. The component considers
+`X-Forwarded-For` only when that peer matches a CIDR entry in `config.proxy.trustedProxies`. Configure this only for reverse proxies under
+your control; the component copies the entries during `iotCommInit()`.
+
+```cpp
+IotCommTrustedProxy_t proxies[1] = {};
+
+parseIP(&proxies[0].network, "192.0.2.0");
+proxies[0].prefixLength = 24;
+config.proxy.trustedProxies = proxies;
+config.proxy.trustedProxiesCount = 1;
+```
+
+Each entry must use its canonical network address (host bits clear). Invalid entries make `iotCommInit()` fail.
+
+When the peer is trusted, the component reads `X-Forwarded-For` from right to left, skips listed proxy addresses, and uses the first
+remaining address as the client. Configure proxies to append or overwrite this header. A missing, malformed, or all-proxy header falls
+back to the direct peer address.
+
 In practice, your event handler is where the application protocol lives. The library takes care of authentication and parsing; your code
 decides what a custom command means and how to answer it.
 
@@ -115,6 +138,10 @@ ticket cookie when `/ws/auth` is performed with credentials enabled.
 
 The component reserves command IDs in the `0x7F00-0x7FFF` range for built-in behavior.
 
+UDP is a one-way transport for custom commands only. It accepts custom command IDs outside the reserved range. A reserved built-in command
+ID is rejected and invalidates the current UDP negotiation; issue `CMD_UDP_OPEN` again over WebSocket before sending more UDP commands.
+For UDP custom-command events, `iotCommEventReply()` and `iotCommEventReplyWithError()` return `ESP_ERR_NOT_ALLOWED`.
+
 `CMD_CREATE_USER` (`0x7FF1`) expects:
 
 * `flags`: bitmask byte. Bit `0` forces the new user to change credentials on the next login.
@@ -140,9 +167,13 @@ The component reserves command IDs in the `0x7F00-0x7FFF` range for built-in beh
 * `IotCommEventTypeSessionEnd`: a session has ended.
 * `IotCommEventTypeCustomCommand`: an authenticated custom command was received.
 
-The important rule here is that replies are synchronous to the event callback. If you receive a custom command, answer it inside that
-callback with `iotCommEventReply()`, `iotCommEventReplyWithError()`, or `iotCommSessionClose()`. Do not keep the command pointer around or
-defer the reply to another task after the callback has returned.
+The important rule here is that WebSocket replies are synchronous to the event callback. If you receive a WebSocket custom command, answer
+it inside that callback with `iotCommEventReply()`, `iotCommEventReplyWithError()`, or `iotCommSessionClose()`. Do not keep the command
+pointer around or defer the reply to another task after the callback has returned. UDP custom commands are one-way; both reply APIs return
+`ESP_ERR_NOT_ALLOWED`.
+
+Do not call `iotCommStopServer()` or `iotCommDeinit()` synchronously from an IoT-Comm event callback. Both APIs wait for the callback's
+rundown reference to finish, so doing so would deadlock. Call them after the callback has returned.
 
 ## Storage Expectations
 
