@@ -530,6 +530,10 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
         uri.method = HTTP_OPTIONS;
         err = httpd_register_uri_handler(server, &uri);
     }
+    if (err == ESP_OK && config->serverInitHandler != nullptr)
+    {
+        err = config->serverInitHandler(server, config->serverInitHandlerCtx);
+    }
     if (err != ESP_OK)
     {
         goto on_error;

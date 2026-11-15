@@ -24,6 +24,9 @@ typedef struct LoopbackTestContext_s {
     TestStorageItem_t storage[3];
     SemaphoreHandle_t done;
     esp_err_t         clientErr;
+    esp_err_t         serverInitErr;
+    httpd_handle_t    serverHandle;
+    bool              serverInitCalled;
 } LoopbackTestContext_t;
 
 // -----------------------------------------------------------------------------
@@ -32,6 +35,7 @@ static esp_err_t loadStorage(IotCommStorageItemType_t type, void* dest, size_t d
 static esp_err_t saveStorage(IotCommStorageItemType_t type, const void* data, size_t dataLen, void* ctx);
 static esp_err_t getRootPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void* ctx);
 static void eventHandler(IotCommEvent_t* event);
+static esp_err_t serverInitHandler(httpd_handle_t server, void* ctx);
 static bool sendAll(int socketFd, const char* data, size_t len);
 static void loopbackClientTask(void* arg);
 
@@ -64,7 +68,11 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(&config));
     TEST_ASSERT_EQUAL(ESP_OK, iotCommVerifyRootUserSignature(hash, signature));
     serverConfig.listenPort = 18080;
+    serverConfig.serverInitHandler = serverInitHandler;
+    serverConfig.serverInitHandlerCtx = &testCtx;
     TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    TEST_ASSERT_TRUE(testCtx.serverInitCalled);
+    TEST_ASSERT_NOT_NULL(testCtx.serverHandle);
     TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(nullptr));
     TEST_ASSERT_TRUE(iotCommIsServerRunning());
     testCtx.done = xSemaphoreCreateBinary();
@@ -73,6 +81,11 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(testCtx.done, pdMS_TO_TICKS(10000)));
     TEST_ASSERT_EQUAL(ESP_OK, testCtx.clientErr);
     iotCommStopServer();
+    testCtx.serverInitCalled = false;
+    testCtx.serverInitErr = ESP_FAIL;
+    TEST_ASSERT_EQUAL(ESP_FAIL, iotCommStartServer(&serverConfig));
+    TEST_ASSERT_TRUE(testCtx.serverInitCalled);
+    TEST_ASSERT_FALSE(iotCommIsServerRunning());
     iotCommDeinit();
     vSemaphoreDelete(testCtx.done);
     p256KeyPairDone(&testCtx.rootKey);
@@ -134,6 +147,15 @@ static esp_err_t getRootPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void*
 static void eventHandler(IotCommEvent_t* event)
 {
     (void)event;
+}
+
+static esp_err_t serverInitHandler(httpd_handle_t server, void* ctx)
+{
+    LoopbackTestContext_t* testCtx = static_cast<LoopbackTestContext_t*>(ctx);
+
+    testCtx->serverHandle = server;
+    testCtx->serverInitCalled = true;
+    return testCtx->serverInitErr;
 }
 
 static bool sendAll(int socketFd, const char* data, size_t len)

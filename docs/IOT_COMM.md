@@ -28,6 +28,16 @@ The usual setup looks like this:
 
 After successful initialization, repeated `iotCommInit()` calls return `ESP_OK` and retain the original configuration.
 
+## Server Initialization Handler
+
+`IotCommServerConfig_t` can provide a `serverInitHandler` to register application-specific HTTP handlers after IoT-Comm has registered
+its built-in handlers. Return an error to abort startup; IoT-Comm stops the HTTP server before `iotCommStartServer()` returns. The
+application owns any state used by its handlers and may release it after `iotCommStopServer()` or a failed `iotCommStartServer()` call
+returns.
+
+The init handler runs while IoT-Comm holds its internal server lock, so it must not call any `iotComm*` API. It may use the provided
+`httpd_handle_t` to register HTTP handlers.
+
 ## Reverse Proxies
 
 By default, client identity, challenge binding, and rate limiting use the direct TCP peer address. The component considers

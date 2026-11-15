@@ -201,12 +201,18 @@ typedef struct IotCommConfig_s {
     void*                                handlerCtx;
 } IotCommConfig_t;
 
+// Registers application-specific HTTP handlers after the built-in handlers are ready. A non-ESP_OK result aborts startup.
+// Runs while the server lock is held; do not call iotComm* APIs from this callback.
+typedef esp_err_t (*IotCommServerInitHandler_t)(httpd_handle_t server, void* ctx);
+
 // Defines the network settings for the embedded server.
 typedef struct IotCommServerConfig_s {
-    uint16_t listenPort;
-    uint16_t udpListenPort;
-    uint16_t maxConnections;
-    uint32_t maxPacketSize;
+    uint16_t                   listenPort;
+    uint16_t                   udpListenPort;
+    uint16_t                   maxConnections;
+    uint32_t                   maxPacketSize;
+    IotCommServerInitHandler_t serverInitHandler;
+    void*                      serverInitHandlerCtx;
 } IotCommServerConfig_t;
 
 // Reports prerequisites that must be met before the authenticated server can be started.
@@ -300,6 +306,8 @@ static inline IotCommServerConfig_t iotCommDefaultServerConfig()
     cfg.listenPort = 80;
     cfg.udpListenPort = 0;
     cfg.maxConnections = IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2; // +2 for unauthenticated session
+    cfg.serverInitHandler = nullptr;
+    cfg.serverInitHandlerCtx = nullptr;
 
     return cfg;
 }
