@@ -63,8 +63,8 @@ TEST_CASE("iotCommDefaultServerConfig returns expected defaults", "[iot_comm]")
     TEST_ASSERT_EQUAL_UINT16(80, cfg.listenPort);
     TEST_ASSERT_EQUAL_UINT16(0, cfg.udpListenPort);
     TEST_ASSERT_EQUAL_UINT16(IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2, cfg.maxConnections);
-    TEST_ASSERT_NULL(cfg.serverInitHandler);
-    TEST_ASSERT_NULL(cfg.serverInitHandlerCtx);
+    TEST_ASSERT_NULL(cfg.extraUriHandlers);
+    TEST_ASSERT_EQUAL_UINT32(0, cfg.extraUriHandlersCount);
 }
 
 TEST_CASE("iotCommGetDeviceIdentityPublicKey requires initialized runtime", "[iot_comm]")

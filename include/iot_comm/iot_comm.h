@@ -5,6 +5,7 @@
 #include "provisioning/wifi.h" // IWYU pragma: keep
 #include "utils/network.h"
 #include <esp_err.h>
+#include <esp_http_server.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -201,18 +202,15 @@ typedef struct IotCommConfig_s {
     void*                                handlerCtx;
 } IotCommConfig_t;
 
-// Registers application-specific HTTP handlers after the built-in handlers are ready. A non-ESP_OK result aborts startup.
-// Runs while the server lock is held; do not call iotComm* APIs from this callback.
-typedef esp_err_t (*IotCommServerInitHandler_t)(httpd_handle_t server, void* ctx);
-
 // Defines the network settings for the embedded server.
 typedef struct IotCommServerConfig_s {
-    uint16_t                   listenPort;
-    uint16_t                   udpListenPort;
-    uint16_t                   maxConnections;
-    uint32_t                   maxPacketSize;
-    IotCommServerInitHandler_t serverInitHandler;
-    void*                      serverInitHandlerCtx;
+    uint16_t           listenPort;
+    uint16_t           udpListenPort;
+    uint16_t           maxConnections;
+    uint32_t           maxPacketSize;
+    // Application HTTP handlers registered after the built-in handlers. URI strings and contexts must remain valid while the server runs.
+    const httpd_uri_t* extraUriHandlers;
+    size_t             extraUriHandlersCount;
 } IotCommServerConfig_t;
 
 // Reports prerequisites that must be met before the authenticated server can be started.
@@ -306,8 +304,6 @@ static inline IotCommServerConfig_t iotCommDefaultServerConfig()
     cfg.listenPort = 80;
     cfg.udpListenPort = 0;
     cfg.maxConnections = IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2; // +2 for unauthenticated session
-    cfg.serverInitHandler = nullptr;
-    cfg.serverInitHandlerCtx = nullptr;
 
     return cfg;
 }

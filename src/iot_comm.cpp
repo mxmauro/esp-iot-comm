@@ -68,6 +68,8 @@ static const char* TAG = "IotComm";
 
 #define MAX_OUTPUT_FRAME_SIZE 4096
 
+#define BUILTIN_URI_HANDLERS_COUNT 6
+
 #define GB_STR_AND_SIZE(str) (str), (sizeof(str) - 1)
 
 // -----------------------------------------------------------------------------
@@ -433,7 +435,9 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     bool rootUserConfigured;
     esp_err_t err;
 
-    if (!(config && config->listenPort >= 1 && config->maxConnections >= 1))
+    if (!(config && config->listenPort >= 1 && config->maxConnections >= 1) ||
+        ((!config->extraUriHandlers) && config->extraUriHandlersCount != 0) ||
+        config->extraUriHandlersCount > UINT16_MAX - BUILTIN_URI_HANDLERS_COUNT)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -466,6 +470,7 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     httpdConfig = HTTPD_DEFAULT_CONFIG();
     httpdConfig.server_port = config->listenPort;
     httpdConfig.max_open_sockets = config->maxConnections;
+    httpdConfig.max_uri_handlers = static_cast<uint16_t>(BUILTIN_URI_HANDLERS_COUNT + config->extraUriHandlersCount);
     httpdConfig.core_id = tskNO_AFFINITY;
     httpdConfig.keep_alive_enable = true;
     httpdConfig.keep_alive_idle = 10;
@@ -530,9 +535,11 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
         uri.method = HTTP_OPTIONS;
         err = httpd_register_uri_handler(server, &uri);
     }
-    if (err == ESP_OK && config->serverInitHandler != nullptr)
+
+    // Setup custom URI handlers
+    for (size_t i = 0; err == ESP_OK && i < config->extraUriHandlersCount; i++)
     {
-        err = config->serverInitHandler(server, config->serverInitHandlerCtx);
+        err = httpd_register_uri_handler(server, &config->extraUriHandlers[i]);
     }
     if (err != ESP_OK)
     {

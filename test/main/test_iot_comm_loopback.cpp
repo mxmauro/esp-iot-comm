@@ -24,9 +24,7 @@ typedef struct LoopbackTestContext_s {
     TestStorageItem_t storage[3];
     SemaphoreHandle_t done;
     esp_err_t         clientErr;
-    esp_err_t         serverInitErr;
-    httpd_handle_t    serverHandle;
-    bool              serverInitCalled;
+    bool              extraUriCalled;
 } LoopbackTestContext_t;
 
 // -----------------------------------------------------------------------------
@@ -35,8 +33,9 @@ static esp_err_t loadStorage(IotCommStorageItemType_t type, void* dest, size_t d
 static esp_err_t saveStorage(IotCommStorageItemType_t type, const void* data, size_t dataLen, void* ctx);
 static esp_err_t getRootPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void* ctx);
 static void eventHandler(IotCommEvent_t* event);
-static esp_err_t serverInitHandler(httpd_handle_t server, void* ctx);
+static esp_err_t extraUriHandler(httpd_req_t* req);
 static bool sendAll(int socketFd, const char* data, size_t len);
+static bool receiveHttpResponse(int socketFd, char* response, size_t responseSize);
 static void loopbackClientTask(void* arg);
 
 // -----------------------------------------------------------------------------
@@ -46,6 +45,7 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     LoopbackTestContext_t testCtx = {};
     IotCommConfig_t config = iotCommDefaultConfig();
     IotCommServerConfig_t serverConfig = iotCommDefaultServerConfig();
+    httpd_uri_t extraUriHandlers[3] = {};
     uint8_t hash[P256_HASH_SIZE] = {};
     uint8_t signature[P256_SIGNATURE_SIZE] = {};
     esp_err_t err;
@@ -68,11 +68,16 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(&config));
     TEST_ASSERT_EQUAL(ESP_OK, iotCommVerifyRootUserSignature(hash, signature));
     serverConfig.listenPort = 18080;
-    serverConfig.serverInitHandler = serverInitHandler;
-    serverConfig.serverInitHandlerCtx = &testCtx;
+    for (size_t i = 0; i < sizeof(extraUriHandlers) / sizeof(extraUriHandlers[0]); i++)
+    {
+        extraUriHandlers[i].uri = (i == 2) ? "/extra/three" : (i == 1) ? "/extra/two" : "/extra/one";
+        extraUriHandlers[i].method = HTTP_GET;
+        extraUriHandlers[i].handler = extraUriHandler;
+        extraUriHandlers[i].user_ctx = &testCtx;
+    }
+    serverConfig.extraUriHandlers = extraUriHandlers;
+    serverConfig.extraUriHandlersCount = sizeof(extraUriHandlers) / sizeof(extraUriHandlers[0]);
     TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
-    TEST_ASSERT_TRUE(testCtx.serverInitCalled);
-    TEST_ASSERT_NOT_NULL(testCtx.serverHandle);
     TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(nullptr));
     TEST_ASSERT_TRUE(iotCommIsServerRunning());
     testCtx.done = xSemaphoreCreateBinary();
@@ -80,11 +85,11 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     TEST_ASSERT_EQUAL(pdPASS, xTaskCreate(loopbackClientTask, "iotcomm-client", 8192, &testCtx, 5, nullptr));
     TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(testCtx.done, pdMS_TO_TICKS(10000)));
     TEST_ASSERT_EQUAL(ESP_OK, testCtx.clientErr);
+    TEST_ASSERT_TRUE(testCtx.extraUriCalled);
     iotCommStopServer();
-    testCtx.serverInitCalled = false;
-    testCtx.serverInitErr = ESP_FAIL;
-    TEST_ASSERT_EQUAL(ESP_FAIL, iotCommStartServer(&serverConfig));
-    TEST_ASSERT_TRUE(testCtx.serverInitCalled);
+    serverConfig.extraUriHandlers = nullptr;
+    serverConfig.extraUriHandlersCount = 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
     TEST_ASSERT_FALSE(iotCommIsServerRunning());
     iotCommDeinit();
     vSemaphoreDelete(testCtx.done);
@@ -149,13 +154,12 @@ static void eventHandler(IotCommEvent_t* event)
     (void)event;
 }
 
-static esp_err_t serverInitHandler(httpd_handle_t server, void* ctx)
+static esp_err_t extraUriHandler(httpd_req_t* req)
 {
-    LoopbackTestContext_t* testCtx = static_cast<LoopbackTestContext_t*>(ctx);
+    LoopbackTestContext_t* testCtx = static_cast<LoopbackTestContext_t*>(req->user_ctx);
 
-    testCtx->serverHandle = server;
-    testCtx->serverInitCalled = true;
-    return testCtx->serverInitErr;
+    testCtx->extraUriCalled = true;
+    return httpd_resp_sendstr(req, "extra");
 }
 
 static bool sendAll(int socketFd, const char* data, size_t len)
@@ -172,6 +176,38 @@ static bool sendAll(int socketFd, const char* data, size_t len)
         len -= static_cast<size_t>(sent);
     }
     return true;
+}
+
+static bool receiveHttpResponse(int socketFd, char* response, size_t responseSize)
+{
+    size_t responseUsed = 0;
+
+    while (responseUsed < responseSize - 1)
+    {
+        char* bodyStart;
+        char* contentLength;
+        int responseLen = recv(socketFd, response + responseUsed, responseSize - 1 - responseUsed, 0);
+
+        if (responseLen <= 0)
+        {
+            return false;
+        }
+        responseUsed += static_cast<size_t>(responseLen);
+        response[responseUsed] = 0;
+        bodyStart = strstr(response, "\r\n\r\n");
+        contentLength = strstr(response, "Content-Length: ");
+        if (bodyStart && contentLength)
+        {
+            size_t expectedBodyLen = strtoul(contentLength + strlen("Content-Length: "), nullptr, 10);
+            size_t headerLen = static_cast<size_t>(bodyStart + 4 - response);
+
+            if (responseUsed >= headerLen + expectedBodyLen)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static void loopbackClientTask(void* arg)
@@ -191,7 +227,6 @@ static void loopbackClientTask(void* arg)
     size_t publicKeyB64Len = sizeof(publicKeyB64) - 1;
     int bodyLen = 0;
     int requestLen = 0;
-    size_t responseUsed = 0;
 
     testCtx->clientErr = ESP_FAIL;
     p256KeyPairInit(&ecdhKey);
@@ -215,6 +250,12 @@ static void loopbackClientTask(void* arg)
     {
         goto done;
     }
+    requestLen = snprintf(request, sizeof(request), "GET /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra"))
+    {
+        goto done;
+    }
     bodyLen = snprintf(body, sizeof(body), "{\"clientNonce\":\"%s\",\"clientPublicKey\":\"%s\"}", nonceB64, publicKeyB64);
     if (bodyLen <= 0 || static_cast<size_t>(bodyLen) >= sizeof(body))
     {
@@ -227,32 +268,8 @@ static void loopbackClientTask(void* arg)
     {
         goto done;
     }
-    while (responseUsed < sizeof(response) - 1)
-    {
-        char* bodyStart;
-        char* contentLength;
-        int responseLen = recv(socketFd, response + responseUsed, sizeof(response) - 1 - responseUsed, 0);
-
-        if (responseLen <= 0)
-        {
-            break;
-        }
-        responseUsed += static_cast<size_t>(responseLen);
-        response[responseUsed] = 0;
-        bodyStart = strstr(response, "\r\n\r\n");
-        contentLength = strstr(response, "Content-Length: ");
-        if (bodyStart && contentLength)
-        {
-            size_t expectedBodyLen = strtoul(contentLength + strlen("Content-Length: "), nullptr, 10);
-            size_t headerLen = static_cast<size_t>(bodyStart + 4 - response);
-
-            if (responseUsed >= headerLen + expectedBodyLen)
-            {
-                break;
-            }
-        }
-    }
-    if (strstr(response, "HTTP/1.1 200") && strstr(response, "serverPublicKey") && strstr(response, "deviceSignature"))
+    if (receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 200") &&
+        strstr(response, "serverPublicKey") && strstr(response, "deviceSignature"))
     {
         testCtx->clientErr = ESP_OK;
     }

@@ -28,15 +28,26 @@ The usual setup looks like this:
 
 After successful initialization, repeated `iotCommInit()` calls return `ESP_OK` and retain the original configuration.
 
-## Server Initialization Handler
+## Application HTTP Handlers
 
-`IotCommServerConfig_t` can provide a `serverInitHandler` to register application-specific HTTP handlers after IoT-Comm has registered
-its built-in handlers. Return an error to abort startup; IoT-Comm stops the HTTP server before `iotCommStartServer()` returns. The
-application owns any state used by its handlers and may release it after `iotCommStopServer()` or a failed `iotCommStartServer()` call
-returns.
+Set `IotCommServerConfig_t::extraUriHandlers` and `extraUriHandlersCount` to register application-specific HTTP handlers after
+IoT-Comm's built-in handlers. IoT-Comm reserves space for every supplied handler before starting, and stops the server if any handler
+cannot be registered.
 
-The init handler runs while IoT-Comm holds its internal server lock, so it must not call any `iotComm*` API. It may use the provided
-`httpd_handle_t` to register HTTP handlers.
+```cpp
+httpd_uri_t extraHandlers[1] = {};
+
+extraHandlers[0].uri = "/status";
+extraHandlers[0].method = HTTP_GET;
+extraHandlers[0].handler = serveStatus;
+extraHandlers[0].user_ctx = &appState;
+
+serverConfig.extraUriHandlers = extraHandlers;
+serverConfig.extraUriHandlersCount = 1;
+```
+
+The application owns the URI strings and contexts referenced by these entries. Keep them valid until `iotCommStopServer()` or a failed
+`iotCommStartServer()` call returns.
 
 ## Reverse Proxies
 
