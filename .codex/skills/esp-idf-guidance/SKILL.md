@@ -1,11 +1,13 @@
 ---
 name: esp-idf-guidance
-description: Apply shared ESP-IDF, FreeRTOS, and multi-core guidance when changing embedded application or component code.
+description: Apply ESP-IDF, FreeRTOS, and multi-core guidance when changing embedded application or component code.
 ---
 
 # ESP-IDF Guidance
 
-- Prefer established ESP-IDF types and error paths: `esp_err_t`, `ESP_OK`, `ESP_ERR_*`, and the local `ESP_RETURN_ON_*` patterns. Validate public or reusable helper inputs early and retain surrounding `assert(...)` checks.
+Use this skill with `embedded-cpp-style` and local component guidance.
+
+- Prefer established ESP-IDF types and error paths: `esp_err_t`, `ESP_OK`, `ESP_ERR_*`, and local `ESP_RETURN_ON_*` patterns. Validate public or reusable helper inputs early and retain surrounding `assert(...)` checks.
 - Preserve the component's existing FreeRTOS, ESP-IDF, MbedTLS, and utility-library patterns. Do not introduce exceptions, RTTI-dependent code, or heavyweight STL facilities into embedded paths unless the current design already relies on them.
 - Keep component registration, dependency declarations, target exclusions, embedded assets, and publish/include rules consistent with the existing CMake and component manifest files.
 
