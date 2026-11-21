@@ -1,11 +1,7 @@
 #pragma once
 
-#include "sdkconfig.h"
+#include "iot_comm/http/helpers.h"
 #include "iot_comm/iot_comm.h"
-#include "iot_comm/utils/network.h"
-#include <esp_err.h>
-#include <esp_http_server.h>
-#include <growable_buffer.h>
 
 // -----------------------------------------------------------------------------
 
@@ -13,24 +9,12 @@
 extern "C" {
 #endif // __cplusplus
 
-esp_err_t httpGetCORSOrigin(httpd_req_t* req, char** originOut);
-void httpFreeCORSOrigin(char* origin);
-
-esp_err_t httpSendDefaultCORS(httpd_req_t* req, const char* origin);
-esp_err_t httpSendPreflightResponse(httpd_req_t* req, const char* origin);
-
-esp_err_t httpGetRequestBody(GrowableBuffer_t* rawBodyBuffer, httpd_req_t* req);
-esp_err_t httpGetRequestQueryParams(GrowableBuffer_t* rawQueryParams, httpd_req_t* req, size_t maxSize = 1024);
-
-esp_err_t httpSendNotFound(httpd_req_t* req);
-esp_err_t httpSendInternalErrorResponse(httpd_req_t* req, esp_err_t err, const char* message);
-
+esp_err_t httpConfigureTrustedProxies(const IotCommProxyConfig_t* config);
+void httpClearTrustedProxies();
 bool httpValidateTrustedProxy(const IotCommTrustedProxy_t* proxy);
 bool httpIsTrustedProxy(const IPAddress_t* addr, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount);
 bool httpSelectClientIpFromXForwardedFor(const char* header, const IotCommTrustedProxy_t* trustedProxies,
                                          size_t trustedProxiesCount, IPAddress_t* out);
-bool httpGetClientIpFromRequest(httpd_req_t* req, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount,
-                                IPAddress_t* out);
 
 #ifdef __cplusplus
 }

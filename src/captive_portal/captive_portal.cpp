@@ -2,7 +2,7 @@
 #include "iot_comm/provisioning/wifi.h"
 #include "iot_comm/crypto/aes.h"
 #include "iot_comm/crypto/hkdf.h"
-#include "iot_comm/crypto/p256.h"
+#include "iot_comm/crypto/ecc.h"
 #include "iot_comm/crypto/sha.h"
 #include "iot_comm/crypto/utils.h"
 #include "http_helpers.h"
@@ -462,7 +462,7 @@ static esp_err_t handleProvision(httpd_req_t* req)
     aesInit(&aesCtx);
 
     // Get body
-    err = httpGetRequestBody(&rawBodyBuffer, req);
+    err = httpGetRequestBody(req, &rawBodyBuffer);
     if (err != ESP_OK)
     {
         goto done;

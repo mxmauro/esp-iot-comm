@@ -1,4 +1,5 @@
 #include <unity.h>
+#include <iot_comm/http/helpers.h>
 #include <iot_comm/iot_comm.h>
 #include "../../private_include/http_helpers.h"
 
@@ -13,6 +14,7 @@ TEST_CASE("iotCommDefaultConfig returns expected defaults", "[iot_comm]")
     TEST_ASSERT_EQUAL_UINT32(IOTCOMM_DEFAULT_MAX_RATE_LIMIT_SLOTS, cfg.rateLimit.maxSlots);
     TEST_ASSERT_EQUAL_UINT32(IOTCOMM_DEFAULT_RATE_LIMIT_WINDOW_TIME_MS, cfg.rateLimit.windowSizeInMs);
     TEST_ASSERT_EQUAL_UINT8(IOTCOMM_DEFAULT_MAX_RATE_LIMIT_REQUESTS_COUNT, cfg.rateLimit.maxRequestsPerWindow);
+    TEST_ASSERT_EQUAL_UINT8(9, cfg.rateLimit.maxRequestsPerWindow);
     TEST_ASSERT_EQUAL_UINT8(IOTCOMM_DEFAULT_MAX_RATE_LIMIT_CONSECUTIVE_FAILURES, cfg.rateLimit.maxConsecutiveAuthFailures);
 
     TEST_ASSERT_EQUAL_UINT32(IOTCOMM_DEFAULT_MAX_CHALLENGES_SLOTS, cfg.challenge.maxSlots);
@@ -54,6 +56,10 @@ TEST_CASE("trusted proxy rules validate CIDRs and resolve X-Forwarded-For", "[io
 
     TEST_ASSERT_TRUE(parseIP(&trustedProxy.network, "10.0.0.1"));
     TEST_ASSERT_FALSE(httpValidateTrustedProxy(&trustedProxy));
+
+    clientAddress.ip[0] = 0xa5;
+    TEST_ASSERT_FALSE(httpGetClientIpFromRequest(nullptr, &clientAddress));
+    TEST_ASSERT_EQUAL_HEX8(0xa5, clientAddress.ip[0]);
 }
 
 TEST_CASE("iotCommDefaultServerConfig returns expected defaults", "[iot_comm]")
@@ -67,10 +73,15 @@ TEST_CASE("iotCommDefaultServerConfig returns expected defaults", "[iot_comm]")
     TEST_ASSERT_EQUAL_UINT32(0, cfg.extraUriHandlersCount);
 }
 
-TEST_CASE("iotCommGetDeviceIdentityPublicKey requires initialized runtime", "[iot_comm]")
+TEST_CASE("device identity APIs require initialized runtime", "[iot_comm]")
 {
     uint8_t publicKey[P256_PUBLIC_KEY_SIZE];
+    uint8_t hash[P256_HASH_SIZE] = {};
+    uint8_t signature[P256_SIGNATURE_SIZE];
 
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, iotCommGetDeviceIdentityPublicKey(publicKey));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommGetDeviceIdentityPublicKey(nullptr));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, iotCommSignDeviceIdentityHash(hash, signature));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommSignDeviceIdentityHash(nullptr, signature));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommSignDeviceIdentityHash(hash, nullptr));
 }

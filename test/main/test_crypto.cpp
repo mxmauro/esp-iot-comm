@@ -1,11 +1,12 @@
 #include <unity.h>
 #include <iot_comm/crypto/aes.h>
 #include <iot_comm/crypto/hkdf.h>
-#include <iot_comm/crypto/p256.h>
+#include <iot_comm/crypto/ecc.h>
 #include <iot_comm/crypto/sha.h>
 #include <iot_comm/crypto/utils.h>
 #include <esp_log.h>
 #include <string.h>
+#include <type_traits>
 
 #if ESP_IDF_VERSION_MAJOR >= 6
     #include <psa/crypto.h>
@@ -15,6 +16,15 @@
 
 static constexpr size_t kChallengeCookieSize = 12;
 static constexpr size_t kChallengeNonceSize  = 16;
+
+static_assert(std::is_nothrow_destructible_v<AesContext>);
+static_assert(std::is_nothrow_destructible_v<P256KeyPair>);
+static_assert(std::is_nothrow_destructible_v<Sha256>);
+static_assert(std::is_nothrow_destructible_v<Sha512>);
+static_assert(noexcept(static_cast<AesContext*>(nullptr)->SetKey(nullptr, 0)));
+static_assert(noexcept(static_cast<P256KeyPair*>(nullptr)->GenerateEcdsaPair()));
+static_assert(noexcept(static_cast<Sha256*>(nullptr)->Start()));
+static_assert(noexcept(static_cast<Sha512*>(nullptr)->Start()));
 
 static void fillPattern(uint8_t* dest, size_t len, uint8_t seed)
 {
@@ -103,6 +113,46 @@ TEST_CASE("sha512 helpers hash incrementally", "[crypto]")
     sha512Done(&ctx);
 
     TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, out, sizeof(expected));
+}
+
+TEST_CASE("C++ crypto wrappers own and delegate to their C contexts", "[crypto C++ wrapper]")
+{
+    const uint8_t key[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                             0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+    const uint8_t iv[12] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b};
+    const uint8_t plaintext[] = {0x30, 0x31, 0x32, 0x33};
+    uint8_t ciphertext[sizeof(plaintext) + 16];
+    uint8_t decrypted[sizeof(plaintext)];
+    uint8_t hash[P256_HASH_SIZE];
+    uint8_t signature[P256_SIGNATURE_SIZE];
+
+    AesContext aes;
+    TEST_ASSERT_EQUAL(ESP_OK, aes.SetKey(key, sizeof(key)));
+    TEST_ASSERT_EQUAL(ESP_OK, aes.Encrypt(plaintext, sizeof(plaintext), iv, sizeof(iv), nullptr, 0, ciphertext));
+    TEST_ASSERT_EQUAL(ESP_OK, aes.Decrypt(ciphertext, sizeof(ciphertext), iv, sizeof(iv), nullptr, 0, decrypted));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(plaintext, decrypted, sizeof(plaintext));
+
+    Sha256 sha256Ctx;
+    IHash& sha256Hash = sha256Ctx;
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Hash.Start());
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Hash.Update(plaintext, sizeof(plaintext)));
+    TEST_ASSERT_EQUAL(ESP_OK, sha256Hash.Finish());
+    TEST_ASSERT_EQUAL_UINT32(SHA256_SIZE, sha256Hash.OutputSize());
+    TEST_ASSERT_NOT_NULL(sha256Hash.Output());
+
+    Sha512 sha512Ctx;
+    IHash& sha512Hash = sha512Ctx;
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Hash.Start());
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Hash.Update(plaintext, sizeof(plaintext)));
+    TEST_ASSERT_EQUAL(ESP_OK, sha512Hash.Finish());
+    TEST_ASSERT_EQUAL_UINT32(SHA512_SIZE, sha512Hash.OutputSize());
+    TEST_ASSERT_NOT_NULL(sha512Hash.Output());
+
+    fillPattern(hash, sizeof(hash), 0x40);
+    P256KeyPair pair;
+    TEST_ASSERT_EQUAL(ESP_OK, pair.GenerateEcdsaPair());
+    TEST_ASSERT_EQUAL(ESP_OK, pair.Sign(hash, signature));
+    TEST_ASSERT_EQUAL(ESP_OK, pair.Verify(hash, signature));
 }
 
 TEST_CASE("aesEncrypt and aesDecrypt roundtrip and detect tampering", "[crypto]")

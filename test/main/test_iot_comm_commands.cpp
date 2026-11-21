@@ -2,7 +2,7 @@
 #include <iot_comm/iot_comm.h>
 #include <iot_comm/crypto/aes.h>
 #include <iot_comm/crypto/hkdf.h>
-#include <iot_comm/crypto/p256.h>
+#include <iot_comm/crypto/ecc.h>
 #include <iot_comm/crypto/sha.h>
 #include <iot_comm/crypto/utils.h>
 #include <esp_event.h>

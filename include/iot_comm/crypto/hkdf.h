@@ -3,6 +3,7 @@
 #include "sdkconfig.h"
 #include <esp_idf_version.h>
 #include <esp_err.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #if ESP_IDF_VERSION_MAJOR < 6

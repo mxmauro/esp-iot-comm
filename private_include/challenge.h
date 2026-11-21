@@ -1,6 +1,6 @@
 #pragma once
 
-#include "iot_comm/crypto/p256.h"
+#include "iot_comm/crypto/ecc.h"
 #include "iot_comm/utils/network.h"
 #include <esp_err.h>
 

@@ -80,11 +80,19 @@ typedef enum IncomingBufferType_e {
     IncomingBufferTypeText
 } IncomingBufferType_t;
 
+typedef struct ExtraUriHandler_s {
+    IotCommHttpEndpointHandler_t handler;
+    void*                        ctx;
+    bool                         rateLimit;
+} ExtraUriHandler_t;
+
 typedef struct ServerContext_s {
-    uint32_t refCount;
-    size_t   maxPacketSize;
-    size_t   maxConnectionsCount;
-    uint16_t udpListenPort;
+    uint32_t           refCount;
+    size_t             maxPacketSize;
+    size_t             maxConnectionsCount;
+    uint16_t           udpListenPort;
+    ExtraUriHandler_t* extraUriHandlers;
+    size_t             extraUriHandlersCount;
     struct {
         Task_t   task;
         int      socketFd;
@@ -258,21 +266,18 @@ static IotCommEventHandler_t handler = nullptr;
 static void* handlerCtx = nullptr;
 static httpd_handle_t server = nullptr;
 static _Atomic(uint32_t) nextSessionId = {0};
-static IotCommTrustedProxy_t* trustedProxies = nullptr;
-static size_t trustedProxiesCount = 0;
 
 // -----------------------------------------------------------------------------
 
 static void iotCommDeinitNoLock();
 static void iotCommStopServerNoLock();
-static esp_err_t copyTrustedProxies(const IotCommProxyConfig_t* config);
-static void clearTrustedProxies();
 
 static esp_err_t serveWsInit(httpd_req_t* req);
 static esp_err_t serveWsAuth(httpd_req_t* req);
 static esp_err_t serveWsPreHandshake(httpd_req_t* req);
 static esp_err_t serveWs(httpd_req_t* req);
 static esp_err_t serveWsPacket(httpd_req_t* req);
+static esp_err_t serveExtraUri(httpd_req_t* req);
 static esp_err_t dispatchCommand(CommandContext_t* commandCtx);
 
 static esp_err_t handleCreateUser(CommandContext_t* commandCtx);
@@ -343,7 +348,8 @@ static esp_err_t deriveAuthEnvelopeKey(const uint8_t sharedSecret[P256_SHARED_SE
 static esp_err_t deriveTransportKeys(const uint8_t sessionMasterKey[SESSION_AES_KEY_LEN], const uint8_t* salt, size_t saltLen,
                                      const uint8_t* info, size_t infoLen, uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN]);
 
-static esp_err_t sendCORSPreflightResponse(httpd_req_t* req);
+static esp_err_t sendPreflightCORS(httpd_req_t* req);
+static esp_err_t sendCORS(httpd_req_t* req, char **originOut);
 
 static bool tryExtractWsTicketFromQuery(const char* query, char* ticketB64, size_t ticketB64Len, bool* selected);
 static bool tryExtractWsTicketFromAuthorization(httpd_req_t* req, char* ticketB64, size_t ticketB64Len, bool* selected);
@@ -354,7 +360,6 @@ esp_err_t iotCommInit(IotCommConfig_t* config)
 {
     AutoRWMutex lock(rwNtx, false);
     UsersConfig_t usersConfig;
-    uint8_t maxRequestsPerWindow;
     esp_err_t ret;
 
     if (handler)
@@ -372,7 +377,7 @@ esp_err_t iotCommInit(IotCommConfig_t* config)
 
     atomic_store_explicit(&nextSessionId, 1, memory_order_relaxed);
 
-    ESP_GOTO_ON_ERROR(copyTrustedProxies(&config->proxy), on_error, TAG, "Failed to configure trusted proxies");
+    ESP_GOTO_ON_ERROR(httpConfigureTrustedProxies(&config->proxy), on_error, TAG, "Failed to configure trusted proxies");
 
     // Initialize users manager
     memset(&usersConfig, 0, sizeof(usersConfig));
@@ -385,17 +390,7 @@ esp_err_t iotCommInit(IotCommConfig_t* config)
     ESP_GOTO_ON_ERROR(usersInit(&usersConfig), on_error, TAG, "Failed to initialize the user manager");
     ESP_GOTO_ON_ERROR(deviceIdentityInit(&config->storage), on_error, TAG, "Failed to initialize the device identity");
 
-    // The authentication flow is INIT+AUTH+WS so let's multiply the provided request limit by three.
-    maxRequestsPerWindow = config->rateLimit.maxRequestsPerWindow;
-    if (maxRequestsPerWindow < ((sizeof(maxRequestsPerWindow) << 8) - 1) / 3)
-    {
-        maxRequestsPerWindow *= 3;
-    }
-    else
-    {
-        maxRequestsPerWindow = static_cast<uint8_t>((sizeof(maxRequestsPerWindow) << 8) - 1);
-    }
-    ESP_GOTO_ON_ERROR(rateLimitInit(config->rateLimit.maxSlots, config->rateLimit.windowSizeInMs, maxRequestsPerWindow,
+    ESP_GOTO_ON_ERROR(rateLimitInit(config->rateLimit.maxSlots, config->rateLimit.windowSizeInMs, config->rateLimit.maxRequestsPerWindow,
                                     config->rateLimit.maxConsecutiveAuthFailures),
                       on_error, TAG, "Failed to initialize the rate-limit handler");
 
@@ -435,11 +430,19 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     bool rootUserConfigured;
     esp_err_t err;
 
-    if (!(config && config->listenPort >= 1 && config->maxConnections >= 1) ||
+    if ((!config) || config->listenPort < 1 || config->maxConnections < 1 ||
         ((!config->extraUriHandlers) && config->extraUriHandlersCount != 0) ||
-        config->extraUriHandlersCount > UINT16_MAX - BUILTIN_URI_HANDLERS_COUNT)
+        config->extraUriHandlersCount > UINT16_MAX - BUILTIN_URI_HANDLERS_COUNT ||
+        config->extraUriHandlersCount > static_cast<size_t>(-1) / sizeof(IotCommHttpEndpoint_t))
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < config->extraUriHandlersCount; i++)
+    {
+        if ((!config->extraUriHandlers[i].uri) || (!config->extraUriHandlers[i].handler))
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
     }
 
     if (!handler)
@@ -539,7 +542,12 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     // Setup custom URI handlers
     for (size_t i = 0; err == ESP_OK && i < config->extraUriHandlersCount; i++)
     {
-        err = httpd_register_uri_handler(server, &config->extraUriHandlers[i]);
+        memset(&uri, 0, sizeof(uri));
+        uri.uri = config->extraUriHandlers[i].uri;
+        uri.method = config->extraUriHandlers[i].method;
+        uri.handler = serveExtraUri;
+        uri.user_ctx = &serverCtx->extraUriHandlers[i];
+        err = httpd_register_uri_handler(server, &uri);
     }
     if (err != ESP_OK)
     {
@@ -910,6 +918,22 @@ esp_err_t iotCommGetDeviceIdentityPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SI
     return deviceIdentityGetPublicKey(publicKey);
 }
 
+esp_err_t iotCommSignDeviceIdentityHash(const uint8_t hash[P256_HASH_SIZE], uint8_t signature[P256_SIGNATURE_SIZE])
+{
+    AutoRWMutex lock(rwNtx, false);
+
+    if (!(hash && signature))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!handler)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return deviceIdentitySignHash(hash, signature);
+}
+
 // -----------------------------------------------------------------------------
 
 static void iotCommDeinitNoLock()
@@ -920,53 +944,10 @@ static void iotCommDeinitNoLock()
     rateLimitDeinit();
     deviceIdentityDeinit();
     usersDeinit();
-    clearTrustedProxies();
+    httpClearTrustedProxies();
 
     handler = nullptr;
     handlerCtx = nullptr;
-}
-
-static esp_err_t copyTrustedProxies(const IotCommProxyConfig_t* config)
-{
-    IotCommTrustedProxy_t* proxies;
-
-    if ((!config) || ((!config->trustedProxies) && config->trustedProxiesCount != 0) ||
-        config->trustedProxiesCount > static_cast<size_t>(-1) / sizeof(IotCommTrustedProxy_t))
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    for (size_t i = 0; i < config->trustedProxiesCount; i++)
-    {
-        if (!httpValidateTrustedProxy(&config->trustedProxies[i]))
-        {
-            return ESP_ERR_INVALID_ARG;
-        }
-    }
-    if (config->trustedProxiesCount == 0)
-    {
-        return ESP_OK;
-    }
-
-    proxies = static_cast<IotCommTrustedProxy_t*>(malloc(config->trustedProxiesCount * sizeof(IotCommTrustedProxy_t)));
-    if (!proxies)
-    {
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(proxies, config->trustedProxies, config->trustedProxiesCount * sizeof(IotCommTrustedProxy_t));
-    trustedProxies = proxies;
-    trustedProxiesCount = config->trustedProxiesCount;
-    return ESP_OK;
-}
-
-static void clearTrustedProxies()
-{
-    if (trustedProxies)
-    {
-        memset(trustedProxies, 0, trustedProxiesCount * sizeof(IotCommTrustedProxy_t));
-        free(trustedProxies);
-        trustedProxies = nullptr;
-    }
-    trustedProxiesCount = 0;
 }
 
 static void iotCommStopServerNoLock()
@@ -984,12 +965,51 @@ static void iotCommStopServerNoLock()
     }
 }
 
+static esp_err_t serveExtraUri(httpd_req_t* req)
+{
+    AutoRundownProtection rpLock(rp);
+    ExtraUriHandler_t* endpoint;
+    void* wrapperCtx;
+    esp_err_t err;
+
+    if (!rpLock.acquired())
+    {
+        ESP_LOGD(TAG, "Server shutting down.");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if ((!req) || (!(endpoint = static_cast<ExtraUriHandler_t*>(req->user_ctx))) || (!endpoint->handler))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (endpoint->rateLimit)
+    {
+        IPAddress_t clientAddr;
+
+        if (!httpGetClientIpFromRequest(req, &clientAddr))
+        {
+            ESP_LOGE(TAG, "Failed to determine the client's IP address.");
+            return httpSendInternalErrorResponse(req, ESP_FAIL, nullptr);
+        }
+        if (rateLimitIsAddressBlocked(&clientAddr) || !rateLimitCheckRequest(&clientAddr))
+        {
+            return httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
+        }
+    }
+
+    wrapperCtx = req->user_ctx;
+    req->user_ctx = endpoint->ctx;
+    err = endpoint->handler(req);
+    req->user_ctx = wrapperCtx;
+    return err;
+}
+
 static esp_err_t serveWsInit(httpd_req_t* req)
 {
     AutoRundownProtection rpLock(rp);
-    esp_err_t err;
     ServeWsInitContext_t* ctx;
     ServerContext_t* serverCtx;
+    lightstd::string originHdr;
+    esp_err_t err;
 
     if (!rpLock.acquired())
     {
@@ -1006,7 +1026,7 @@ static esp_err_t serveWsInit(httpd_req_t* req)
 
     if (req->method == HTTP_OPTIONS)
     {
-        return sendCORSPreflightResponse(req);
+        return sendPreflightCORS(req);
     }
 
     ctx = static_cast<ServeWsInitContext_t*>(malloc(sizeof(ServeWsInitContext_t)));
@@ -1020,17 +1040,13 @@ static esp_err_t serveWsInit(httpd_req_t* req)
     ctx->respBody = GB_STATIC_INIT;
     p256KeyPairInit(&ctx->ecdhKeyPair);
 
-    err = httpGetCORSOrigin(req, &ctx->corsOrigin);
-    if (err == ESP_OK)
-    {
-        err = httpSendDefaultCORS(req, ctx->corsOrigin);
-    }
+    err = sendCORS(req, &ctx->corsOrigin);
     if (err != ESP_OK)
     {
         goto done;
     }
 
-    if (!httpGetClientIpFromRequest(req, trustedProxies, trustedProxiesCount, &ctx->remoteAddr))
+    if (!httpGetClientIpFromRequest(req, &ctx->remoteAddr))
     {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
@@ -1054,7 +1070,7 @@ static esp_err_t serveWsInit(httpd_req_t* req)
         err = httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, nullptr);
         goto done;
     }
-    err = httpGetRequestBody(&ctx->reqBody, req);
+    err = httpGetRequestBody(req, &ctx->reqBody);
     if (err != ESP_OK)
     {
         goto done;
@@ -1178,7 +1194,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
 
     if (req->method == HTTP_OPTIONS)
     {
-        return sendCORSPreflightResponse(req);
+        return sendPreflightCORS(req);
     }
 
     ctx = static_cast<ServeWsAuthContext_t*>(malloc(sizeof(ServeWsAuthContext_t)));
@@ -1194,17 +1210,13 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
     p256KeyPairInit(&ctx->ecdhKeyPair);
     aesInit(&ctx->aesCtx);
 
-    err = httpGetCORSOrigin(req, &ctx->corsOrigin);
-    if (err == ESP_OK)
-    {
-        err = httpSendDefaultCORS(req, ctx->corsOrigin);
-    }
+    err = sendCORS(req, &ctx->corsOrigin);
     if (err != ESP_OK)
     {
         goto done;
     }
 
-    if (!httpGetClientIpFromRequest(req, trustedProxies, trustedProxiesCount, &ctx->remoteAddr))
+    if (!httpGetClientIpFromRequest(req, &ctx->remoteAddr))
     {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
@@ -1228,7 +1240,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
         err = httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, nullptr);
         goto done;
     }
-    err = httpGetRequestBody(&ctx->reqBody, req);
+    err = httpGetRequestBody(req, &ctx->reqBody);
     if (err != ESP_OK)
     {
         goto done;
@@ -1493,7 +1505,7 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
 
     // Prepare
     // Get request IP address
-    if (!httpGetClientIpFromRequest(req, trustedProxies, trustedProxiesCount, &ctx->remoteAddr))
+    if (!httpGetClientIpFromRequest(req, &ctx->remoteAddr))
     {
         ESP_LOGE(TAG, "Failed to determine the client's IP address.");
         err = ESP_FAIL;
@@ -1514,7 +1526,7 @@ static esp_err_t serveWsPreHandshake(httpd_req_t* req)
     }
 
     // Read request quey
-    err = httpGetRequestQueryParams(&ctx->reqQueryParams, req, MAX_QUERY_SIZE);
+    err = httpGetRequestQueryParams(req, MAX_QUERY_SIZE, &ctx->reqQueryParams);
     if (err != ESP_OK)
     {
         if (err == ESP_ERR_INVALID_SIZE)
@@ -1712,7 +1724,7 @@ static esp_err_t serveWs(httpd_req_t* req)
     switch (req->method)
     {
         case HTTP_OPTIONS:
-            err = sendCORSPreflightResponse(req);
+            err = sendPreflightCORS(req);
             if (err != ESP_OK)
             {
                 ESP_LOGD(TAG, "Failed to send the WebSocket CORS preflight response. Error: %d.", err);
@@ -2741,11 +2753,29 @@ static ServerContext_t* createServerCtx(IotCommServerConfig_t* config)
     }
     memset(serverCtx, 0, sizeof(ServerContext_t));
     serverCtx->maxConnectionsCount = static_cast<size_t>(config->maxConnections);
-    serverCtx->maxPacketSize = (config->maxPacketSize > MIN_WS_PACKET_SIZE) ? static_cast<size_t>(config->maxPacketSize) : MIN_WS_PACKET_SIZE;
+    serverCtx->maxPacketSize = (config->maxPacketSize > MIN_WS_PACKET_SIZE) ? static_cast<size_t>(config->maxPacketSize)
+                                                                            : MIN_WS_PACKET_SIZE;
     serverCtx->udpListenPort = config->udpListenPort;
     serverCtx->refCount = 1;
     serverCtx->udp.socketFd = -1;
     portMUX_INITIALIZE(&serverCtx->sessions.mux);
+    if (config->extraUriHandlersCount > 0)
+    {
+        serverCtx->extraUriHandlers = static_cast<ExtraUriHandler_t*>(malloc(config->extraUriHandlersCount * sizeof(ExtraUriHandler_t)));
+        if (!serverCtx->extraUriHandlers)
+        {
+            memset(serverCtx, 0, sizeof(ServerContext_t));
+            free(serverCtx);
+            return nullptr;
+        }
+        for (size_t i = 0; i < config->extraUriHandlersCount; i++)
+        {
+            serverCtx->extraUriHandlers[i].handler = config->extraUriHandlers[i].handler;
+            serverCtx->extraUriHandlers[i].ctx = config->extraUriHandlers[i].ctx;
+            serverCtx->extraUriHandlers[i].rateLimit = config->extraUriHandlers[i].rateLimit;
+        }
+        serverCtx->extraUriHandlersCount = config->extraUriHandlersCount;
+    }
 
     // Done
     return serverCtx;
@@ -2778,6 +2808,11 @@ static void decrementServerCtxRefCount(ServerContext_t* serverCtx)
         {
             memset(serverCtx->udp.rxBuffer, 0, serverCtx->maxPacketSize);
             free(serverCtx->udp.rxBuffer);
+        }
+        if (serverCtx->extraUriHandlers)
+        {
+            memset(serverCtx->extraUriHandlers, 0, serverCtx->extraUriHandlersCount * sizeof(ExtraUriHandler_t));
+            free(serverCtx->extraUriHandlers);
         }
         memset(serverCtx, 0, sizeof(ServerContext_t));
         free(serverCtx);
@@ -3446,19 +3481,40 @@ static esp_err_t deriveTransportKeys(const uint8_t sessionMasterKey[SESSION_AES_
                                2 * AES_KEY_LEN + 2 * SESSION_IV_LEN);
 }
 
-static esp_err_t sendCORSPreflightResponse(httpd_req_t* req)
+static esp_err_t sendPreflightCORS(httpd_req_t* req)
 {
-    char* corsOrigin = nullptr;
+    lightstd::string origin;
     esp_err_t err;
 
-    err = httpGetCORSOrigin(req, &corsOrigin);
+    err = httpGetCORSOrigin(req, origin);
     if (err == ESP_OK)
     {
-        err = httpSendPreflightResponse(req, corsOrigin);
+        err = httpd_resp_set_status(req, "204 No Content");
+        if (err == ESP_OK)
+        {
+            err = httpSendCORSHeaders(req, origin.c_str(), "GET,POST,OPTIONS", "Content-Type, Authorization");
+            if (err == ESP_OK)
+            {
+                err = httpd_resp_send(req, nullptr, 0);
+            }
+            }
     }
 
     // Done
-    httpFreeCORSOrigin(corsOrigin);
+    return err;
+}
+
+static esp_err_t sendCORS(httpd_req_t* req, char **originOut)
+{
+    esp_err_t err;
+
+    err = httpGetCORSOrigin(req, originOut);
+    if (err == ESP_OK)
+    {
+        err = httpSendCORSHeaders(req, *originOut, "GET,POST,OPTIONS", "Content-Type, Authorization");
+    }
+
+    // Done
     return err;
 }
 

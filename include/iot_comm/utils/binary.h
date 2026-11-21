@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 // -----------------------------------------------------------------------------
@@ -44,7 +45,11 @@ bool br_read_be64(binary_reader_t* br, uint64_t* value);
 binary_writer_t bw_init(uint8_t* data, size_t maxDataLen);
 
 // Writes a length-prefixed string to the output buffer.
+#ifdef __cplusplus
 bool bw_write_str(binary_writer_t* bw, const char* value, size_t valueLen = static_cast<size_t>(-1));
+#else
+bool bw_write_str(binary_writer_t* bw, const char* value, size_t valueLen);
+#endif // __cplusplus
 // Writes a fixed-size blob to the output buffer.
 bool bw_write_blob(binary_writer_t* bw, const uint8_t* value, size_t size);
 // Writes a single byte to the output buffer.

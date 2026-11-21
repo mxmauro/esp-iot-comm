@@ -1,9 +1,10 @@
 #pragma once
 
 #include "iot_comm/utils/network.h"
-#include "iot_comm/crypto/p256.h"
+#include "iot_comm/crypto/ecc.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
+#include <stdbool.h>
 
 // -----------------------------------------------------------------------------
 

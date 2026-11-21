@@ -5,6 +5,10 @@
 
 static bool getIpFromPeer(int sockfd, IPAddress_t* out);
 
+static IotCommTrustedProxy_t* trustedProxies = nullptr;
+static size_t trustedProxiesCount = 0;
+static bool trustedProxiesConfigured = false;
+
 // -----------------------------------------------------------------------------
 
 esp_err_t httpGetCORSOrigin(httpd_req_t* req, char** originOut)
@@ -42,6 +46,46 @@ esp_err_t httpGetCORSOrigin(httpd_req_t* req, char** originOut)
     return ESP_OK;
 }
 
+
+#ifdef __cplusplus
+esp_err_t httpGetCORSOrigin(httpd_req_t* req, lightstd::string &originOut)
+{
+    size_t originLen;
+    char* origin;
+    esp_err_t err;
+
+    assert(req);
+
+    originOut.clear();
+
+    originLen = httpd_req_get_hdr_value_len(req, "Origin");
+    if (originLen == 0)
+    {
+        return ESP_OK;
+    }
+
+    if (!originOut.reserve(originLen))
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = httpd_req_get_hdr_value_str(req, "Origin", originOut.data(), originLen + 1);
+    if (err != ESP_OK)
+    {
+        originOut.clear();
+        return err;
+    }
+
+    if (!originOut.resize(originLen))
+    {
+        originOut.clear();
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+#endif // __cplusplus
+
 void httpFreeCORSOrigin(char* origin)
 {
     if (origin)
@@ -51,7 +95,7 @@ void httpFreeCORSOrigin(char* origin)
     }
 }
 
-esp_err_t httpSendDefaultCORS(httpd_req_t* req, const char* origin)
+esp_err_t httpSendCORSHeaders(httpd_req_t* req, const char* origin, const char* allowMethods, const char* allowHeaders)
 {
     esp_err_t err;
 
@@ -62,50 +106,22 @@ esp_err_t httpSendDefaultCORS(httpd_req_t* req, const char* origin)
     {
         err = httpd_resp_set_hdr(req, "Vary", "Origin");
     }
-    if (err == ESP_OK)
+    if (err == ESP_OK && origin && *origin != 0)
     {
         err = httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
     }
+    if (err == ESP_OK && allowMethods && *allowMethods != 0)
+    {
+        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", allowMethods);
+    }
+    if (err == ESP_OK && allowHeaders && *allowHeaders != 0)
+    {
+        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", allowHeaders);
+    }
     return err;
 }
 
-esp_err_t httpSendPreflightResponse(httpd_req_t* req, const char* origin)
-{
-    esp_err_t err;
-
-    assert(req);
-
-    err = httpd_resp_set_status(req, "204 No Content");
-    if (err == ESP_OK)
-    {
-        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", (origin && *origin != 0) ? origin : "*");
-    }
-    if (err == ESP_OK)
-    {
-        err = httpd_resp_set_hdr(req, "Vary", "Origin");
-    }
-    if (err == ESP_OK)
-    {
-        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-        if (err == ESP_OK)
-        {
-            err = httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
-            if (err == ESP_OK)
-            {
-                err = httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
-                if (err == ESP_OK)
-                {
-                    err = httpd_resp_send(req, nullptr, 0);
-                }
-            }
-        }
-    }
-
-    // Done
-    return err;
-}
-
-esp_err_t httpGetRequestBody(GrowableBuffer_t* rawBodyBuffer, httpd_req_t* req)
+esp_err_t httpGetRequestBody(httpd_req_t* req, GrowableBuffer_t* rawBodyBuffer)
 {
     gbReset(rawBodyBuffer, false);
     if (req->content_len > 0)
@@ -134,7 +150,7 @@ esp_err_t httpGetRequestBody(GrowableBuffer_t* rawBodyBuffer, httpd_req_t* req)
     return ESP_OK;
 }
 
-esp_err_t httpGetRequestQueryParams(GrowableBuffer_t* rawQueryParams, httpd_req_t* req, size_t maxSize)
+esp_err_t httpGetRequestQueryParams(httpd_req_t* req, size_t maxSize, GrowableBuffer_t* rawQueryParams)
 {
     char* rawQuery;
     size_t queryLen;
@@ -233,6 +249,52 @@ bool httpValidateTrustedProxy(const IotCommTrustedProxy_t* proxy)
     return true;
 }
 
+esp_err_t httpConfigureTrustedProxies(const IotCommProxyConfig_t* config)
+{
+    IotCommTrustedProxy_t* proxies;
+
+    if (trustedProxiesConfigured || (!config) || ((!config->trustedProxies) && config->trustedProxiesCount != 0) ||
+        config->trustedProxiesCount > static_cast<size_t>(-1) / sizeof(IotCommTrustedProxy_t))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < config->trustedProxiesCount; i++)
+    {
+        if (!httpValidateTrustedProxy(&config->trustedProxies[i]))
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    if (config->trustedProxiesCount == 0)
+    {
+        trustedProxiesConfigured = true;
+        return ESP_OK;
+    }
+
+    proxies = static_cast<IotCommTrustedProxy_t*>(malloc(config->trustedProxiesCount * sizeof(IotCommTrustedProxy_t)));
+    if (!proxies)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(proxies, config->trustedProxies, config->trustedProxiesCount * sizeof(IotCommTrustedProxy_t));
+    trustedProxies = proxies;
+    trustedProxiesCount = config->trustedProxiesCount;
+    trustedProxiesConfigured = true;
+    return ESP_OK;
+}
+
+void httpClearTrustedProxies()
+{
+    if (trustedProxies)
+    {
+        memset(trustedProxies, 0, trustedProxiesCount * sizeof(IotCommTrustedProxy_t));
+        free(trustedProxies);
+        trustedProxies = nullptr;
+    }
+    trustedProxiesCount = 0;
+    trustedProxiesConfigured = false;
+}
+
 bool httpIsTrustedProxy(const IPAddress_t* addr, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount)
 {
     if ((!addr) || (!trustedProxies))
@@ -308,15 +370,16 @@ bool httpSelectClientIpFromXForwardedFor(const char* header, const IotCommTruste
     return false;
 }
 
-bool httpGetClientIpFromRequest(httpd_req_t* req, const IotCommTrustedProxy_t* trustedProxies, size_t trustedProxiesCount,
-                                IPAddress_t* out)
+bool httpGetClientIpFromRequest(httpd_req_t* req, IPAddress_t* out)
 {
     IPAddress_t peerAddr;
     char hdr[256];
     esp_err_t err;
 
-    assert(req);
-    assert(out);
+    if ((!req) || (!out) || (!trustedProxiesConfigured))
+    {
+        return false;
+    }
 
     if (!getIpFromPeer(httpd_req_to_sockfd(req), &peerAddr))
     {

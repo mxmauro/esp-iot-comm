@@ -4,6 +4,7 @@
 #include <esp_idf_version.h>
 #include <esp_err.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #if ESP_IDF_VERSION_MAJOR >= 6
@@ -60,4 +61,54 @@ esp_err_t aesDecrypt(AesContext_t* ctx, const uint8_t* ciphertext, size_t cipher
 
 #ifdef __cplusplus
 }
+#endif // __cplusplus
+
+// -----------------------------------------------------------------------------
+
+#ifdef __cplusplus
+
+class AesContext
+{
+public:
+    AesContext() noexcept
+    {
+        aesInit(&ctx);
+    }
+    AesContext(const AesContext&) noexcept = delete;
+    AesContext(AesContext&&) noexcept = delete;
+
+    ~AesContext() noexcept
+    {
+        aesDone(&ctx);
+    }
+
+    AesContext& operator=(const AesContext&) noexcept = delete;
+    AesContext& operator=(AesContext&&) noexcept = delete;
+
+    esp_err_t SetKey(const uint8_t* key, size_t keyLen) noexcept
+    {
+        return aesSetKey(&ctx, key, keyLen);
+    }
+
+    esp_err_t Encrypt(const uint8_t* plaintext, size_t plaintextLen, const uint8_t* iv, size_t ivLen, const uint8_t* aad,
+                      size_t aadLen, uint8_t* ciphertextOut) noexcept
+    {
+        return aesEncrypt(&ctx, plaintext, plaintextLen, iv, ivLen, aad, aadLen, ciphertextOut);
+    }
+
+    esp_err_t Decrypt(const uint8_t* ciphertext, size_t ciphertextLen, const uint8_t* iv, size_t ivLen, const uint8_t* aad,
+                      size_t aadLen, uint8_t* plaintextOut) noexcept
+    {
+        return aesDecrypt(&ctx, ciphertext, ciphertextLen, iv, ivLen, aad, aadLen, plaintextOut);
+    }
+
+    AesContext_t& NativeHandle() noexcept
+    {
+        return ctx;
+    }
+
+private:
+    AesContext_t ctx;
+};
+
 #endif // __cplusplus

@@ -1,9 +1,10 @@
 #include <unity.h>
 #include <iot_comm/iot_comm.h>
-#include <iot_comm/crypto/p256.h>
+#include <iot_comm/crypto/ecc.h>
 #include <iot_comm/crypto/utils.h>
 #include <esp_event.h>
 #include <esp_netif.h>
+#include <freertos/event_groups.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -25,7 +26,28 @@ typedef struct LoopbackTestContext_s {
     SemaphoreHandle_t done;
     esp_err_t         clientErr;
     bool              extraUriCalled;
+    size_t            extraUriCalls;
+    EventGroupHandle_t multiCoreSync;
+    esp_err_t          multiCoreClientErr[2];
+    BaseType_t         multiCoreClientCore[2];
+    size_t             multiCoreActiveRequests;
+    size_t             multiCoreMaxActiveRequests;
 } LoopbackTestContext_t;
+
+typedef struct MultiCoreRequestTaskArgs_s {
+    LoopbackTestContext_t* testCtx;
+    EventBits_t            readyBit;
+    EventBits_t            doneBit;
+    size_t                 index;
+} MultiCoreRequestTaskArgs_t;
+
+// -----------------------------------------------------------------------------
+
+static constexpr EventBits_t kMultiCoreStartBit = BIT0;
+static constexpr EventBits_t kMultiCoreClient0ReadyBit = BIT1;
+static constexpr EventBits_t kMultiCoreClient1ReadyBit = BIT2;
+static constexpr EventBits_t kMultiCoreClient0DoneBit = BIT3;
+static constexpr EventBits_t kMultiCoreClient1DoneBit = BIT4;
 
 // -----------------------------------------------------------------------------
 
@@ -34,9 +56,11 @@ static esp_err_t saveStorage(IotCommStorageItemType_t type, const void* data, si
 static esp_err_t getRootPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void* ctx);
 static void eventHandler(IotCommEvent_t* event);
 static esp_err_t extraUriHandler(httpd_req_t* req);
+static void freeTestStorage(LoopbackTestContext_t* testCtx);
 static bool sendAll(int socketFd, const char* data, size_t len);
 static bool receiveHttpResponse(int socketFd, char* response, size_t responseSize);
 static void loopbackClientTask(void* arg);
+static void multiCoreRequestTask(void* arg);
 
 // -----------------------------------------------------------------------------
 
@@ -45,9 +69,12 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     LoopbackTestContext_t testCtx = {};
     IotCommConfig_t config = iotCommDefaultConfig();
     IotCommServerConfig_t serverConfig = iotCommDefaultServerConfig();
-    httpd_uri_t extraUriHandlers[3] = {};
+    IotCommHttpEndpoint_t extraUriHandlers[4] = {};
     uint8_t hash[P256_HASH_SIZE] = {};
     uint8_t signature[P256_SIGNATURE_SIZE] = {};
+    uint8_t identityPublicKey[P256_PUBLIC_KEY_SIZE] = {};
+    uint8_t identitySignature[P256_SIGNATURE_SIZE] = {};
+    P256KeyPair_t identityVerifier = {};
     esp_err_t err;
 
     err = esp_event_loop_create_default();
@@ -65,19 +92,28 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     config.storage.load = loadStorage;
     config.storage.save = saveStorage;
     config.storage.ctx = &testCtx;
+    config.rateLimit.maxRequestsPerWindow = 4;
     TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(&config));
     TEST_ASSERT_EQUAL(ESP_OK, iotCommVerifyRootUserSignature(hash, signature));
+    p256KeyPairInit(&identityVerifier);
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommGetDeviceIdentityPublicKey(identityPublicKey));
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommSignDeviceIdentityHash(hash, identitySignature));
+    TEST_ASSERT_EQUAL(ESP_OK, p256LoadPublicKey(&identityVerifier, identityPublicKey));
+    TEST_ASSERT_EQUAL(ESP_OK, ecdsaVerify(&identityVerifier, hash, identitySignature));
+    p256KeyPairDone(&identityVerifier);
     serverConfig.listenPort = 18080;
     for (size_t i = 0; i < sizeof(extraUriHandlers) / sizeof(extraUriHandlers[0]); i++)
     {
-        extraUriHandlers[i].uri = (i == 2) ? "/extra/three" : (i == 1) ? "/extra/two" : "/extra/one";
+        extraUriHandlers[i].uri = (i == 3) ? "/extra/multicore" : (i == 2) ? "/extra/three" : (i == 1) ? "/extra/two" : "/extra/one";
         extraUriHandlers[i].method = HTTP_GET;
         extraUriHandlers[i].handler = extraUriHandler;
-        extraUriHandlers[i].user_ctx = &testCtx;
+        extraUriHandlers[i].ctx = &testCtx;
+        extraUriHandlers[i].rateLimit = i == 1;
     }
     serverConfig.extraUriHandlers = extraUriHandlers;
     serverConfig.extraUriHandlersCount = sizeof(extraUriHandlers) / sizeof(extraUriHandlers[0]);
     TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    extraUriHandlers[2].ctx = nullptr;
     TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(nullptr));
     TEST_ASSERT_TRUE(iotCommIsServerRunning());
     testCtx.done = xSemaphoreCreateBinary();
@@ -86,22 +122,92 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(testCtx.done, pdMS_TO_TICKS(10000)));
     TEST_ASSERT_EQUAL(ESP_OK, testCtx.clientErr);
     TEST_ASSERT_TRUE(testCtx.extraUriCalled);
+    TEST_ASSERT_EQUAL_UINT32(4, testCtx.extraUriCalls);
     iotCommStopServer();
     serverConfig.extraUriHandlers = nullptr;
     serverConfig.extraUriHandlersCount = 1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
+    IotCommHttpEndpoint_t invalidEndpoint = {};
+
+    serverConfig.extraUriHandlers = &invalidEndpoint;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
     TEST_ASSERT_FALSE(iotCommIsServerRunning());
     iotCommDeinit();
     vSemaphoreDelete(testCtx.done);
     p256KeyPairDone(&testCtx.rootKey);
-    for (TestStorageItem_t& item : testCtx.storage)
+    freeTestStorage(&testCtx);
+    memset(identitySignature, 0, sizeof(identitySignature));
+}
+
+TEST_CASE("IoT-Comm serializes loopback endpoint requests from two cores", "[iot_comm][integration][multicore]")
+{
+    if (portNUM_PROCESSORS < 2)
     {
-        if (item.data)
-        {
-            memset(item.data, 0, item.len);
-            free(item.data);
-        }
+        TEST_IGNORE_MESSAGE("requires a multicore target");
     }
+
+    LoopbackTestContext_t testCtx = {};
+    MultiCoreRequestTaskArgs_t taskArgs[2] = {
+        {.testCtx = &testCtx, .readyBit = kMultiCoreClient0ReadyBit, .doneBit = kMultiCoreClient0DoneBit, .index = 0},
+        {.testCtx = &testCtx, .readyBit = kMultiCoreClient1ReadyBit, .doneBit = kMultiCoreClient1DoneBit, .index = 1},
+    };
+    IotCommConfig_t config = iotCommDefaultConfig();
+    IotCommServerConfig_t serverConfig = iotCommDefaultServerConfig();
+    IotCommHttpEndpoint_t endpoint = {
+        .uri = "/extra/multicore",
+        .method = HTTP_GET,
+        .handler = extraUriHandler,
+        .ctx = &testCtx,
+        .rateLimit = false,
+    };
+    EventBits_t bits;
+    esp_err_t err;
+    BaseType_t currentCore;
+
+    err = esp_event_loop_create_default();
+    TEST_ASSERT_TRUE(err == ESP_OK || err == ESP_ERR_INVALID_STATE);
+    err = esp_netif_init();
+    TEST_ASSERT_TRUE(err == ESP_OK || err == ESP_ERR_INVALID_STATE);
+    p256KeyPairInit(&testCtx.rootKey);
+    TEST_ASSERT_EQUAL(ESP_OK, ecdsaGeneratePair(&testCtx.rootKey));
+    config.handler = eventHandler;
+    config.handlerCtx = &testCtx;
+    config.rootKey.cb = getRootPublicKey;
+    config.rootKey.ctx = &testCtx;
+    config.storage.load = loadStorage;
+    config.storage.save = saveStorage;
+    config.storage.ctx = &testCtx;
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommInit(&config));
+    serverConfig.listenPort = 18081;
+    serverConfig.extraUriHandlers = &endpoint;
+    serverConfig.extraUriHandlersCount = 1;
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+
+    testCtx.multiCoreSync = xEventGroupCreate();
+    TEST_ASSERT_NOT_NULL(testCtx.multiCoreSync);
+    currentCore = xPortGetCoreID();
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore(multiCoreRequestTask, "iotcomm-mc-0", 4096, &taskArgs[0], 5, nullptr, currentCore));
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore(multiCoreRequestTask, "iotcomm-mc-1", 4096, &taskArgs[1], 5, nullptr,
+                                                      (currentCore + 1) % portNUM_PROCESSORS));
+    bits = xEventGroupWaitBits(testCtx.multiCoreSync, kMultiCoreClient0ReadyBit | kMultiCoreClient1ReadyBit, pdFALSE, pdTRUE,
+                               pdMS_TO_TICKS(10000));
+    TEST_ASSERT_EQUAL(kMultiCoreClient0ReadyBit | kMultiCoreClient1ReadyBit,
+                      bits & (kMultiCoreClient0ReadyBit | kMultiCoreClient1ReadyBit));
+    TEST_ASSERT_EQUAL(currentCore, testCtx.multiCoreClientCore[0]);
+    TEST_ASSERT_EQUAL((currentCore + 1) % portNUM_PROCESSORS, testCtx.multiCoreClientCore[1]);
+    xEventGroupSetBits(testCtx.multiCoreSync, kMultiCoreStartBit);
+    bits = xEventGroupWaitBits(testCtx.multiCoreSync, kMultiCoreClient0DoneBit | kMultiCoreClient1DoneBit, pdFALSE, pdTRUE,
+                               pdMS_TO_TICKS(10000));
+    TEST_ASSERT_EQUAL(kMultiCoreClient0DoneBit | kMultiCoreClient1DoneBit, bits & (kMultiCoreClient0DoneBit | kMultiCoreClient1DoneBit));
+    TEST_ASSERT_EQUAL(ESP_OK, testCtx.multiCoreClientErr[0]);
+    TEST_ASSERT_EQUAL(ESP_OK, testCtx.multiCoreClientErr[1]);
+    TEST_ASSERT_EQUAL_UINT32(1, testCtx.multiCoreMaxActiveRequests);
+
+    iotCommStopServer();
+    iotCommDeinit();
+    vEventGroupDelete(testCtx.multiCoreSync);
+    p256KeyPairDone(&testCtx.rootKey);
+    freeTestStorage(&testCtx);
 }
 
 // -----------------------------------------------------------------------------
@@ -159,7 +265,32 @@ static esp_err_t extraUriHandler(httpd_req_t* req)
     LoopbackTestContext_t* testCtx = static_cast<LoopbackTestContext_t*>(req->user_ctx);
 
     testCtx->extraUriCalled = true;
+    testCtx->extraUriCalls += 1;
+    if (strcmp(req->uri, "/extra/multicore") == 0)
+    {
+        // Two client tasks issue this request from different cores. The ESP-IDF
+        // HTTP server must still invoke handlers serially in its one server task.
+        testCtx->multiCoreActiveRequests += 1;
+        if (testCtx->multiCoreActiveRequests > testCtx->multiCoreMaxActiveRequests)
+        {
+            testCtx->multiCoreMaxActiveRequests = testCtx->multiCoreActiveRequests;
+        }
+        vTaskDelay(1);
+        testCtx->multiCoreActiveRequests -= 1;
+    }
     return httpd_resp_sendstr(req, "extra");
+}
+
+static void freeTestStorage(LoopbackTestContext_t* testCtx)
+{
+    for (TestStorageItem_t& item : testCtx->storage)
+    {
+        if (item.data)
+        {
+            memset(item.data, 0, item.len);
+            free(item.data);
+        }
+    }
 }
 
 static bool sendAll(int socketFd, const char* data, size_t len)
@@ -271,7 +402,21 @@ static void loopbackClientTask(void* arg)
     if (receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 200") &&
         strstr(response, "serverPublicKey") && strstr(response, "deviceSignature"))
     {
-        testCtx->clientErr = ESP_OK;
+        for (size_t i = 0; i < 3; i++)
+        {
+            requestLen = snprintf(request, sizeof(request), "GET /extra/two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+                !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra"))
+            {
+                goto done;
+            }
+        }
+        requestLen = snprintf(request, sizeof(request), "GET /extra/two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
+            receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 429"))
+        {
+            testCtx->clientErr = ESP_OK;
+        }
     }
 
 done:
@@ -283,5 +428,46 @@ done:
     memset(publicKey, 0, sizeof(publicKey));
     p256KeyPairDone(&ecdhKey);
     xSemaphoreGive(testCtx->done);
+    vTaskDelete(nullptr);
+}
+
+static void multiCoreRequestTask(void* arg)
+{
+    MultiCoreRequestTaskArgs_t* taskArgs = static_cast<MultiCoreRequestTaskArgs_t*>(arg);
+    LoopbackTestContext_t* testCtx = taskArgs->testCtx;
+    struct sockaddr_in addr = {};
+    char response[256];
+    constexpr char request[] = "GET /extra/multicore HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    int socketFd = -1;
+
+    testCtx->multiCoreClientErr[taskArgs->index] = ESP_FAIL;
+    testCtx->multiCoreClientCore[taskArgs->index] = xPortGetCoreID();
+    xEventGroupSetBits(testCtx->multiCoreSync, taskArgs->readyBit);
+    if ((xEventGroupWaitBits(testCtx->multiCoreSync, kMultiCoreStartBit, pdFALSE, pdTRUE, pdMS_TO_TICKS(10000)) & kMultiCoreStartBit) == 0)
+    {
+        goto done;
+    }
+
+    socketFd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (socketFd < 0)
+    {
+        goto done;
+    }
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(18081);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || !sendAll(socketFd, request, sizeof(request) - 1) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra"))
+    {
+        goto done;
+    }
+    testCtx->multiCoreClientErr[taskArgs->index] = ESP_OK;
+
+done:
+    if (socketFd >= 0)
+    {
+        close(socketFd);
+    }
+    xEventGroupSetBits(testCtx->multiCoreSync, taskArgs->doneBit);
     vTaskDelete(nullptr);
 }

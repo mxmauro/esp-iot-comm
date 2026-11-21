@@ -1,4 +1,4 @@
-#include "iot_comm/crypto/p256.h"
+#include "iot_comm/crypto/ecc.h"
 #include "iot_comm/crypto/utils.h"
 #include <assert.h>
 #include <convert.h>

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <lwip/sockets.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -35,7 +36,11 @@ void parseIPv6(IPAddress_t* addr, const struct sockaddr_in6* in);
 //  - "203.0.113.1:1234"  (we'll strip :port for IPv4)
 //  - "[2001:db8::1]:1234" (strip brackets + port)
 // Parses an IPv4 or IPv6 address string into the library representation.
+#ifdef __cplusplus
 bool parseIP(IPAddress_t* addr, const char* s, size_t len = static_cast<size_t>(-1));
+#else
+bool parseIP(IPAddress_t* addr, const char* s, size_t len);
+#endif // __cplusplus
 
 // Converts an IPv6 to IPv4 and returns true if conversion could be done or the address already was IPv4.
 bool toIPv4(IPAddress_t* addr);

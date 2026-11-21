@@ -1,7 +1,7 @@
 #pragma once
 
 #include "iot_comm/iot_comm.h"
-#include "iot_comm/crypto/p256.h"
+#include "iot_comm/crypto/ecc.h"
 #include <esp_err.h>
 
 // -----------------------------------------------------------------------------

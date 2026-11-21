@@ -1,11 +1,13 @@
 #pragma once
 
 #include "sdkconfig.h"
-#include "crypto/p256.h"
+#include "crypto/ecc.h"
 #include "provisioning/wifi.h" // IWYU pragma: keep
 #include "utils/network.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -20,7 +22,7 @@
 #define IOTCOMM_DEFAULT_MAX_USERS_COUNT                     4
 #define IOTCOMM_DEFAULT_MAX_RATE_LIMIT_SLOTS                20
 #define IOTCOMM_DEFAULT_RATE_LIMIT_WINDOW_TIME_MS           60000
-#define IOTCOMM_DEFAULT_MAX_RATE_LIMIT_REQUESTS_COUNT       3
+#define IOTCOMM_DEFAULT_MAX_RATE_LIMIT_REQUESTS_COUNT       9
 #define IOTCOMM_DEFAULT_MAX_RATE_LIMIT_CONSECUTIVE_FAILURES 3
 #define IOTCOMM_DEFAULT_MAX_CHALLENGES_SLOTS                10
 #define IOTCOMM_DEFAULT_CHALLENGE_WINDOW_TIME_MS            60000
@@ -159,7 +161,9 @@ typedef struct IotCommStorageCallbacks_s {
     void*                            ctx;
 } IotCommStorageCallbacks_t;
 
-// Configures request throttling for authentication and command traffic.
+// Configures request throttling for authentication and rate-limited HTTP traffic.
+// maxRequestsPerWindow counts individual protected requests; a complete login
+// consumes three requests: /ws/init, /ws/auth, and the /ws upgrade.
 typedef struct IotCommRateLimitConfig_s {
     size_t   maxSlots;
     uint32_t windowSizeInMs;
@@ -190,6 +194,19 @@ typedef struct IotCommProxyConfig_s {
 // Receives server lifecycle and command events.
 typedef void (*IotCommEventHandler_t)(IotCommEvent_t* event);
 
+// Handles an application-defined HTTP endpoint request.
+typedef esp_err_t (*IotCommHttpEndpointHandler_t)(httpd_req_t* req);
+
+// Describes an application-defined HTTP endpoint. WebSocket endpoints are not
+// supported here; IoT-Comm owns its WebSocket routes.
+typedef struct IotCommHttpEndpoint_s {
+    const char*                  uri;
+    httpd_method_t               method;
+    IotCommHttpEndpointHandler_t handler;
+    void*                        ctx;
+    bool                         rateLimit;
+} IotCommHttpEndpoint_t;
+
 // Holds the runtime configuration for the IoT communication subsystem.
 typedef struct IotCommConfig_s {
     size_t                               maxUsersCount;
@@ -208,9 +225,9 @@ typedef struct IotCommServerConfig_s {
     uint16_t           udpListenPort;
     uint16_t           maxConnections;
     uint32_t           maxPacketSize;
-    // Application HTTP handlers registered after the built-in handlers. URI strings and contexts must remain valid while the server runs.
-    const httpd_uri_t* extraUriHandlers;
-    size_t             extraUriHandlersCount;
+    // Application HTTP endpoints registered after the built-in handlers. URI strings and contexts must remain valid while the server runs.
+    const IotCommHttpEndpoint_t* extraUriHandlers;
+    size_t                       extraUriHandlersCount;
 } IotCommServerConfig_t;
 
 // Reports prerequisites that must be met before the authenticated server can be started.
@@ -235,6 +252,8 @@ void iotCommDeinit();
 
 // Returns the persisted device identity public key used to authenticate the server handshake.
 esp_err_t iotCommGetDeviceIdentityPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE]);
+// Signs a SHA-256 digest with the persisted device identity private key.
+esp_err_t iotCommSignDeviceIdentityHash(const uint8_t hash[P256_HASH_SIZE], uint8_t signature[P256_SIGNATURE_SIZE]);
 
 // Starts the IoT communication server with the given listener configuration.
 esp_err_t iotCommStartServer(IotCommServerConfig_t* config);

@@ -4,6 +4,7 @@
 #include <esp_err.h>
 #include <esp_idf_version.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #if ESP_IDF_VERSION_MAJOR < 6
     #include <mbedtls/ecp.h>
@@ -110,4 +111,112 @@ esp_err_t ecdsaVerify(P256KeyPair_t* pair, const uint8_t hash[P256_HASH_SIZE], c
 
 #ifdef __cplusplus
 }
+#endif // __cplusplus
+
+// -----------------------------------------------------------------------------
+
+#ifdef __cplusplus
+
+class P256KeyPair
+{
+public:
+    P256KeyPair() noexcept
+    {
+        p256KeyPairInit(&pair);
+    }
+    P256KeyPair(const P256KeyPair&) noexcept = delete;
+    P256KeyPair(P256KeyPair&&) noexcept = delete;
+
+    ~P256KeyPair() noexcept
+    {
+        p256KeyPairDone(&pair);
+    }
+
+    P256KeyPair& operator=(const P256KeyPair&) noexcept = delete;
+    P256KeyPair& operator=(P256KeyPair&&) noexcept = delete;
+
+    esp_err_t LoadPublicKey(const uint8_t publicKey[P256_PUBLIC_KEY_SIZE]) noexcept
+    {
+        return p256LoadPublicKey(&pair, publicKey);
+    }
+
+    esp_err_t SavePublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE]) noexcept
+    {
+        return p256SavePublicKey(&pair, publicKey);
+    }
+
+    esp_err_t LoadPrivateKey(const uint8_t privateKey[P256_PRIVATE_KEY_SIZE]) noexcept
+    {
+        return p256LoadPrivateKey(&pair, privateKey);
+    }
+
+    esp_err_t SavePrivateKey(uint8_t privateKey[P256_PRIVATE_KEY_SIZE]) noexcept
+    {
+        return p256SavePrivateKey(&pair, privateKey);
+    }
+
+    esp_err_t DerivePublicKey() noexcept
+    {
+        return p256DerivePublicKey(&pair);
+    }
+
+    esp_err_t LoadPublicKeyB64(const char* publicKey, size_t publicKeyLen, bool isUrl) noexcept
+    {
+        return p256LoadPublicKeyB64(&pair, publicKey, publicKeyLen, isUrl);
+    }
+
+    esp_err_t SavePublicKeyB64(char* publicKey, size_t* publicKeyLen, bool isUrl) noexcept
+    {
+        return p256SavePublicKeyB64(&pair, publicKey, publicKeyLen, isUrl);
+    }
+
+    esp_err_t LoadPrivateKeyB64(const char* privateKey, size_t privateKeyLen, bool isUrl) noexcept
+    {
+        return p256LoadPrivateKeyB64(&pair, privateKey, privateKeyLen, isUrl);
+    }
+
+    esp_err_t SavePrivateKeyB64(char* privateKey, size_t* privateKeyLen, bool isUrl) noexcept
+    {
+        return p256SavePrivateKeyB64(&pair, privateKey, privateKeyLen, isUrl);
+    }
+
+    esp_err_t GenerateEcdhPair() noexcept
+    {
+        return ecdhGeneratePair(&pair);
+    }
+
+    esp_err_t ComputeEcdhSharedSecret(uint8_t sharedSecret[P256_SHARED_SECRET_SIZE]) noexcept
+    {
+        return ecdhComputeSharedSecret(&pair, sharedSecret);
+    }
+
+    esp_err_t GenerateEcdsaPair() noexcept
+    {
+        return ecdsaGeneratePair(&pair);
+    }
+
+    esp_err_t Sign(const uint8_t hash[P256_HASH_SIZE], uint8_t signature[P256_SIGNATURE_SIZE]) noexcept
+    {
+        return ecdsaSign(&pair, hash, signature);
+    }
+
+    esp_err_t Verify(const uint8_t hash[P256_HASH_SIZE], const uint8_t signature[P256_SIGNATURE_SIZE]) noexcept
+    {
+        return ecdsaVerify(&pair, hash, signature);
+    }
+
+    static bool ValidatePublicKey(const uint8_t* publicKey, size_t publicKeySize) noexcept
+    {
+        return p256ValidatePublicKey(publicKey, publicKeySize);
+    }
+
+    P256KeyPair_t& NativeHandle() noexcept
+    {
+        return pair;
+    }
+
+private:
+    P256KeyPair_t pair;
+};
+
 #endif // __cplusplus

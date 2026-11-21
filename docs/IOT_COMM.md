@@ -35,19 +35,28 @@ IoT-Comm's built-in handlers. IoT-Comm reserves space for every supplied handler
 cannot be registered.
 
 ```cpp
-httpd_uri_t extraHandlers[1] = {};
+IotCommHttpEndpoint_t extraHandlers[1] = {};
 
 extraHandlers[0].uri = "/status";
 extraHandlers[0].method = HTTP_GET;
 extraHandlers[0].handler = serveStatus;
-extraHandlers[0].user_ctx = &appState;
+extraHandlers[0].ctx = &appState;
+extraHandlers[0].rateLimit = false;
 
 serverConfig.extraUriHandlers = extraHandlers;
 serverConfig.extraUriHandlersCount = 1;
 ```
 
-The application owns the URI strings and contexts referenced by these entries. Keep them valid until `iotCommStopServer()` or a failed
-`iotCommStartServer()` call returns.
+IoT-Comm retains the handler, context, and rate-limit setting, but the application owns the URI strings and contexts. Keep those valid
+until `iotCommStopServer()` or a failed `iotCommStartServer()` call returns. Extra endpoints are ordinary HTTP handlers; WebSocket
+endpoints are not supported. Set `rateLimit` to `true` to apply IoT-Comm's configured per-client request limit before the application
+handler runs. Rate-limited endpoints share that limit with IoT-Comm's built-in authentication routes. Each protected request consumes
+one slot in the shared budget; a complete login consumes three slots for `/ws/init`, `/ws/auth`, and the `/ws` upgrade.
+
+Include `iot_comm/http/helpers.h` in an application handler to reuse the request-body, query-parameter, CORS, and standard error-response
+helpers. `httpGetClientIpFromRequest(req, &address)` resolves the client address using the trusted-proxy configuration supplied to
+`iotCommInit()`; application handlers do not pass or retain that configuration themselves. It returns `false` when called without an
+initialized IoT-Comm runtime or when the peer address cannot be determined.
 
 ## Reverse Proxies
 
@@ -82,6 +91,7 @@ decides what a custom command means and how to answer it.
 | `iotCommStartServer()`                | Starts accepting HTTP/WebSocket connections.           |
 | `iotCommStopServer()`                 | Stops the listener and active server work.             |
 | `iotCommGetDeviceIdentityPublicKey()` | Returns the persisted device identity public key.      |
+| `iotCommSignDeviceIdentityHash()`      | Signs a SHA-256 digest with the device identity key.   |
 | `iotCommSetSessionUserData()`         | Attaches application-owned state to a session.         |
 | `iotCommEventReply()`                 | Sends a successful response from the current callback. |
 | `iotCommEventReplyWithError()`        | Sends an application error from the callback.          |
