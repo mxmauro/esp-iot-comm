@@ -53,6 +53,31 @@ endpoints are not supported. Set `rateLimit` to `true` to apply IoT-Comm's confi
 handler runs. Rate-limited endpoints share that limit with IoT-Comm's built-in authentication routes. Each protected request consumes
 one slot in the shared budget; a complete login consumes three slots for `/ws/init`, `/ws/auth`, and the `/ws` upgrade.
 
+## CORS
+
+Set `IotCommServerConfig_t::cors` to enable CORS for the authenticated server. A null pointer is the default and sends no CORS headers.
+Start from `iotCommDefaultCORSConfig()` and customize the methods and request headers accepted by browser preflights. Null or empty
+method and header strings use the defaults.
+
+```cpp
+IotCommCORSConfig_t cors = iotCommDefaultCORSConfig();
+
+cors.allowedMethods = "GET,POST,OPTIONS";
+cors.allowedHeaders = "Content-Type, Authorization";
+cors.useWildcardOrigin = false;
+serverConfig.cors = &cors;
+```
+
+With `useWildcardOrigin == false`, IoT-Comm reflects a supplied `Origin`, sends `Vary: Origin`, and enables credentials for browser
+cookie support. Requests without an `Origin` header use `Access-Control-Allow-Origin: *`. With `useWildcardOrigin == true`, responses
+always use `*` and do not enable credentials.
+
+IoT-Comm applies the configured CORS headers to its built-in HTTP responses, extra endpoint responses before calling the application
+handler, and ESP-IDF-generated error responses. Extra endpoints also receive automatic `OPTIONS` preflight responses with status 204;
+they do not invoke the application handler or consume rate-limit slots. When CORS is enabled, applications must not register an extra
+`HTTP_OPTIONS` endpoint because `iotCommStartServer()` rejects that configuration. Application handlers that add CORS headers after
+IoT-Comm has done so can produce duplicate HTTP headers and are responsible for their own response policy.
+
 Include `iot_comm/http/helpers.h` in an application handler to reuse the request-body, query-parameter, CORS, and standard error-response
 helpers. `httpGetClientIpFromRequest(req, &address)` resolves the client address using the trusted-proxy configuration supplied to
 `iotCommInit()`; application handlers do not pass or retain that configuration themselves. It returns `false` when called without an

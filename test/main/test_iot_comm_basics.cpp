@@ -65,12 +65,18 @@ TEST_CASE("trusted proxy rules validate CIDRs and resolve X-Forwarded-For", "[io
 TEST_CASE("iotCommDefaultServerConfig returns expected defaults", "[iot_comm]")
 {
     IotCommServerConfig_t cfg = iotCommDefaultServerConfig();
+    IotCommCORSConfig_t cors = iotCommDefaultCORSConfig();
 
     TEST_ASSERT_EQUAL_UINT16(80, cfg.listenPort);
     TEST_ASSERT_EQUAL_UINT16(0, cfg.udpListenPort);
     TEST_ASSERT_EQUAL_UINT16(IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2, cfg.maxConnections);
+    TEST_ASSERT_NULL(cfg.cors);
     TEST_ASSERT_NULL(cfg.extraUriHandlers);
     TEST_ASSERT_EQUAL_UINT32(0, cfg.extraUriHandlersCount);
+
+    TEST_ASSERT_NULL(cors.allowedMethods);
+    TEST_ASSERT_NULL(cors.allowedHeaders);
+    TEST_ASSERT_FALSE(cors.useWildcardOrigin);
 }
 
 TEST_CASE("device identity APIs require initialized runtime", "[iot_comm]")

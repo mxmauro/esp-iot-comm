@@ -60,6 +60,7 @@ static void freeTestStorage(LoopbackTestContext_t* testCtx);
 static bool sendAll(int socketFd, const char* data, size_t len);
 static bool receiveHttpResponse(int socketFd, char* response, size_t responseSize);
 static void loopbackClientTask(void* arg);
+static void wildcardCorsClientTask(void* arg);
 static void multiCoreRequestTask(void* arg);
 
 // -----------------------------------------------------------------------------
@@ -69,6 +70,7 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     LoopbackTestContext_t testCtx = {};
     IotCommConfig_t config = iotCommDefaultConfig();
     IotCommServerConfig_t serverConfig = iotCommDefaultServerConfig();
+    IotCommCORSConfig_t corsConfig = iotCommDefaultCORSConfig();
     IotCommHttpEndpoint_t extraUriHandlers[4] = {};
     uint8_t hash[P256_HASH_SIZE] = {};
     uint8_t signature[P256_SIGNATURE_SIZE] = {};
@@ -110,6 +112,7 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
         extraUriHandlers[i].ctx = &testCtx;
         extraUriHandlers[i].rateLimit = i == 1;
     }
+    serverConfig.cors = &corsConfig;
     serverConfig.extraUriHandlers = extraUriHandlers;
     serverConfig.extraUriHandlersCount = sizeof(extraUriHandlers) / sizeof(extraUriHandlers[0]);
     TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
@@ -122,14 +125,58 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(testCtx.done, pdMS_TO_TICKS(10000)));
     TEST_ASSERT_EQUAL(ESP_OK, testCtx.clientErr);
     TEST_ASSERT_TRUE(testCtx.extraUriCalled);
-    TEST_ASSERT_EQUAL_UINT32(4, testCtx.extraUriCalls);
+    TEST_ASSERT_EQUAL_UINT32(5, testCtx.extraUriCalls);
     iotCommStopServer();
+    IotCommHttpEndpoint_t wildcardEndpoint = {
+        .uri = "/extra/wildcard",
+        .method = HTTP_GET,
+        .handler = extraUriHandler,
+        .ctx = &testCtx,
+        .rateLimit = false,
+    };
+    IotCommCORSConfig_t wildcardCORSConfig = iotCommDefaultCORSConfig();
+
+    wildcardCORSConfig.useWildcardOrigin = true;
+    serverConfig.listenPort = 18082;
+    serverConfig.cors = &wildcardCORSConfig;
+    serverConfig.extraUriHandlers = &wildcardEndpoint;
+    serverConfig.extraUriHandlersCount = 1;
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreate(wildcardCorsClientTask, "iotcomm-cors", 4096, &testCtx, 5, nullptr));
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(testCtx.done, pdMS_TO_TICKS(10000)));
+    TEST_ASSERT_EQUAL(ESP_OK, testCtx.clientErr);
+    iotCommStopServer();
+    serverConfig.listenPort = 18080;
+    serverConfig.cors = &corsConfig;
     serverConfig.extraUriHandlers = nullptr;
     serverConfig.extraUriHandlersCount = 1;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
     IotCommHttpEndpoint_t invalidEndpoint = {};
 
     serverConfig.extraUriHandlers = &invalidEndpoint;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
+    serverConfig.extraUriHandlers = extraUriHandlers;
+    serverConfig.extraUriHandlersCount = 1;
+    corsConfig.allowedMethods = nullptr;
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    iotCommStopServer();
+    corsConfig.allowedMethods = "";
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    iotCommStopServer();
+    corsConfig = iotCommDefaultCORSConfig();
+    corsConfig.allowedHeaders = nullptr;
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    iotCommStopServer();
+    corsConfig.allowedHeaders = "";
+    TEST_ASSERT_EQUAL(ESP_OK, iotCommStartServer(&serverConfig));
+    iotCommStopServer();
+    corsConfig = iotCommDefaultCORSConfig();
+    invalidEndpoint.uri = "/extra/options";
+    invalidEndpoint.method = HTTP_OPTIONS;
+    invalidEndpoint.handler = extraUriHandler;
+    serverConfig.extraUriHandlers = &invalidEndpoint;
+    serverConfig.extraUriHandlersCount = 1;
+    serverConfig.cors = &corsConfig;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
     TEST_ASSERT_FALSE(iotCommIsServerRunning());
     iotCommDeinit();
@@ -350,8 +397,8 @@ static void loopbackClientTask(void* arg)
     char nonceB64[32];
     char publicKeyB64[96];
     char body[192];
-    char request[320];
-    char response[768];
+    char request[512];
+    char response[1024];
     struct sockaddr_in addr = {};
     int socketFd = -1;
     size_t nonceB64Len = sizeof(nonceB64) - 1;
@@ -381,9 +428,30 @@ static void loopbackClientTask(void* arg)
     {
         goto done;
     }
-    requestLen = snprintf(request, sizeof(request), "GET /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    requestLen = snprintf(request, sizeof(request),
+                          "GET /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
-        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra"))
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra") ||
+        !strstr(response, "Access-Control-Allow-Origin: https://example.test") ||
+        !strstr(response, "Access-Control-Allow-Credentials: true") ||
+        !strstr(response, "Access-Control-Allow-Methods: GET,POST,OPTIONS") ||
+        !strstr(response, "Access-Control-Allow-Headers: Content-Type, Authorization"))
+    {
+        goto done;
+    }
+    requestLen = snprintf(request, sizeof(request),
+                          "OPTIONS /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n"
+                          "Access-Control-Request-Method: GET\r\n\r\n");
+    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
+        !strstr(response, "Access-Control-Allow-Origin: https://example.test"))
+    {
+        goto done;
+    }
+    requestLen = snprintf(request, sizeof(request), "GET /extra/one HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra") ||
+        !strstr(response, "Access-Control-Allow-Origin: *"))
     {
         goto done;
     }
@@ -393,14 +461,16 @@ static void loopbackClientTask(void* arg)
         goto done;
     }
     requestLen = snprintf(request, sizeof(request),
-                          "POST /ws/init HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %u\r\n\r\n%s",
+                          "POST /ws/init HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\nContent-Type: application/json\r\n"
+                          "Content-Length: %u\r\n\r\n%s",
                           static_cast<unsigned>(bodyLen), body);
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen))
     {
         goto done;
     }
     if (receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 200") &&
-        strstr(response, "serverPublicKey") && strstr(response, "deviceSignature"))
+        strstr(response, "serverPublicKey") && strstr(response, "deviceSignature") &&
+        strstr(response, "Access-Control-Allow-Origin: https://example.test"))
     {
         for (size_t i = 0; i < 3; i++)
         {
@@ -415,7 +485,29 @@ static void loopbackClientTask(void* arg)
         if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
             receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 429"))
         {
-            testCtx->clientErr = ESP_OK;
+            requestLen = snprintf(request, sizeof(request),
+                                  "POST /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
+            if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
+                receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 405") &&
+                strstr(response, "Access-Control-Allow-Origin: https://example.test"))
+            {
+                close(socketFd);
+                socketFd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+                if (socketFd >= 0 && connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+                {
+                    requestLen = snprintf(request, sizeof(request),
+                                          "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
+                    if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
+                        receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 404") &&
+                        strstr(response, "Access-Control-Allow-Origin: https://example.test") &&
+                        strstr(response, "Access-Control-Allow-Credentials: true") &&
+                        strstr(response, "Access-Control-Allow-Methods: GET,POST,OPTIONS") &&
+                        strstr(response, "Access-Control-Allow-Headers: Content-Type, Authorization"))
+                    {
+                        testCtx->clientErr = ESP_OK;
+                    }
+                }
+            }
         }
     }
 
@@ -431,13 +523,65 @@ done:
     vTaskDelete(nullptr);
 }
 
+static void wildcardCorsClientTask(void* arg)
+{
+    LoopbackTestContext_t* testCtx = static_cast<LoopbackTestContext_t*>(arg);
+    struct sockaddr_in addr = {};
+    char request[256];
+    char response[512];
+    int socketFd = -1;
+    int requestLen;
+
+    testCtx->clientErr = ESP_FAIL;
+    socketFd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (socketFd < 0)
+    {
+        goto done;
+    }
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(18082);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+    {
+        goto done;
+    }
+    requestLen = snprintf(request, sizeof(request),
+                          "GET /extra/wildcard HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
+    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") ||
+        !strstr(response, "Access-Control-Allow-Origin: *") || strstr(response, "Access-Control-Allow-Credentials") ||
+        strstr(response, "Vary: Origin"))
+    {
+        goto done;
+    }
+    requestLen = snprintf(request, sizeof(request),
+                          "OPTIONS /extra/wildcard HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n"
+                          "Access-Control-Request-Method: GET\r\n\r\n");
+    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
+        !strstr(response, "Access-Control-Allow-Origin: *") || strstr(response, "Access-Control-Allow-Credentials") ||
+        strstr(response, "Vary: Origin"))
+    {
+        goto done;
+    }
+    testCtx->clientErr = ESP_OK;
+
+done:
+    if (socketFd >= 0)
+    {
+        close(socketFd);
+    }
+    xSemaphoreGive(testCtx->done);
+    vTaskDelete(nullptr);
+}
+
 static void multiCoreRequestTask(void* arg)
 {
     MultiCoreRequestTaskArgs_t* taskArgs = static_cast<MultiCoreRequestTaskArgs_t*>(arg);
     LoopbackTestContext_t* testCtx = taskArgs->testCtx;
     struct sockaddr_in addr = {};
     char response[256];
-    constexpr char request[] = "GET /extra/multicore HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    constexpr char request[] = "GET /extra/multicore HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n";
     int socketFd = -1;
 
     testCtx->multiCoreClientErr[taskArgs->index] = ESP_FAIL;
@@ -457,7 +601,8 @@ static void multiCoreRequestTask(void* arg)
     addr.sin_port = htons(18081);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || !sendAll(socketFd, request, sizeof(request) - 1) ||
-        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra"))
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra") ||
+        strstr(response, "Access-Control-Allow-Origin"))
     {
         goto done;
     }

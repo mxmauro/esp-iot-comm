@@ -102,13 +102,16 @@ esp_err_t httpSendCORSHeaders(httpd_req_t* req, const char* origin, const char* 
     assert(req);
 
     err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", (origin && *origin != 0) ? origin : "*");
-    if (err == ESP_OK)
-    {
-        err = httpd_resp_set_hdr(req, "Vary", "Origin");
-    }
     if (err == ESP_OK && origin && *origin != 0)
     {
-        err = httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
+        if (*origin != '*')
+        {
+            err = httpd_resp_set_hdr(req, "Vary", "Origin");
+        }
+        if (err == ESP_OK)
+        {
+            err = httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
+        }
     }
     if (err == ESP_OK && allowMethods && *allowMethods != 0)
     {

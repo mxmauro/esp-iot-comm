@@ -63,14 +63,18 @@
 //     reply:
 //           UDP listen port: 2-byte big-endian port
 //         UDP connection id: 4-byte big-endian opaque identifier
-//           server UDP nonce: raw 16-byte nonce
+//          server UDP nonce: raw 16-byte nonce
 //
-// UDP data packets use this encrypted binary packet header layout:
-//     udpConnectionId(4) | version(1) | cmd(2) | flags(1) | counter(8)
-// UDP is a one-way transport for custom command IDs outside 0x7F00-0x7FFF.
-// Reserved built-in command IDs are rejected and invalidate the current UDP
-// negotiation; open UDP again with CMD_UDP_OPEN. UDP custom commands do not
-// support iotCommEventReply*() responses; those APIs return ESP_ERR_NOT_ALLOWED.
+//     UDP data packets use this encrypted binary packet header layout:
+//         udpConnectionId(4) | version(1) | cmd(2) | flags(1) | counter(8)
+//
+//     UDP is a one-way transport for custom command IDs outside 0x7F00-0x7FFF.
+//     Reserved built-in command IDs are rejected and invalidate the current UDP
+//     negotiation; open UDP again with CMD_UDP_OPEN. UDP custom commands do not
+//     support iotCommEventReply*() responses; those APIs return ESP_ERR_NOT_ALLOWED.
+//
+// CMD_REBOOT (0x7FF8)
+//     no payload
 //
 
 // Websocket close codes
@@ -207,6 +211,16 @@ typedef struct IotCommHttpEndpoint_s {
     bool                         rateLimit;
 } IotCommHttpEndpoint_t;
 
+// Configures Cross-Origin Resource Sharing (CORS) for an IoT-Comm server.
+// Null or empty allowedMethods and allowedHeaders use the default values.
+typedef struct IotCommCORSConfig_s {
+    bool        useWildcardOrigin;
+    // If nullptr or empty, then defaults to GET,POST & OPTIONS
+    const char* allowedMethods;
+    // If nullptr or empty, then defaults to Content-Type & Authorization
+    const char* allowedHeaders;
+} IotCommCORSConfig_t;
+
 // Holds the runtime configuration for the IoT communication subsystem.
 typedef struct IotCommConfig_s {
     size_t                               maxUsersCount;
@@ -221,10 +235,12 @@ typedef struct IotCommConfig_s {
 
 // Defines the network settings for the embedded server.
 typedef struct IotCommServerConfig_s {
-    uint16_t           listenPort;
-    uint16_t           udpListenPort;
-    uint16_t           maxConnections;
-    uint32_t           maxPacketSize;
+    uint16_t                     listenPort;
+    uint16_t                     udpListenPort;
+    uint16_t                     maxConnections;
+    uint32_t                     maxPacketSize;
+    // Optional CORS policy. A null pointer disables CORS response headers.
+    const IotCommCORSConfig_t*   cors;
     // Application HTTP endpoints registered after the built-in handlers. URI strings and contexts must remain valid while the server runs.
     const IotCommHttpEndpoint_t* extraUriHandlers;
     size_t                       extraUriHandlersCount;
@@ -323,6 +339,16 @@ static inline IotCommServerConfig_t iotCommDefaultServerConfig()
     cfg.listenPort = 80;
     cfg.udpListenPort = 0;
     cfg.maxConnections = IOTCOMM_DEFAULT_MAX_USERS_COUNT + 2; // +2 for unauthenticated session
+
+    return cfg;
+}
+
+// Builds a CORS configuration populated with the built-in HTTP route defaults.
+static inline IotCommCORSConfig_t iotCommDefaultCORSConfig()
+{
+    IotCommCORSConfig_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
 
     return cfg;
 }
