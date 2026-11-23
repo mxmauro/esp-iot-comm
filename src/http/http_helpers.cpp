@@ -51,7 +51,6 @@ esp_err_t httpGetCORSOrigin(httpd_req_t* req, char** originOut)
 esp_err_t httpGetCORSOrigin(httpd_req_t* req, lightstd::string &originOut)
 {
     size_t originLen;
-    char* origin;
     esp_err_t err;
 
     assert(req);

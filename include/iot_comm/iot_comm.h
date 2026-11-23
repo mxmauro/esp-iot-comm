@@ -202,7 +202,8 @@ typedef void (*IotCommEventHandler_t)(IotCommEvent_t* event);
 typedef esp_err_t (*IotCommHttpEndpointHandler_t)(httpd_req_t* req);
 
 // Describes an application-defined HTTP endpoint. WebSocket endpoints are not
-// supported here; IoT-Comm owns its WebSocket routes.
+// supported here; IoT-Comm owns its WebSocket routes. When CORS is enabled,
+// the URI "/__iot_comm_cors_fallback__" is reserved by IoT-Comm.
 typedef struct IotCommHttpEndpoint_s {
     const char*                  uri;
     httpd_method_t               method;

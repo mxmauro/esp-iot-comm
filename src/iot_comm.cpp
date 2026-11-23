@@ -22,6 +22,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <growable_buffer.h>
+#include <http_parser.h>
 #include <mutex.h>
 #include <rundown_protection.h>
 #include <stdatomic.h>
@@ -72,6 +73,8 @@ static const char* TAG = "IotComm";
 
 #define BUILTIN_URI_HANDLERS_COUNT 6
 
+#define CORS_FALLBACK_URI "/__iot_comm_cors_fallback__"
+
 #define GB_STR_AND_SIZE(str) (str), (sizeof(str) - 1)
 
 // -----------------------------------------------------------------------------
@@ -83,6 +86,7 @@ typedef enum IncomingBufferType_e {
 } IncomingBufferType_t;
 
 typedef struct ExtraUriHandler_s {
+    const char*                  uri;
     IotCommHttpEndpointHandler_t handler;
     void*                        ctx;
     bool                         rateLimit;
@@ -97,7 +101,6 @@ typedef struct ServerContext_s {
     bool               corsUseWildcardOrigin;
     char*              corsAllowedMethods;
     char*              corsAllowedHeaders;
-    httpd_req_t*       corsRequest;
     ExtraUriHandler_t* extraUriHandlers;
     size_t             extraUriHandlersCount;
     struct {
@@ -286,7 +289,8 @@ static esp_err_t serveWs(httpd_req_t* req);
 static esp_err_t serveWsPacket(httpd_req_t* req);
 static esp_err_t serveExtraUri(httpd_req_t* req);
 static esp_err_t serveExtraUriPreflight(httpd_req_t* req);
-static esp_err_t serveHttpError(httpd_req_t* req, httpd_err_code_t error);
+static esp_err_t serveCORSFallback(httpd_req_t* req);
+
 static esp_err_t dispatchCommand(CommandContext_t* commandCtx);
 
 static esp_err_t handleCreateUser(CommandContext_t* commandCtx);
@@ -362,6 +366,8 @@ static esp_err_t sendPreflightCORS(httpd_req_t* req);
 static esp_err_t sendCORS(httpd_req_t* req, char **originOut);
 static esp_err_t sendCORSHeaders(httpd_req_t* req, ServerContext_t* serverCtx, const char* origin);
 static bool hasInvalidHttpHeaderValue(const char* value);
+static bool matchCORSFallbackUri(const char* templateUri, const char* requestUri, size_t requestUriLen);
+static bool serverHasUri(const ServerContext_t* serverCtx, const char* requestUri);
 
 static bool tryExtractWsTicketFromQuery(const char* query, char* ticketB64, size_t ticketB64Len, bool* selected);
 static bool tryExtractWsTicketFromAuthorization(httpd_req_t* req, char* ticketB64, size_t ticketB64Len, bool* selected);
@@ -460,7 +466,7 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
             return ESP_ERR_INVALID_ARG;
         }
     }
-    if (config->extraUriHandlersCount > (UINT16_MAX - BUILTIN_URI_HANDLERS_COUNT) / (corsEnabled ? 2 : 1))
+    if (config->extraUriHandlersCount > (UINT16_MAX - BUILTIN_URI_HANDLERS_COUNT - (corsEnabled ? 1 : 0)) / (corsEnabled ? 2 : 1))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -468,7 +474,8 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     for (size_t i = 0; i < config->extraUriHandlersCount; i++)
     {
         if ((!config->extraUriHandlers[i].uri) || config->extraUriHandlers[i].uri[0] == 0 || (!config->extraUriHandlers[i].handler) ||
-            (corsEnabled && config->extraUriHandlers[i].method == HTTP_OPTIONS))
+            (corsEnabled && (config->extraUriHandlers[i].method == HTTP_OPTIONS ||
+                             strcmp(config->extraUriHandlers[i].uri, CORS_FALLBACK_URI) == 0)))
         {
             return ESP_ERR_INVALID_ARG;
         }
@@ -503,7 +510,8 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     httpdConfig.server_port = config->listenPort;
     httpdConfig.max_open_sockets = config->maxConnections;
     httpdConfig.max_uri_handlers = static_cast<uint16_t>(BUILTIN_URI_HANDLERS_COUNT +
-                                                         config->extraUriHandlersCount * (corsEnabled ? 2 : 1));
+                                                         config->extraUriHandlersCount * (corsEnabled ? 2 : 1) + (corsEnabled ? 1 : 0));
+    httpdConfig.uri_match_fn = corsEnabled ? matchCORSFallbackUri : nullptr;
     httpdConfig.core_id = tskNO_AFFINITY;
     httpdConfig.keep_alive_enable = true;
     httpdConfig.keep_alive_idle = 10;
@@ -516,15 +524,6 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     {
         destroyServerCtx(serverCtx);
         goto on_error;
-    }
-
-    for (int error = 0; error < HTTPD_ERR_CODE_MAX; error++)
-    {
-        err = httpd_register_err_handler(server, static_cast<httpd_err_code_t>(error), serveHttpError);
-        if (err != ESP_OK)
-        {
-            goto on_error;
-        }
     }
 
     if (serverCtx->udpListenPort != 0)
@@ -610,6 +609,16 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
             {
                 goto on_error;
             }
+        }
+
+        memset(&uri, 0, sizeof(uri));
+        uri.uri = CORS_FALLBACK_URI;
+        uri.method = static_cast<httpd_method_t>(HTTP_ANY);
+        uri.handler = serveCORSFallback;
+        err = httpd_register_uri_handler(server, &uri);
+        if (err != ESP_OK)
+        {
+            goto on_error;
         }
     }
 
@@ -1034,8 +1043,8 @@ static esp_err_t serveExtraUri(httpd_req_t* req)
     ExtraUriHandler_t* endpoint;
     ServerContext_t* serverCtx;
     void* wrapperCtx;
-    httpd_req_t* previousCORSRequest;
     char* corsOrigin = nullptr;
+    IPAddress_t clientAddr;
     esp_err_t err;
 
     if (!rpLock.acquired())
@@ -1043,47 +1052,48 @@ static esp_err_t serveExtraUri(httpd_req_t* req)
         ESP_LOGD(TAG, "Server shutting down.");
         return ESP_ERR_INVALID_STATE;
     }
+
     if ((!req) || (!(endpoint = static_cast<ExtraUriHandler_t*>(req->user_ctx))) || (!endpoint->handler))
     {
         return ESP_ERR_INVALID_ARG;
     }
+
     serverCtx = static_cast<ServerContext_t*>(httpd_get_global_user_ctx(req->handle));
     if (!serverCtx)
     {
         return ESP_ERR_INVALID_STATE;
     }
+
     err = sendCORS(req, &corsOrigin);
     if (err != ESP_OK)
     {
         httpFreeCORSOrigin(corsOrigin);
         return err;
     }
+
     if (endpoint->rateLimit)
     {
-        IPAddress_t clientAddr;
-
         if (!httpGetClientIpFromRequest(req, &clientAddr))
         {
             ESP_LOGE(TAG, "Failed to determine the client's IP address.");
             err = httpSendInternalErrorResponse(req, ESP_FAIL, nullptr);
-            httpFreeCORSOrigin(corsOrigin);
-            return err;
+            goto done;
         }
-        if (rateLimitIsAddressBlocked(&clientAddr) || !rateLimitCheckRequest(&clientAddr))
+        if (rateLimitIsAddressBlocked(&clientAddr) || (!rateLimitCheckRequest(&clientAddr)))
         {
             err = httpd_resp_send_custom_err(req, "429 Too Many Requests", "");
-            httpFreeCORSOrigin(corsOrigin);
-            return err;
+            goto done;
         }
     }
 
+    // Call the endpoint handler
     wrapperCtx = req->user_ctx;
-    previousCORSRequest = serverCtx->corsRequest;
-    serverCtx->corsRequest = req;
     req->user_ctx = endpoint->ctx;
     err = endpoint->handler(req);
     req->user_ctx = wrapperCtx;
-    serverCtx->corsRequest = previousCORSRequest;
+
+done:
+    // Done
     httpFreeCORSOrigin(corsOrigin);
     return err;
 }
@@ -1097,29 +1107,46 @@ static esp_err_t serveExtraUriPreflight(httpd_req_t* req)
         ESP_LOGD(TAG, "Server shutting down.");
         return ESP_ERR_INVALID_STATE;
     }
+
     return sendPreflightCORS(req);
 }
 
-static esp_err_t serveHttpError(httpd_req_t* req, httpd_err_code_t error)
+static esp_err_t serveCORSFallback(httpd_req_t* req)
 {
+    AutoRundownProtection rpLock(rp);
     ServerContext_t* serverCtx;
     char* corsOrigin = nullptr;
+    esp_err_t err;
+
+    if (!rpLock.acquired())
+    {
+        ESP_LOGD(TAG, "Server shutting down.");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (!req)
     {
         return ESP_FAIL;
     }
-    serverCtx = static_cast<ServerContext_t*>(httpd_get_global_user_ctx(req->handle));
-    if (serverCtx && serverCtx->corsEnabled && serverCtx->corsRequest != req)
-    {
-        esp_err_t corsErr = sendCORS(req, &corsOrigin);
 
-        if (corsErr != ESP_OK)
-        {
-            ESP_LOGD(TAG, "Failed to set CORS headers on an HTTP error response. Error: %d.", corsErr);
-        }
+    serverCtx = static_cast<ServerContext_t*>(httpd_get_global_user_ctx(req->handle));
+    if ((!serverCtx) || (!serverCtx->corsEnabled))
+    {
+        return ESP_ERR_INVALID_STATE;
     }
-    (void)httpd_resp_send_err(req, error, nullptr);
+
+    if (req->method == HTTP_OPTIONS)
+    {
+        return sendPreflightCORS(req);
+    }
+
+    err = sendCORS(req, &corsOrigin);
+    if (err != ESP_OK)
+    {
+        ESP_LOGD(TAG, "Failed to set CORS headers on an HTTP fallback response. Error: %d.", err);
+    }
+
+    (void)httpd_resp_send_err(req, serverHasUri(serverCtx, req->uri) ? HTTPD_405_METHOD_NOT_ALLOWED : HTTPD_404_NOT_FOUND, nullptr);
     httpFreeCORSOrigin(corsOrigin);
 
     // Preserve ESP-IDF's default behavior of closing the connection after an error response.
@@ -2957,6 +2984,7 @@ static ServerContext_t* createServerCtx(IotCommServerConfig_t* config)
         }
         for (size_t i = 0; i < config->extraUriHandlersCount; i++)
         {
+            serverCtx->extraUriHandlers[i].uri = config->extraUriHandlers[i].uri;
             serverCtx->extraUriHandlers[i].handler = config->extraUriHandlers[i].handler;
             serverCtx->extraUriHandlers[i].ctx = config->extraUriHandlers[i].ctx;
             serverCtx->extraUriHandlers[i].rateLimit = config->extraUriHandlers[i].rateLimit;
@@ -3683,6 +3711,7 @@ static esp_err_t sendPreflightCORS(httpd_req_t* req)
         err = httpd_resp_set_status(req, "204 No Content");
         if (err == ESP_OK)
         {
+            // httpd_resp_send() emits Content-Length: 0, which is required by some browsers even for a 204 preflight response.
             err = httpd_resp_send(req, nullptr, 0);
         }
     }
@@ -3716,8 +3745,7 @@ static esp_err_t sendCORS(httpd_req_t* req, char **originOut)
         err = httpGetCORSOrigin(req, originOut);
         if (err != ESP_OK)
         {
-            // Error handlers can receive partially parsed requests. Preserve CORS
-            // coverage by using the configured no-Origin fallback in that case.
+            // Preserve CORS coverage when the Origin header cannot be read.
             *originOut = nullptr;
         }
     }
@@ -3739,6 +3767,55 @@ static esp_err_t sendCORSHeaders(httpd_req_t* req, ServerContext_t* serverCtx, c
 static bool hasInvalidHttpHeaderValue(const char* value)
 {
     return value && strpbrk(value, "\r\n") != nullptr;
+}
+
+static bool matchCORSFallbackUri(const char* templateUri, const char* requestUri, size_t requestUriLen)
+{
+    if ((!templateUri) || (!requestUri))
+    {
+        return false;
+    }
+    if (strcmp(templateUri, CORS_FALLBACK_URI) == 0)
+    {
+        return true;
+    }
+    return strlen(templateUri) == requestUriLen && strncmp(templateUri, requestUri, requestUriLen) == 0;
+}
+
+static bool serverHasUri(const ServerContext_t* serverCtx, const char* requestUri)
+{
+    static const char* const builtinUris[] = {"/ws/init", "/ws/auth", "/ws"};
+    http_parser_url parsedUrl;
+    const char* requestPath;
+    size_t i, requestPathLen;
+
+    assert(serverCtx);
+    assert(requestUri);
+
+    http_parser_url_init(&parsedUrl);
+    if (http_parser_parse_url(requestUri, strlen(requestUri), 0, &parsedUrl) != 0 || (parsedUrl.field_set & (1U << UF_PATH)) == 0)
+    {
+        return false;
+    }
+
+    requestPath = requestUri + parsedUrl.field_data[UF_PATH].off;
+    requestPathLen = parsedUrl.field_data[UF_PATH].len;
+
+    for (i = 0; i < sizeof(builtinUris) / sizeof(builtinUris[0]); i++)
+    {
+        if (matchCORSFallbackUri(builtinUris[i], requestPath, requestPathLen))
+        {
+            return true;
+        }
+    }
+    for (i = 0; i < serverCtx->extraUriHandlersCount; i++)
+    {
+        if (matchCORSFallbackUri(serverCtx->extraUriHandlers[i].uri, requestPath, requestPathLen))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool tryExtractWsTicketFromQuery(const char* query, char* ticketB64, size_t ticketB64Len, bool* selected)

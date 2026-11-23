@@ -56,6 +56,7 @@ static esp_err_t saveStorage(IotCommStorageItemType_t type, const void* data, si
 static esp_err_t getRootPublicKey(uint8_t publicKey[P256_PUBLIC_KEY_SIZE], void* ctx);
 static void eventHandler(IotCommEvent_t* event);
 static esp_err_t extraUriHandler(httpd_req_t* req);
+static esp_err_t extraUriErrorHandler(httpd_req_t* req);
 static void freeTestStorage(LoopbackTestContext_t* testCtx);
 static bool sendAll(int socketFd, const char* data, size_t len);
 static bool receiveHttpResponse(int socketFd, char* response, size_t responseSize);
@@ -71,7 +72,7 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     IotCommConfig_t config = iotCommDefaultConfig();
     IotCommServerConfig_t serverConfig = iotCommDefaultServerConfig();
     IotCommCORSConfig_t corsConfig = iotCommDefaultCORSConfig();
-    IotCommHttpEndpoint_t extraUriHandlers[4] = {};
+    IotCommHttpEndpoint_t extraUriHandlers[5] = {};
     uint8_t hash[P256_HASH_SIZE] = {};
     uint8_t signature[P256_SIGNATURE_SIZE] = {};
     uint8_t identityPublicKey[P256_PUBLIC_KEY_SIZE] = {};
@@ -106,9 +107,11 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     serverConfig.listenPort = 18080;
     for (size_t i = 0; i < sizeof(extraUriHandlers) / sizeof(extraUriHandlers[0]); i++)
     {
-        extraUriHandlers[i].uri = (i == 3) ? "/extra/multicore" : (i == 2) ? "/extra/three" : (i == 1) ? "/extra/two" : "/extra/one";
+        extraUriHandlers[i].uri = (i == 4) ? "/extra/error" : (i == 3) ? "/extra/multicore" : (i == 2) ? "/extra/three"
+                                                                                                        : (i == 1) ? "/extra/two"
+                                                                                                                   : "/extra/one";
         extraUriHandlers[i].method = HTTP_GET;
-        extraUriHandlers[i].handler = extraUriHandler;
+        extraUriHandlers[i].handler = (i == 4) ? extraUriErrorHandler : extraUriHandler;
         extraUriHandlers[i].ctx = &testCtx;
         extraUriHandlers[i].rateLimit = i == 1;
     }
@@ -177,6 +180,9 @@ TEST_CASE("IoT-Comm serves WebSocket initialization over loopback", "[iot_comm][
     serverConfig.extraUriHandlers = &invalidEndpoint;
     serverConfig.extraUriHandlersCount = 1;
     serverConfig.cors = &corsConfig;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
+    invalidEndpoint.uri = "/__iot_comm_cors_fallback__";
+    invalidEndpoint.method = HTTP_GET;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, iotCommStartServer(&serverConfig));
     TEST_ASSERT_FALSE(iotCommIsServerRunning());
     iotCommDeinit();
@@ -328,6 +334,11 @@ static esp_err_t extraUriHandler(httpd_req_t* req)
     return httpd_resp_sendstr(req, "extra");
 }
 
+static esp_err_t extraUriErrorHandler(httpd_req_t* req)
+{
+    return httpd_req_handle_err(req, HTTPD_400_BAD_REQUEST);
+}
+
 static void freeTestStorage(LoopbackTestContext_t* testCtx)
 {
     for (TestStorageItem_t& item : testCtx->storage)
@@ -444,7 +455,16 @@ static void loopbackClientTask(void* arg)
                           "Access-Control-Request-Method: GET\r\n\r\n");
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
         !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
-        !strstr(response, "Access-Control-Allow-Origin: https://example.test"))
+        !strstr(response, "Access-Control-Allow-Origin: https://example.test") || !strstr(response, "Content-Length: 0"))
+    {
+        goto done;
+    }
+    requestLen = snprintf(request, sizeof(request),
+                          "OPTIONS /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n"
+                          "Access-Control-Request-Method: GET\r\n\r\n");
+    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
+        !strstr(response, "Access-Control-Allow-Origin: https://example.test") || !strstr(response, "Content-Length: 0"))
     {
         goto done;
     }
@@ -486,7 +506,8 @@ static void loopbackClientTask(void* arg)
             receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 429"))
         {
             requestLen = snprintf(request, sizeof(request),
-                                  "POST /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
+                                  "POST http://127.0.0.1:18080/extra/three?value=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                  "Origin: https://example.test\r\n\r\n");
             if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
                 receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 405") &&
                 strstr(response, "Access-Control-Allow-Origin: https://example.test"))
@@ -496,6 +517,25 @@ static void loopbackClientTask(void* arg)
                 if (socketFd >= 0 && connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
                 {
                     requestLen = snprintf(request, sizeof(request),
+                                          "GET /extra/error HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
+                    if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
+                        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 400"))
+                    {
+                        goto done;
+                    }
+                    char* corsHeader = strstr(response, "Access-Control-Allow-Origin: https://example.test");
+
+                    if ((!corsHeader) || strstr(corsHeader + 1, "Access-Control-Allow-Origin:"))
+                    {
+                        goto done;
+                    }
+                    close(socketFd);
+                    socketFd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+                    if (socketFd < 0 || connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+                    {
+                        goto done;
+                    }
+                    requestLen = snprintf(request, sizeof(request),
                                           "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
                     if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
                         receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 404") &&
@@ -504,7 +544,20 @@ static void loopbackClientTask(void* arg)
                         strstr(response, "Access-Control-Allow-Methods: GET,POST,OPTIONS") &&
                         strstr(response, "Access-Control-Allow-Headers: Content-Type, Authorization"))
                     {
-                        testCtx->clientErr = ESP_OK;
+                        close(socketFd);
+                        socketFd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+                        if (socketFd < 0 || connect(socketFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+                        {
+                            goto done;
+                        }
+                        requestLen = snprintf(request, sizeof(request),
+                                              "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nBroken-Header\r\n\r\n");
+                        if (requestLen > 0 && static_cast<size_t>(requestLen) < sizeof(request) && sendAll(socketFd, request, requestLen) &&
+                            receiveHttpResponse(socketFd, response, sizeof(response)) && strstr(response, "HTTP/1.1 400") &&
+                            !strstr(response, "Access-Control-Allow-Origin:"))
+                        {
+                            testCtx->clientErr = ESP_OK;
+                        }
                     }
                 }
             }

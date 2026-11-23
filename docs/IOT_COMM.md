@@ -73,10 +73,11 @@ cookie support. Requests without an `Origin` header use `Access-Control-Allow-Or
 always use `*` and do not enable credentials.
 
 IoT-Comm applies the configured CORS headers to its built-in HTTP responses, extra endpoint responses before calling the application
-handler, and ESP-IDF-generated error responses. Extra endpoints also receive automatic `OPTIONS` preflight responses with status 204;
-they do not invoke the application handler or consume rate-limit slots. When CORS is enabled, applications must not register an extra
-`HTTP_OPTIONS` endpoint because `iotCommStartServer()` rejects that configuration. Application handlers that add CORS headers after
-IoT-Comm has done so can produce duplicate HTTP headers and are responsible for their own response policy.
+handler, and unknown-path or unsupported-method responses. Extra endpoints also receive automatic `OPTIONS` preflight responses with
+status 204; they do not invoke the application handler or consume rate-limit slots. Malformed HTTP requests use ESP-IDF's default error
+responses without CORS headers. When CORS is enabled, applications must not register an extra `HTTP_OPTIONS` endpoint or use the reserved
+`/__iot_comm_cors_fallback__` URI because `iotCommStartServer()` rejects those configurations. Application handlers that add CORS headers
+after IoT-Comm has done so can produce duplicate HTTP headers and are responsible for their own response policy.
 
 Include `iot_comm/http/helpers.h` in an application handler to reuse the request-body, query-parameter, CORS, and standard error-response
 helpers. `httpGetClientIpFromRequest(req, &address)` resolves the client address using the trusted-proxy configuration supplied to
