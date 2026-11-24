@@ -446,32 +446,33 @@ static void loopbackClientTask(void* arg)
         !strstr(response, "Access-Control-Allow-Origin: https://example.test") ||
         !strstr(response, "Access-Control-Allow-Credentials: true") ||
         !strstr(response, "Access-Control-Allow-Methods: GET,POST,OPTIONS") ||
-        !strstr(response, "Access-Control-Allow-Headers: Content-Type, Authorization"))
+        !strstr(response, "Access-Control-Allow-Headers: Content-Type, Authorization") ||
+        !strstr(response, "Access-Control-Expose-Headers: *"))
     {
         goto done;
     }
     requestLen = snprintf(request, sizeof(request),
-                          "OPTIONS /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n"
-                          "Access-Control-Request-Method: GET\r\n\r\n");
+                          "OPTIONS /extra/three HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
-        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
-        !strstr(response, "Access-Control-Allow-Origin: https://example.test") || !strstr(response, "Content-Length: 0"))
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") ||
+        !strstr(response, "Access-Control-Allow-Origin: https://example.test") || !strstr(response, "Access-Control-Max-Age: 10") ||
+        !strstr(response, "Access-Control-Expose-Headers: *") || !strstr(response, "Content-Length: 0"))
     {
         goto done;
     }
     requestLen = snprintf(request, sizeof(request),
-                          "OPTIONS /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n"
-                          "Access-Control-Request-Method: GET\r\n\r\n");
+                          "OPTIONS /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
-        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
-        !strstr(response, "Access-Control-Allow-Origin: https://example.test") || !strstr(response, "Content-Length: 0"))
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") ||
+        !strstr(response, "Access-Control-Allow-Origin: https://example.test") || !strstr(response, "Access-Control-Max-Age: 10") ||
+        !strstr(response, "Content-Length: 0"))
     {
         goto done;
     }
     requestLen = snprintf(request, sizeof(request), "GET /extra/one HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
         !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") || !strstr(response, "extra") ||
-        !strstr(response, "Access-Control-Allow-Origin: *"))
+        strstr(response, "Access-Control-Allow-Origin:"))
     {
         goto done;
     }
@@ -603,17 +604,17 @@ static void wildcardCorsClientTask(void* arg)
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
         !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") ||
         !strstr(response, "Access-Control-Allow-Origin: *") || strstr(response, "Access-Control-Allow-Credentials") ||
-        strstr(response, "Vary: Origin"))
+        strstr(response, "Vary: Origin") || !strstr(response, "Access-Control-Expose-Headers: *"))
     {
         goto done;
     }
     requestLen = snprintf(request, sizeof(request),
-                          "OPTIONS /extra/wildcard HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n"
-                          "Access-Control-Request-Method: GET\r\n\r\n");
+                          "OPTIONS /extra/wildcard HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://example.test\r\n\r\n");
     if (requestLen <= 0 || static_cast<size_t>(requestLen) >= sizeof(request) || !sendAll(socketFd, request, requestLen) ||
-        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 204") ||
+        !receiveHttpResponse(socketFd, response, sizeof(response)) || !strstr(response, "HTTP/1.1 200") ||
         !strstr(response, "Access-Control-Allow-Origin: *") || strstr(response, "Access-Control-Allow-Credentials") ||
-        strstr(response, "Vary: Origin"))
+        strstr(response, "Vary: Origin") || !strstr(response, "Access-Control-Max-Age: 10") ||
+        !strstr(response, "Access-Control-Expose-Headers: *"))
     {
         goto done;
     }

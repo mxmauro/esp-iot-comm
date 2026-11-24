@@ -120,6 +120,10 @@ esp_err_t httpSendCORSHeaders(httpd_req_t* req, const char* origin, const char* 
     {
         err = httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", allowHeaders);
     }
+    if (err == ESP_OK)
+    {
+        err = httpd_resp_set_hdr(req, "Access-Control-Expose-Headers", "*");
+    }
     return err;
 }
 

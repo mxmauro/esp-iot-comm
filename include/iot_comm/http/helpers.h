@@ -17,6 +17,8 @@
 extern "C" {
 #endif // __cplusplus
 
+// Returns ESP_OK and sets *originOut to nullptr when the Origin header is not present.
+// Also, allocated memory for *originOut must be freed with httpFreeCORSOrigin() when no longer needed.
 esp_err_t httpGetCORSOrigin(httpd_req_t* req, char** originOut);
 void httpFreeCORSOrigin(char* origin);
 
@@ -41,5 +43,6 @@ bool httpGetClientIpFromRequest(httpd_req_t* req, IPAddress_t* out);
 // -----------------------------------------------------------------------------
 
 #ifdef __cplusplus
+// Returns ESP_OK and sets originOut to an empty string when the Origin header is not present.
 esp_err_t httpGetCORSOrigin(httpd_req_t* req, lightstd::string &originOut);
 #endif // __cplusplus

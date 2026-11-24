@@ -363,8 +363,10 @@ static esp_err_t deriveTransportKeys(const uint8_t sessionMasterKey[SESSION_AES_
                                      const uint8_t* info, size_t infoLen, uint8_t derivedKey[2 * AES_KEY_LEN + 2 * SESSION_IV_LEN]);
 
 static esp_err_t sendPreflightCORS(httpd_req_t* req);
-static esp_err_t sendCORS(httpd_req_t* req, char **originOut);
-static esp_err_t sendCORSHeaders(httpd_req_t* req, ServerContext_t* serverCtx, const char* origin);
+static esp_err_t addCORSHeadersIfNeeded(httpd_req_t* req, char **originOut);
+static bool isCORSRequest(httpd_req_t* req);
+static bool isCORSPreflightRequest(httpd_req_t* req);
+
 static bool hasInvalidHttpHeaderValue(const char* value);
 static bool matchCORSFallbackUri(const char* templateUri, const char* requestUri, size_t requestUriLen);
 static bool serverHasUri(const ServerContext_t* serverCtx, const char* requestUri);
@@ -460,8 +462,7 @@ esp_err_t iotCommStartServer(IotCommServerConfig_t* config)
     corsEnabled = config->cors != nullptr;
     if (corsEnabled)
     {
-        if (hasInvalidHttpHeaderValue(config->cors->allowedMethods) ||
-            hasInvalidHttpHeaderValue(config->cors->allowedHeaders))
+        if (hasInvalidHttpHeaderValue(config->cors->allowedMethods) || hasInvalidHttpHeaderValue(config->cors->allowedHeaders))
         {
             return ESP_ERR_INVALID_ARG;
         }
@@ -1064,7 +1065,7 @@ static esp_err_t serveExtraUri(httpd_req_t* req)
         return ESP_ERR_INVALID_STATE;
     }
 
-    err = sendCORS(req, &corsOrigin);
+    err = addCORSHeadersIfNeeded(req, &corsOrigin);
     if (err != ESP_OK)
     {
         httpFreeCORSOrigin(corsOrigin);
@@ -1108,7 +1109,11 @@ static esp_err_t serveExtraUriPreflight(httpd_req_t* req)
         return ESP_ERR_INVALID_STATE;
     }
 
-    return sendPreflightCORS(req);
+    if (isCORSPreflightRequest(req))
+    {
+        return sendPreflightCORS(req);
+    }
+    return httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, nullptr);
 }
 
 static esp_err_t serveCORSFallback(httpd_req_t* req)
@@ -1135,12 +1140,12 @@ static esp_err_t serveCORSFallback(httpd_req_t* req)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (req->method == HTTP_OPTIONS)
+    if (isCORSPreflightRequest(req))
     {
         return sendPreflightCORS(req);
     }
 
-    err = sendCORS(req, &corsOrigin);
+    err = addCORSHeadersIfNeeded(req, &corsOrigin);
     if (err != ESP_OK)
     {
         ESP_LOGD(TAG, "Failed to set CORS headers on an HTTP fallback response. Error: %d.", err);
@@ -1176,6 +1181,10 @@ static esp_err_t serveWsInit(httpd_req_t* req)
 
     if (req->method == HTTP_OPTIONS)
     {
+        if (!isCORSPreflightRequest(req))
+        {
+            return httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, nullptr);
+        }
         return sendPreflightCORS(req);
     }
 
@@ -1190,7 +1199,7 @@ static esp_err_t serveWsInit(httpd_req_t* req)
     ctx->respBody = GB_STATIC_INIT;
     p256KeyPairInit(&ctx->ecdhKeyPair);
 
-    err = sendCORS(req, &ctx->corsOrigin);
+    err = addCORSHeadersIfNeeded(req, &ctx->corsOrigin);
     if (err != ESP_OK)
     {
         goto done;
@@ -1344,6 +1353,10 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
 
     if (req->method == HTTP_OPTIONS)
     {
+        if (!isCORSPreflightRequest(req))
+        {
+            return httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, nullptr);
+        }
         return sendPreflightCORS(req);
     }
 
@@ -1360,7 +1373,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
     p256KeyPairInit(&ctx->ecdhKeyPair);
     aesInit(&ctx->aesCtx);
 
-    err = sendCORS(req, &ctx->corsOrigin);
+    err = addCORSHeadersIfNeeded(req, &ctx->corsOrigin);
     if (err != ESP_OK)
     {
         goto done;
@@ -1399,7 +1412,7 @@ static esp_err_t serveWsAuth(httpd_req_t* req)
     ctx->json = cJSON_ParseWithLength(reinterpret_cast<const char*>(ctx->reqBody.buffer), ctx->reqBody.used);
     if (!(ctx->json && cJSON_IsObject(ctx->json)))
     {
-    error_invalid_data:
+error_invalid_data:
         err = httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid parameters");
         goto done;
     }
@@ -1874,6 +1887,10 @@ static esp_err_t serveWs(httpd_req_t* req)
     switch (req->method)
     {
         case HTTP_OPTIONS:
+            if (!isCORSPreflightRequest(req))
+            {
+                return httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, nullptr);
+            }
             err = sendPreflightCORS(req);
             if (err != ESP_OK)
             {
@@ -1885,7 +1902,7 @@ static esp_err_t serveWs(httpd_req_t* req)
         {
             char* corsOrigin = nullptr;
 
-            err = sendCORS(req, &corsOrigin);
+            err = addCORSHeadersIfNeeded(req, &corsOrigin);
             if (err != ESP_OK)
             {
                 return err;
@@ -3705,13 +3722,16 @@ static esp_err_t sendPreflightCORS(httpd_req_t* req)
     char* origin = nullptr;
     esp_err_t err;
 
-    err = sendCORS(req, &origin);
+    err = addCORSHeadersIfNeeded(req, &origin);
     if (err == ESP_OK)
     {
-        err = httpd_resp_set_status(req, "204 No Content");
+        err = httpd_resp_set_hdr(req, "Access-Control-Max-Age", "10");
         if (err == ESP_OK)
         {
-            // httpd_resp_send() emits Content-Length: 0, which is required by some browsers even for a 204 preflight response.
+            err = httpd_resp_set_status(req, "200 OK");
+        }
+        if (err == ESP_OK)
+        {
             err = httpd_resp_send(req, nullptr, 0);
         }
     }
@@ -3721,47 +3741,57 @@ static esp_err_t sendPreflightCORS(httpd_req_t* req)
     return err;
 }
 
-static esp_err_t sendCORS(httpd_req_t* req, char **originOut)
+static esp_err_t addCORSHeadersIfNeeded(httpd_req_t* req, char **originOut)
 {
     ServerContext_t* serverCtx;
     esp_err_t err;
 
+    if (originOut)
+    {
+        *originOut = nullptr;
+    }
     if ((!req) || (!originOut))
     {
         return ESP_ERR_INVALID_ARG;
     }
-    *originOut = nullptr;
+
     serverCtx = static_cast<ServerContext_t*>(httpd_get_global_user_ctx(req->handle));
     if (!serverCtx)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!serverCtx->corsEnabled)
+
+    if (!(serverCtx->corsEnabled && isCORSRequest(req)))
     {
         return ESP_OK;
     }
-    if (!serverCtx->corsUseWildcardOrigin)
-    {
-        err = httpGetCORSOrigin(req, originOut);
-        if (err != ESP_OK)
-        {
-            // Preserve CORS coverage when the Origin header cannot be read.
-            *originOut = nullptr;
-        }
-    }
-    return sendCORSHeaders(req, serverCtx, *originOut);
-}
-
-static esp_err_t sendCORSHeaders(httpd_req_t* req, ServerContext_t* serverCtx, const char* origin)
-{
-    assert(req);
-    assert(serverCtx);
 
     if (serverCtx->corsUseWildcardOrigin)
     {
         return httpSendCORSHeaders(req, nullptr, serverCtx->corsAllowedMethods, serverCtx->corsAllowedHeaders);
     }
-    return httpSendCORSHeaders(req, origin, serverCtx->corsAllowedMethods, serverCtx->corsAllowedHeaders);
+
+    err = httpGetCORSOrigin(req, originOut);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    if (!*originOut)
+    {
+        return ESP_OK; // Should not happen because of the previous isCORSRequest check, but just in case.
+    }
+
+    return httpSendCORSHeaders(req, *originOut, serverCtx->corsAllowedMethods, serverCtx->corsAllowedHeaders);
+}
+
+static bool isCORSRequest(httpd_req_t* req)
+{
+    return req && httpd_req_get_hdr_value_len(req, "Origin") != 0;
+}
+
+static bool isCORSPreflightRequest(httpd_req_t* req)
+{
+    return isCORSRequest(req) && req->method == HTTP_OPTIONS;
 }
 
 static bool hasInvalidHttpHeaderValue(const char* value)
